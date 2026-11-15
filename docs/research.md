@@ -239,3 +239,14 @@ truncates a real document to exactly `P = 32, 128, 256, 512` tokens, and times
 causal `generate()` against cached `k=4` and `k=8` at batch 1 and 4. Prompt
 length is the variable that matters: with `P` around 15 (the default generation
 prompts), the prefix is a rounding error and the cache cannot help.
+
+## Right-Shifted Coordinate Alignment & Carrier-Frontier Diffusion
+
+Pretrained causal transformers (including Qwen2.5) are hardwired so that query position $k$ predicts token $k+1$. In standard causal training:
+$$\text{logits}[k] \to \text{target}[k+1]$$
+When turning this into a hybrid prefix-canvas architecture:
+1. **Right-Shifted Coordinates:** Slicing `out.logits[:, P-1 : P+C-1, :]` ensures that position $P-1$ (the prompt boundary token) predicts `canvas[0]`, and active canvas position $P-1+j$ predicts `canvas[j]`. This aligns 100% of the transformer's native positional representations with the diffusion objective.
+2. **Trainable `[MASK]` Row:** The unused spare row `151665` (`<|extra_0|>`) is unfrozen via an Adam gradient filter hook during LoRA training. The base embedding table remains frozen.
+3. **Carrier-Frontier & Island Anchoring:** Because slot $j$'s logits sit on top of input token $j-1$'s residual stream, unmasking slot $j$ when $j-1$ is still `[MASK]` forces the model to guess without a carrier token. The sampler prioritizes slots with concrete left carriers (`has_carrier == True`), while unmasking non-adjacent island anchors ($j \ge 2$) when the step budget exceeds available carriers, enabling independent frontiers to double carriers cleanly ($1 \to 2 \to 4 \to 8$) in parallel.
+4. **Sliding Sub-Blocks:** To generate sequences of arbitrary length without quadratic memory or unanchored degradation, `sample_canvas` slides across sub-blocks ($C_{\text{sub}}=8$ or $16$) that are committed into the causal prefix KV cache as they finish.
+

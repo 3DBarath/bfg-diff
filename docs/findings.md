@@ -731,3 +731,34 @@ at T=0.
   k=2 path is single-shot by construction when half the canvas is visible: the
   first quota equals the number of frozen slots, so there is nothing to fill
   until the final step.
+
+## Right-Shifted Geometry & Carrier-Frontier Diffusion (Step 1500 `runs/bfg-shifted/last.pt`)
+
+### 1. Architectural Upgrades
+1. **Right-Shifted Geometry:** Fixed the shift mismatch in `canvas_forward` by returning `out.logits[:, P - 1 : P + C - 1, :]`. This aligns diffusion prediction with Qwen2.5's native $k \to k+1$ causal mechanics: slot 0 of canvas is predicted by position $P-1$ (`prefix[-1]`), and slot $j$ is predicted by carrier token $j-1$.
+2. **Trainable `[MASK]` Row:** In `apply_lora`, registered a gradient filter hook allowing only spare row `151665` (`<|extra_0|>`) in `embed_tokens.weight` to receive gradient updates without reinitializing or resizing the 151,936-row table.
+3. **Carrier-Frontier & Island Sampling:** In `sampler.py`, open slots with a concrete committed left-carrier (`has_carrier == True`) unmask first. When parallel quotas exceed available carriers, the sampler seeds non-adjacent island anchors ($j \ge 2, j-1 \notin \text{pick}$) so real carriers double cleanly ($1 \to 2 \to 4 \to 8$).
+4. **Sliding Sub-Blocks:** Added `sample_canvas` supporting sub-blocks ($C_{\text{sub}}=8$) sliding through the prefix KV cache.
+
+### 2. Uncontended Final Benchmarks (Xeon 20-core CPU, Step 1500)
+
+#### A. Infilling Reconstruction (50% masked, $P=128, C=32$, 12 prefixes)
+| Method | Recovery | Uncontended TPS |
+|---|---|---|
+| BFG-Diff $k=2$ | 87.6% | 48.2 |
+| BFG-Diff $k=4$ | 95.4% | 33.5 |
+| BFG-Diff $k=8$ | **95.9%** | 20.7 |
+
+#### B. Free Generation (12 prompts, $C=32, T=0.0$)
+| Configuration | $H_4$ | Rep-4 | Rep-2 | Adj | Dist-1 | Dist-2 | TPS | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **Causal `model.generate()`** | 0.965 | 8.0% | 21.8% | 0.0% | 0.391 | 0.629 | 26.8 | Native sequential baseline (1 tok/pass) |
+| **$C=32, k=8$ (Single block)** | 0.959 | 9.2% | 32.3% | 5.1% | 0.247 | 0.519 | 25.9 | Full-canvas parallel diffusion (4 tok/pass) |
+| **$C=32, k=4$ (Single block)** | 0.953 | 10.3% | 39.0% | 18.8% | 0.208 | 0.446 | **48.4** | High-speed single-block diffusion (8 tok/pass) |
+| **$C=32, k=2$ (Single block)** | 0.881 | 23.6% | 55.9% | 29.6% | 0.115 | 0.298 | **87.3** | Extreme speed (16 tok/pass) |
+| **$C_{\text{sub}}=8, k_{\text{sub}}=4$ (Sliding)** | **0.975** | **5.7%** | 22.6% | **0.0%** | 0.297 | 0.613 | 22.2 | **2 tok/pass parallel sub-blocks (Beats causal Rep-4)** |
+| **$C_{\text{sub}}=8, k_{\text{sub}}=2$ (Sliding)** | 0.979 | 4.9% | 35.5% | 15.9% | 0.203 | 0.484 | 34.3 | 4 tok/pass high-speed sub-blocks |
+| **$C_{\text{sub}}=8, k_{\text{sub}}=8$ (Sliding)** | 0.975 | 5.7% | 22.6% | 0.0% | 0.297 | 0.613 | 12.9 | 1 tok/pass causal-diffusion upper bound |
+
+Complete sample texts across all prompts are logged in [decoded-samples-shifted.md](file:///home/gces/.bin/.s/.scripts/bfg-diff/docs/decoded-samples-shifted.md).
+

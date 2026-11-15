@@ -100,6 +100,10 @@ def parse_args():
                    help="sub-block canvas length for sliding generation (e.g. 16 or 8)")
     p.add_argument("--sub_steps", type=int, default=None,
                    help="steps per sub-block (defaults to proportional steps)")
+    p.add_argument("--no_carrier_priority", action="store_true",
+                   help="disable carrier-aware margin bonus in sampler")
+    p.add_argument("--schedule", default="linear", choices=["linear", "geometric"],
+                   help="unmasking schedule quota: linear or geometric")
     p.add_argument("--prefix_sweep", action="store_true",
                    help="TPS vs prefix length for causal and bfg-diff at batch 1 and 4")
     p.add_argument("--no_adj_suppress", action="store_true",
@@ -230,6 +234,8 @@ def run_sampler_generation(
             prefix_keep=keep, margin_floor=margin_floor,
             temperature=temperature, position_decay=position_decay, top_k=args.top_k,
             remask_ratio=remask_ratio, suppress_adjacent=not args.no_adj_suppress,
+            carrier_priority=not args.no_carrier_priority,
+            schedule=args.schedule,
         )
         token_ids.extend(canvas.tolist())
     sync(device)

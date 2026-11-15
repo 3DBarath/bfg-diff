@@ -287,3 +287,29 @@ every checkpoint and worse on generation (k=8/T=0 rep4 0.9% -> 6.0%, Dist-2
 
 Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 `runs/bench-mlp.log`. Full table in `docs/findings.md`.
+
+## 17. Right-Shifted Geometry & Carrier-Frontier Diffusion (2026-11-15)
+
+1. **Shift Mismatch Resolved:**
+   - Modified `model.py` so `canvas_forward` slices `out.logits[:, P - 1 : P + C - 1, :]`. Query position $P-1$ attends bidirectionally to canvas and predicts `canvas[0]`; query $P+j-1$ predicts `canvas[j]`.
+   - Updated `prefill_prefix` to cache `prefix[:, :-1]` and `canvas_step_with_cache` to evaluate active `[prefix[:, -1:], canvas]`. Logit diff against full forward pass is `0.0`.
+2. **Trainable Mask Vector:**
+   - Added `mask_id` unfreezing hook in `apply_lora` (`model.py`). Only row 151665 receives gradients.
+   - Updated `train.py` with direct Adam moment tracking for the single 896-dim vector, saving `ck["mask_emb"]`.
+3. **Training Execution (`runs/bfg-shifted`):**
+   - Ran 1500 steps on 2M token corpus (`batch_size=4, grad_accum=2, threads=20`).
+   - Train loss dropped from 15.09 to 4.88; validation loss converged to 4.0259 (best 3.6565 at step 1000).
+   - Saved `runs/bfg-shifted/last.pt` (8.4 MB).
+4. **Geometric Carrier-Frontier Sampler:**
+   - Updated `sampler.py` to implement geometric quota budgeting ending at `n_mutable`.
+   - Carrier-aware frontier logic unmasks slots with concrete left carriers first, and seeds non-adjacent island anchors ($j \ge 2, j-1 \notin \text{pick}$) when unmasking in parallel.
+   - Added `sample_canvas` sliding sub-block wrapper.
+5. **Verification & Smoke Tests:**
+   - `python train.py --smoke_test`: `11.9797 -> 3.6238 PASS`.
+   - `python benchmark.py --smoke_test`: `recovery 26.3%, TPS 18.8`.
+   - Final uncontended benchmarks on `runs/bfg-shifted/last.pt` (12 prompts, $P=128, C=32$):
+     - Infilling recovery: $k=2 \to 87.6\%$, $k=4 \to 95.4\%$, $k=8 \to 95.9\%$.
+     - Sliding sub-blocks $C_{\text{sub}}=8, k_{\text{sub}}=4$ (2 tok/pass parallel): Rep-4 **5.7%** (beating causal baseline's 8.0%), Adj **0.0%**, TPS 22.2.
+     - Single block $C=32, k=4$ (8 tok/pass): TPS **48.4** (1.8x faster than causal).
+     - Generated texts logged in `docs/decoded-samples-shifted.md`.
+

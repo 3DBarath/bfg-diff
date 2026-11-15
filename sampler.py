@@ -21,6 +21,9 @@ def sample_canvas_block(
     top_k=50,
     remask_ratio=0.0,
     suppress_adjacent=True,
+    carrier_priority=True,
+    schedule="linear",
+    anchor_thresh=4.0,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -114,6 +117,19 @@ def sample_canvas_block(
             margin = top2.values[..., 0] - top2.values[..., 1]
 
         rank = margin * decay if (decay is not None and s == 1) else margin
+        if carrier_priority and s < steps:
+            # Right-shifted geometry: slot j's logits sit on top of input token canvas[j-1].
+            # For j=0, carrier is prefix[-1] which is always concrete.
+            # For j>0, carrier is concrete if keep_token[:, j-1] is True.
+            has_carrier = torch.zeros_like(frozen)
+            has_carrier[:, 0] = True
+            has_carrier[:, 1:] = keep_token[:, :-1] | frozen[:, :-1]
+            # Prioritize slots with real carrier, OR strong structural anchors
+            anchor = margin >= anchor_thresh
+            is_priority = has_carrier | anchor
+            # Priority offset (+10.0) ensures carrier-anchored slots unmask before orphan masks
+            rank = rank + torch.where(is_priority, 10.0, 0.0)
+
         if margin_floor > 0.0 and s < steps:
             rank = rank.masked_fill((canvas == mask_id) & (margin < margin_floor), -float("inf"))
 
@@ -160,7 +176,12 @@ def sample_canvas_block(
                 # Interpolate strictly over the slots this sampler can fill:
                 # pre-filled slots hold their own share of the canvas for free.
                 n_mutable = canvas_len - n_frozen
-                budget = min(max(0, int(s / steps * n_mutable)), n_mutable)
+                if schedule == "geometric":
+                    # Geometric unmasking quota ending cleanly at n_mutable
+                    budget = min(n_mutable, max(1, math.ceil(n_mutable * (2.0 ** -(steps - s)))))
+                else:
+                    # Linear quota
+                    budget = min(max(0, int(s / steps * n_mutable)), n_mutable)
                 if not budget:
                     continue
                 # Protected decoded slots keep their token; the rest of the budget
@@ -168,17 +189,58 @@ def sample_canvas_block(
                 # compete: they already hold quota and are restored below.
                 keep = keep_token[i] & ~frozen[i]
                 need = budget - int(keep.sum())
-                pick = keep.nonzero().flatten()
-                if need > 0:
+                pick = set(keep.nonzero().flatten().tolist())
+
+                if need > 0 and carrier_priority:
+                    # Carrier-Island Frontier selection:
+                    # 1. First, pick all open slots that already have a real carrier (has_carrier == True)
+                    has_carrier_i = has_carrier[i]
+                    cand_carrier = [
+                        j for j in range(canvas_len)
+                        if has_carrier_i[j] and j not in pick and not frozen[i, j] and rank[i, j] > -float("inf")
+                    ]
+                    cand_carrier.sort(key=lambda j: float(rank[i, j]), reverse=True)
+                    for j in cand_carrier:
+                        if len(pick) < budget:
+                            pick.add(j)
+
+                    # 2. If budget still needs slots (parallel unmasking > available carriers),
+                    # pick island anchors that are NOT immediately adjacent to newly picked slots
+                    # (j - 1 not in pick), so that next step the island becomes a second carrier frontier!
+                    while len(pick) < budget:
+                        cand_island = [
+                            j for j in range(canvas_len)
+                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            and rank[i, j] > -float("inf")
+                            and not (j > 0 and (j - 1) in pick)
+                        ]
+                        if not cand_island:
+                            # Fallback if canvas is tight
+                            cand_island = [
+                                j for j in range(canvas_len)
+                                if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                                and rank[i, j] > -float("inf")
+                            ]
+                        if not cand_island:
+                            break
+                        cand_island.sort(key=lambda j: float(rank[i, j]), reverse=True)
+                        pick.add(cand_island[0])
+                    pick_tensor = torch.tensor(sorted(list(pick)), dtype=torch.long, device=canvas.device)
+                elif need > 0:
                     cand = (rank[i] > -float("inf")) & ~frozen[i] & ~keep
                     cand = cand.nonzero().flatten()
+                    pick_tensor = keep.nonzero().flatten()
                     if cand.numel():
                         order = rank[i, cand].topk(min(need, cand.numel())).indices
-                        pick = torch.cat([pick, cand[order]])
+                        pick_tensor = torch.cat([pick_tensor, cand[order]])
+                else:
+                    pick_tensor = keep.nonzero().flatten()
+
                 old = canvas[i].clone()
                 row = torch.full_like(old, mask_id)
                 row[frozen[i]] = old[frozen[i]]
-                row[pick] = torch.where(keep_token[i, pick], old[pick], sampled[i, pick])
+                if pick_tensor.numel():
+                    row[pick_tensor] = torch.where(keep_token[i, pick_tensor], old[pick_tensor], sampled[i, pick_tensor])
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
 
@@ -197,6 +259,7 @@ def sample_canvas(
     steps=8,
     sub_steps=None,
     prefix_keep=None,
+    carrier_priority=True,
     **kwargs,
 ):
     """Generate canvas_len tokens either in one block or sliding through sub-blocks.
@@ -212,6 +275,7 @@ def sample_canvas(
             canvas_len=canvas_len,
             steps=steps,
             prefix_keep=prefix_keep,
+            carrier_priority=carrier_priority,
             **kwargs,
         )
 
@@ -229,6 +293,7 @@ def sample_canvas(
             canvas_len=c_sub,
             steps=k_sub,
             prefix_keep=cur_keep,
+            carrier_priority=carrier_priority,
             **kwargs,
         )
         generated_blocks.append(block)
