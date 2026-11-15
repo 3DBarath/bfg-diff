@@ -1,4 +1,4 @@
-"""Benchmark BFG-Diff vs causal generation: reconstruction, entropy, throughput."""
+"""Benchmark BFG-Diff vs causal generation: reconstruction, diversity, throughput."""
 import argparse
 import math
 import time
@@ -85,7 +85,11 @@ def parse_args():
     p.add_argument("--prefix_len", type=int, default=384)
     p.add_argument("--canvas_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--steps", type=int, nargs="+", default=[4, 8])
+    p.add_argument("--steps", type=int, nargs="+", default=[2, 4, 8])
+    p.add_argument("--floors", type=float, nargs="+", default=[0.0],
+                   help="margin floors tested for every step count")
+    p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
+    p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="auto")
     p.add_argument("--smoke_test", action="store_true")
@@ -93,7 +97,7 @@ def parse_args():
     if args.smoke_test:
         args.checkpoint = args.checkpoint or "runs/smoke/last.pt"
         args.num_prompts, args.canvas_len, args.prefix_len = 2, 16, 128
-        args.batch_size, args.steps = 1, [2]
+        args.batch_size, args.steps, args.floors, args.show = 1, [2], [0.0], 1
     else:
         args.checkpoint = args.checkpoint or "runs/bfg-diff/last.pt"
     return args
@@ -139,6 +143,16 @@ def repeat_rate(seqs, n=4):
     return sum(vals) / len(vals)
 
 
+def distinct(seqs, n):
+    """Corpus-level Dist-n: unique n-grams / total n-grams."""
+    total, unique = 0, set()
+    for s in seqs:
+        grams = [tuple(s[i : i + n]) for i in range(max(0, len(s) - n + 1))]
+        total += len(grams)
+        unique.update(grams)
+    return len(unique) / total if total else 0.0
+
+
 @torch.inference_mode()
 def run_reconstruction(model, tok, args, mask_id, device, steps):
     n = args.num_prompts
@@ -174,37 +188,30 @@ def run_reconstruction(model, tok, args, mask_id, device, steps):
 
 
 @torch.inference_mode()
-def run_sampler_generation(model, tok, args, mask_id, device, steps):
-    prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
+def run_sampler_generation(model, tok, prompt_ids, args, mask_id, device, steps, margin_floor):
     token_ids = []
     sync(device)
     start = time.perf_counter()
-    for i in range(0, len(prompts), args.batch_size):
-        ids, keep = left_pad(
-            [tokenize(tok, p) for p in prompts[i : i + args.batch_size]],
-            tok.pad_token_id,
-            device,
-        )
+    for i in range(0, len(prompt_ids), args.batch_size):
+        ids, keep = left_pad(prompt_ids[i : i + args.batch_size], tok.pad_token_id, device)
         canvas = sample_canvas_block(
-            model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id, prefix_keep=keep
+            model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
+            prefix_keep=keep, margin_floor=margin_floor,
         )
         token_ids.extend(canvas.tolist())
     sync(device)
-    return token_ids, len(token_ids) * args.canvas_len / (time.perf_counter() - start)
+    elapsed = time.perf_counter() - start
+    texts = [tok.decode(t, skip_special_tokens=True) for t in token_ids]
+    return token_ids, texts, len(token_ids) * args.canvas_len / elapsed
 
 
 @torch.inference_mode()
-def run_causal_generation(model, tok, args, device):
-    prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
+def run_causal_generation(model, tok, prompt_ids, args, device):
     token_ids = []
     sync(device)
     start = time.perf_counter()
-    for i in range(0, len(prompts), args.batch_size):
-        ids, keep = left_pad(
-            [tokenize(tok, p) for p in prompts[i : i + args.batch_size]],
-            tok.pad_token_id,
-            device,
-        )
+    for i in range(0, len(prompt_ids), args.batch_size):
+        ids, keep = left_pad(prompt_ids[i : i + args.batch_size], tok.pad_token_id, device)
         out = model.generate(
             input_ids=ids,
             attention_mask=keep.long(),
@@ -216,11 +223,13 @@ def run_causal_generation(model, tok, args, device):
         token_ids.extend(out[:, ids.shape[1] :].tolist())
     sync(device)
     elapsed = time.perf_counter() - start
-    return token_ids, sum(len(s) for s in token_ids) / elapsed
+    texts = [tok.decode(t, skip_special_tokens=True) for t in token_ids]
+    return token_ids, texts, sum(len(s) for s in token_ids) / elapsed
 
 
 def main():
     args = parse_args()
+    torch.set_num_threads(args.threads or (torch.get_num_threads()))
     device = torch.device(
         "cuda" if args.device == "auto" and torch.cuda.is_available() else
         ("cpu" if args.device == "auto" else args.device)
@@ -233,13 +242,16 @@ def main():
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
-    if args.checkpoint and Path(args.checkpoint).exists():
+    if Path(args.checkpoint).exists():
         ck = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(ck["model"])
         mask_id = ck.get("mask_id", mask_id)
     else:
         print(f"warning: checkpoint {args.checkpoint!r} not found; benchmarking base model")
     model.eval()
+
+    prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
+    prompt_ids = [tokenize(tok, p) for p in prompts]
 
     print(f"\nReconstruction | {args.num_prompts} prefixes | P={args.prefix_len} C={args.canvas_len}")
     print(f"{'method':<18}{'recovery':>10}{'TPS':>12}")
@@ -248,12 +260,32 @@ def main():
         print(f"{f'bfg-diff k={steps}':<18}{rec:>9.1%}{tps:>12,.1f}")
 
     print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len}")
-    print(f"{'method':<18}{'4gram H':>9}{'repeat':>8}{'TPS':>12}")
-    for steps in args.steps:
-        ids, tps = run_sampler_generation(model, tok, args, mask_id, device, steps)
-        print(f"{f'bfg-diff k={steps}':<18}{ngram_entropy(ids):>9.3f}{repeat_rate(ids):>7.1%}{tps:>12,.1f}")
-    ids, tps = run_causal_generation(model, tok, args, device)
-    print(f"{'causal generate':<18}{ngram_entropy(ids):>9.3f}{repeat_rate(ids):>7.1%}{tps:>12,.1f}")
+    print(f"{'method':<22}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
+    outputs = {}
+    for floor in args.floors:
+        for steps in args.steps:
+            ids, texts, tps = run_sampler_generation(
+                model, tok, prompt_ids, args, mask_id, device, steps, floor
+            )
+            name = f"bfg-diff k={steps}" + (f" f={floor:g}" if floor else "")
+            outputs[name] = texts
+            print(
+                f"{name:<22}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+                f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
+            )
+    ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
+    outputs["causal generate"] = texts
+    print(
+        f"{'causal generate':<22}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+        f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
+    )
+
+    if args.show:
+        print("\nSide-by-side completions")
+        for i in range(min(args.show, len(prompts))):
+            print(f"\n[{i}] {prompts[i]}")
+            for name, texts in outputs.items():
+                print(f"  {name}: {texts[i]}")
 
 
 if __name__ == "__main__":

@@ -50,23 +50,45 @@ python train.py --data /path/to/texts --steps 4000 --batch_size 4 --grad_accum 4
 
 `--data` accepts a directory (recursively reads files, skipping binaries), a
 single file, or is omitted to use synthetic text. Any text format is fine
-(`.txt`, `.md`, `.json`, source code).
+(`.txt`, `.md`, `.json`, source code). `--limit` caps files and `--max_tokens`
+caps the corpus.
 
 Defaults: `P=384`, `C=128`, lr `5e-5`, warmup 500 optimizer updates, cosine
 decay, weight decay `0.01`, AdamW, checkpoint every 500 steps to
 `runs/bfg-diff/`.
 
+### CPU preset
+
+`--cpu` sets `P=128`, `C=32`, batch 2 x gradient accumulation 8 (effective 16),
+1000 steps, checkpoints every 200 steps, `float32`, and `--device cpu`. Warmup is
+20 optimizer updates (1000 micro-steps / 8 = 125 updates total). Explicit flags
+override the preset. Threads default to all cores; on a 10-core/20-thread Xeon,
+`--threads 10` avoids oversubscription.
+
+```bash
+python train.py --cpu --threads 10 \
+  --data /path/to/docs --limit 2000 --max_tokens 2000000
+```
+
+CPU training is fp32 on purpose: bf16/AMX is emulated on pre-Sapphire-Rapids
+Xeons and is slower than fp32 there.
+
 ## Benchmark
 
 ```bash
-python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 100
+python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 100 \
+  --canvas_len 32 --steps 2 4 8 --floors 0.0 1.0 --show 3
 ```
 
-Reports, for k=4 and k=8:
+Reports, for every checkpoint x step-count x margin-floor combination:
 
 - masked-token recovery on 50%-masked real text,
-- 4-gram entropy and repeat rate of free generations,
+- 4-gram entropy, 4-gram repeat rate, Dist-1 and Dist-2,
 - wall-clock tokens/s, alongside Hugging Face causal `generate()`.
+
+It also prints side-by-side completions for the first `--show` prompts
+(diffusion vs causal), so repetition and phrasing can be inspected directly.
+`--floors` is the confidence-margin sweep; `0.0` is the original rigid quota.
 
 The default checkpoint is `runs/bfg-diff/last.pt`. A missing checkpoint is
 reported and the base model is benchmarked instead.
@@ -87,7 +109,9 @@ reported and the base model is benchmarked instead.
 4. **Sampling.** Start from an all-mask canvas. Each step, score every masked
    slot by `log p(1) - log p(2)`, unmask the `floor(s/K*C)` highest-margin
    slots, and freeze them. With a partially filled canvas only the remaining
-   masked slots are eligible.
+   masked slots are eligible. `margin_floor` optionally holds back slots whose
+   top-1 is not clearly ahead of the runner-up; held-back slots are filled by
+   argmax at the end.
 
 See `docs/research.md` for the reasoning and `docs/findings.md` for measured
 numbers, including the CPU smoke-test results.

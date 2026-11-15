@@ -106,13 +106,104 @@ How to read this:
    tests an emulated path; the loader now chooses fp32 on CPU and bf16 on CUDA
    unless overridden with `--dtype`.
 
+## CPU sprint: preset, corpus, floor
+
+Environment: same CPU-only box, Intel Xeon Gold 5215 (10 cores / 20 threads).
+`avx512f` only — no `avx512_bf16`, no AMX — so fp32 is the fast path and bf16
+would be emulation.
+
+- Corpus: `/usr/share/doc` filtered to `README*`, `*.md`, `*.txt`, 2 KB–200 KB,
+  depth 3, symlinked into `/tmp/bfg-corpus` (1006 files, 13 MB). Capped at
+  2,000,000 tokens → 62,432 windows at `P=128, C=32`.
+- Threads: 4 steps took 31.8 s with `--threads 10` and 31.6 s with
+  `--threads 20`, so there is no benefit from hyper-threads here. Peak RSS for
+  model + optimizer + data was 10.2 GB.
+- Per-step time is about 3 s at `B=2, T=160` before gradient accumulation, i.e.
+  roughly 45–55 min for the 1000-step preset including five checkpoints.
+- `margin_floor` unit test: with `floor=1e9`, pre-filled slots are untouched and
+  the rest are completed by the final argmax fill; with `floor=0.0`, behavior
+  matches the old rigid quota.
+
+The full 1000-step run and the k/floor sweep are reported below.
+
+### 1000-step CPU run
+
+```bash
+python train.py --cpu --threads 10 --data /tmp/bfg-corpus \
+  --max_tokens 2000000 --out runs/bfg-diff
+```
+
+- Corpus: 1006 filtered documentation files, capped at 2,000,000 tokens
+  (62,432 overlapping windows, 64 held out for validation).
+- Wall time: 3195 s (53 min) at ~100 tokens/s; 10.5 GB peak RSS.
+- Train loss (20-step mean, noisy because `t` changes): 5.23 at step 100,
+  5.20 at 200, 4.73 at 500, 4.52 at 1000.
+- Validation loss: 4.97 (200), 4.85 (400), 3.94 (600), 3.64 (800), 4.06 (1000).
+  The validation set is only 64 windows and each evaluation draws a fresh 50%
+  mask, so the last two points are within noise of each other; `ckpt-800.pt` is
+  not obviously worse than `last.pt`.
+- Checkpoints: `ckpt-200/400/600/800.pt` and `last.pt`, 1.9 GB each (fp32).
+
+### Benchmark of the 1000-step checkpoint
+
+```bash
+python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 12 \
+  --prefix_len 128 --canvas_len 32 --batch_size 2 \
+  --steps 2 4 8 --floors 0.0 1.0 --show 3 --threads 10
+```
+
+Reconstruction (50% of the canvas masked, 12 prefixes):
+
+| method | recovery | TPS |
+|---|---|---|
+| bfg-diff k=2 | 63.9% | 33.4 |
+| bfg-diff k=4 | 81.4% | 16.9 |
+| bfg-diff k=8 | 90.2% | 8.5 |
+
+Generation (12 prompts, 32 tokens each):
+
+| method | H4 | repeat | Dist-1 | Dist-2 | TPS |
+|---|---|---|---|---|---|
+| bfg-diff k=2 | 0.523 | 56.0% | 0.083 | 0.183 | 92.9 |
+| bfg-diff k=4 | 0.548 | 54.6% | 0.099 | 0.196 | 46.7 |
+| bfg-diff k=8 | 0.757 | 37.6% | 0.141 | 0.288 | 23.4 |
+| bfg-diff k=2, f=1 | 0.523 | 56.9% | 0.096 | 0.191 | 63.5 |
+| bfg-diff k=4, f=1 | 0.508 | 57.2% | 0.104 | 0.196 | 37.9 |
+| bfg-diff k=8, f=1 | 0.571 | 51.1% | 0.115 | 0.218 | 20.9 |
+| causal generate | 0.938 | 13.5% | 0.362 | 0.578 | 25.6 |
+
+Interpretation:
+
+- **Infilling works, free generation does not.** Recovery rises 63.9% → 90.2%
+  with more denoising steps, so the model learned to use prefix and unmasked
+  canvas context. But full-canvas generation collapses to "the the the"
+  (repeat 56% at k=2). Example: `"the fish of the the the the..."`; causal
+  generation produced a coherent sentence. Training on 2M tokens for 1000
+  steps, with `t` up to 0.95, rewards local copying rather than long-range
+  planning.
+- **More steps help.** k=8 is the best diffusion setting (H4 0.757, repeat
+  37.6%, Dist-2 0.288), still well below causal (H4 0.938, repeat 13.5%).
+- **The margin floor did not help at 1.0.** Repeat rate moved 54.6% → 57.2% at
+  k=4 and 37.6% → 51.1% at k=8; Dist-1 was flat or slightly worse. It also
+  costs an extra forward for the final argmax fill (TPS drops ~20%). The
+  bottleneck here is the learned conditional distribution, not the rigid quota.
+  A higher floor or a stronger checkpoint would be needed before concluding the
+  mechanism is useless.
+- **Throughput depends on canvas/prompt length.** At C=32, k=2 and k=4 beat
+  causal `generate()` (92.9 and 46.7 vs 25.6 TPS); k=8 is slower. The earlier
+  C=16 smoke had k=2 at ~2.9x causal.
+
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.
-- Whether `recovery` and `repeat` separate meaningfully after long training;
-  the smoke run only proves the plumbing.
-- Reference texts repeat every 10 prompts in the 100-prompt benchmark, so
-  per-prefix scores are correlated.
+- Infilling separates from generation strongly (90% recovery vs 56% repeat),
+  but 1000 steps on 2M tokens is not enough for coherent free generation.
+  Longer training, larger `C`, or a curriculum on `t` are the obvious next
+  levers.
+- The margin floor needs a sweep above 1.0 (2.0, 3.0) and a stronger checkpoint
+  before judging the idea; at 1.0 it did not beat the rigid quota.
+- Reference texts repeat every 10 prompts in the benchmark, so per-prefix scores
+  are correlated; only 12 prompts were used in the timed sweep.
 - No comparison against standard block-autoregressive decoding or other
   diffusion samplers; only HF greedy `generate()`.
 - The 0.15–0.95 corruption range is fixed as specified, not tuned.

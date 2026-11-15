@@ -11,7 +11,8 @@ class GeneralTextDataset(Dataset):
     `texts`. Binary files (NUL in the first 4 KiB) are skipped."""
 
     def __init__(
-        self, root_dir=None, tokenizer=None, prefix_len=384, canvas_len=128, texts=None, limit=None
+        self, root_dir=None, tokenizer=None, prefix_len=384, canvas_len=128,
+        texts=None, limit=None, max_tokens=None,
     ):
         assert tokenizer is not None, "tokenizer is required"
         raw = texts if texts is not None else _read_texts(root_dir, limit)
@@ -20,6 +21,10 @@ class GeneralTextDataset(Dataset):
         for text in raw:
             stream.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
             stream.extend(sep)
+            if max_tokens and len(stream) >= max_tokens:
+                break
+        if max_tokens:
+            stream = stream[:max_tokens]
         need = prefix_len + canvas_len
         self.prefix_len, self.canvas_len = prefix_len, canvas_len
         self.chunks = [

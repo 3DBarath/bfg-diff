@@ -87,6 +87,33 @@ capped per sample at the number still masked; otherwise `topk` could pull in
 The final step has `k = C`, so the canvas is fully concrete. A last argmax pass
 covers any rounding leftovers.
 
+### Margin floor
+
+A rigid linear quota forces the model to commit to `C/K` tokens per step even
+when it is unsure. Early wrong commitments cannot be revised, and repeated
+phrases are the usual symptom.
+
+`margin_floor` adds an absolute gate: a masked slot is eligible for unmasking
+only if `margin >= floor`. The per-step budget stays linear
+(`quota_s - quota_{s-1}`), so held-back slots are not dumped later; they remain
+masked until the final argmax fill. This trades a little latency for fewer
+early mistakes. A high floor can leave most of the canvas to the final fill, so
+the floor is meant to be small (roughly 0.5-2.0 in log-prob units) and tuned in
+`benchmark.py --floors`.
+
+## CPU execution
+
+The verification machine is a 10-core / 20-thread Xeon Gold 5215 (Cascade
+Lake). It has AVX-512 but no native bf16 or AMX, so bf16 would be emulated;
+fp32 with MKLDNN is faster. `train.py` therefore keeps fp32 on CPU, sets
+`torch.set_num_threads` (explicit `--threads` or all cores), uses
+`torch.inference_mode()` for evaluation and benchmarking, and caps the corpus
+with `--max_tokens` because `GeneralTextDataset` materialises overlapping
+windows eagerly.
+
+On hyper-threaded Xeons, setting `--threads` to the physical core count can beat
+the default all-cores setting.
+
 ## Cost model
 
 A diffusion step is one forward over `P+C` tokens and produces `C` positions at

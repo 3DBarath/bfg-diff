@@ -75,7 +75,37 @@ time python benchmark.py --smoke_test
   1.000 and repeat 46.2% vs 0% — expected for a 12-step checkpoint and two
   sampling steps, not a quality verdict.
 
-## 8. Cleanup
+## 8. CPU optimization sprint
+
+- Added `--cpu` preset (P=128, C=32, batch 2 x accum 8, 1000 steps, warmup 20
+  updates, checkpoints every 200), `--threads`, `--max_tokens`, in-loop
+  `torch.set_num_threads`, and `torch.inference_mode()` evaluation.
+- `sampler.py`: added `margin_floor`, per-step new-slot budget, and a unit test
+  that a huge floor leaves pre-filled slots intact.
+- `benchmark.py`: k sweep (2/4/8) crossed with margin floors, Dist-1/Dist-2,
+  4-gram entropy/repeat, side-by-side decoded completions.
+- Speed trial: 4 steps and a 2 GB checkpoint in 31.6 s, 10.2 GB RSS, corpus
+  62,432 windows. 1000-step run launched on the filtered documentation corpus.
+
+## 9. 1000-step CPU run
+
+- Command: `train.py --cpu --threads 10 --data /tmp/bfg-corpus
+  --max_tokens 2000000 --out runs/bfg-diff`; ran in tmux session `bfg-train`.
+- 3195 s (53 min), ~100 tok/s, val loss 4.97 → 3.64 (step 800) → 4.06 (1000).
+  Checkpoints 200/400/600/800/1000 at 1.9 GB each.
+- Restarted once at step 60 to move the run into tmux (a live process cannot be
+  attached without `reptyr`); cost ~2 min.
+
+## 10. Benchmark sweep of the trained checkpoint
+
+- 12 prompts, P=128, C=32, k in {2,4,8}, margin floors {0.0, 1.0}, 3 examples.
+- Recovery 63.9% / 81.4% / 90.2% for k=2/4/8.
+- Generation stays repetitive ("the the the"); k=8 is best (repeat 37.6% vs
+  13.5% causal). Margin floor 1.0 did not reduce repetition.
+- k=2 and k=4 are faster than causal `generate()` at this canvas size
+  (92.9/46.7 vs 25.6 TPS); k=8 is slower.
+
+## 11. Cleanup
 
 - Removed `runs/smoke/ckpt-*.pt` (numbered smoke checkpoints) and
   `__pycache__`; kept `runs/smoke/last.pt` so the benchmark smoke runs

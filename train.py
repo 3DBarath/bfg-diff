@@ -1,6 +1,8 @@
 """Train Qwen2.5 as a block-autoregressive discrete diffusion LM (BD3-LM style)."""
 import argparse
 import math
+import os
+import sys
 import time
 from itertools import cycle
 from pathlib import Path
@@ -31,11 +33,20 @@ def parse_args():
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--eval_batches", type=int, default=4)
     p.add_argument("--limit", type=int, default=None, help="max source files")
+    p.add_argument("--max_tokens", type=int, default=None, help="cap on corpus tokens")
     p.add_argument("--texts", type=int, default=32, help="synthetic texts when --data is unset")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp32"])
+    p.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
+    p.add_argument("--cpu", action="store_true", help="CPU-friendly preset (P=128, C=32, 1k steps)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--smoke_test", action="store_true", help="tiny synthetic run + convergence check")
+    if "--cpu" in sys.argv:  # preset only changes defaults; explicit flags still win
+        p.set_defaults(
+            device="cpu", dtype="fp32", prefix_len=128, canvas_len=32,
+            batch_size=2, grad_accum=8, steps=1000, save_every=200,
+            log_every=20, eval_every=200, warmup=20,
+        )
     args = p.parse_args()
     if args.smoke_test:
         args.steps = 12
@@ -71,7 +82,7 @@ def diffusion_loss(model, prefix, target, mask_id):
     return F.cross_entropy(logits[mask], target[mask])
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, loader, mask_id, device, batches):
     model.eval()
     total, n = 0.0, 0
@@ -105,6 +116,8 @@ def save_checkpoint(path, model, mask_id, args, step):
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    n_threads = args.threads or (os.cpu_count() or 1)
+    torch.set_num_threads(n_threads)
     device = pick_device(args.device)
     dtype = (
         torch.bfloat16
@@ -114,7 +127,10 @@ def main():
 
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     ds = (
-        GeneralTextDataset(args.data, tok, args.prefix_len, args.canvas_len, limit=args.limit)
+        GeneralTextDataset(
+            args.data, tok, args.prefix_len, args.canvas_len,
+            limit=args.limit, max_tokens=args.max_tokens,
+        )
         if args.data
         else GeneralTextDataset(
             tokenizer=tok,
