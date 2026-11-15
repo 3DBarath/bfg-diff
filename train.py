@@ -65,12 +65,15 @@ def pick_device(name):
 
 
 def make_mask(target, mask_id):
-    """Per-sample t ~ U(0.15, 0.95); mask exactly floor(t*C) canvas tokens."""
+    """20% of draws are fully masked (t=1); otherwise t ~ U(0.20, 1.0) per sample."""
     B, C = target.shape
+    if torch.rand(1).item() < 0.20:
+        ratios = torch.ones(B)
+    else:
+        ratios = torch.empty(B).uniform_(0.20, 1.0)
     mask = torch.zeros_like(target, dtype=torch.bool)
     for i in range(B):
-        t = float(torch.empty(1).uniform_(0.15, 0.95))
-        n = max(1, int(t * C))
+        n = max(1, int(float(ratios[i]) * C))
         mask[i, torch.randperm(C, device=target.device)[:n]] = True
     return target.masked_fill(mask, mask_id), mask
 

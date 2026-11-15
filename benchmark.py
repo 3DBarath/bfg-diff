@@ -88,6 +88,10 @@ def parse_args():
     p.add_argument("--steps", type=int, nargs="+", default=[2, 4, 8])
     p.add_argument("--floors", type=float, nargs="+", default=[0.0],
                    help="margin floors tested for every step count")
+    p.add_argument("--temps", type=float, nargs="+", default=[0.0],
+                   help="Gumbel temperatures (0 = greedy)")
+    p.add_argument("--pos_decay", type=float, nargs="+", default=[0.0],
+                   help="step-1 position decay lambdas")
     p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -98,6 +102,7 @@ def parse_args():
         args.checkpoint = args.checkpoint or "runs/smoke/last.pt"
         args.num_prompts, args.canvas_len, args.prefix_len = 2, 16, 128
         args.batch_size, args.steps, args.floors, args.show = 1, [2], [0.0], 1
+        args.temps, args.pos_decay = [0.0], [0.0]
     else:
         args.checkpoint = args.checkpoint or "runs/bfg-diff/last.pt"
     return args
@@ -188,7 +193,9 @@ def run_reconstruction(model, tok, args, mask_id, device, steps):
 
 
 @torch.inference_mode()
-def run_sampler_generation(model, tok, prompt_ids, args, mask_id, device, steps, margin_floor):
+def run_sampler_generation(
+    model, tok, prompt_ids, args, mask_id, device, steps, margin_floor, temperature, position_decay
+):
     token_ids = []
     sync(device)
     start = time.perf_counter()
@@ -197,6 +204,7 @@ def run_sampler_generation(model, tok, prompt_ids, args, mask_id, device, steps,
         canvas = sample_canvas_block(
             model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
             prefix_keep=keep, margin_floor=margin_floor,
+            temperature=temperature, position_decay=position_decay,
         )
         token_ids.extend(canvas.tolist())
     sync(device)
@@ -260,23 +268,26 @@ def main():
         print(f"{f'bfg-diff k={steps}':<18}{rec:>9.1%}{tps:>12,.1f}")
 
     print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len}")
-    print(f"{'method':<22}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
+    print(f"{'method':<30}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
     outputs = {}
     for floor in args.floors:
-        for steps in args.steps:
-            ids, texts, tps = run_sampler_generation(
-                model, tok, prompt_ids, args, mask_id, device, steps, floor
-            )
-            name = f"bfg-diff k={steps}" + (f" f={floor:g}" if floor else "")
-            outputs[name] = texts
-            print(
-                f"{name:<22}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
-                f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
-            )
+        for temp in args.temps:
+            for decay in args.pos_decay:
+                for steps in args.steps:
+                    ids, texts, tps = run_sampler_generation(
+                        model, tok, prompt_ids, args, mask_id, device, steps, floor, temp, decay
+                    )
+                    label = f"k={steps} T={temp:g} d={decay:g} f={floor:g}"
+                    name = f"bfg-diff {label}"
+                    outputs[name] = texts
+                    print(
+                        f"{name:<30}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+                        f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
+                    )
     ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
     outputs["causal generate"] = texts
     print(
-        f"{'causal generate':<22}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+        f"{'causal generate':<30}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
         f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
     )
 

@@ -105,7 +105,17 @@ time python benchmark.py --smoke_test
 - k=2 and k=4 are faster than causal `generate()` at this canvas size
   (92.9/46.7 vs 25.6 TPS); k=8 is slower.
 
-## 11. Cleanup
+## 11. Sampler-only fixes
+
+- Added Gumbel temperature sampling (clean margins still rank slots) and a
+  step-1 position-decay prior; both default off.
+- Swept k=8 on `last.pt`: decay alone is a no-op; Gumbel T=0.7 removes 4-gram
+  repetition (0%) but the decoded text is incoherent, so the metric win is an
+  artifact of near-random sampling. Gumbel costs ~23% TPS.
+- Changed the training mask schedule to 20% fully masked batches and
+  `U(0.20, 1.0)` otherwise; not yet trained.
+
+## 12. Cleanup
 
 - Removed `runs/smoke/ckpt-*.pt` (numbered smoke checkpoints) and
   `__pycache__`; kept `runs/smoke/last.pt` so the benchmark smoke runs

@@ -193,6 +193,42 @@ Interpretation:
   causal `generate()` (92.9 and 46.7 vs 25.6 TPS); k=8 is slower. The earlier
   C=16 smoke had k=2 at ~2.9x causal.
 
+### Sampler-only fixes on `last.pt` (no retraining)
+
+Sweep at k=8 (12 prompts, C=32), adding Gumbel temperature and the step-1
+position-decay prior:
+
+| config | H4 | rep4 | Dist-1 | Dist-2 | TPS |
+|---|---|---|---|---|---|
+| T=0, d=0 (greedy) | 0.757 | 37.6% | 0.141 | 0.288 | 23.2 |
+| T=0, d=1.5 | 0.762 | 38.2% | 0.130 | 0.277 | 23.2 |
+| T=0.7, d=0 | 1.000 | 0.0% | 0.385 | 0.849 | 17.8 |
+| T=0.7, d=1.5 | 0.996 | 0.9% | 0.354 | 0.820 | 17.8 |
+| causal generate | 0.938 | 13.5% | 0.362 | 0.578 | 25.8 |
+
+Decoded samples for `Once upon a time, ... the fishermen noticed that`:
+
+- greedy: `the fish of the sea the the sea of the sea of the sea ...`
+- Gumbel T=0.7: `the fish the day, the a fish of.The,, deep kept, it that, ...`
+- decay + Gumbel: `a new of the fish the fish are more exposed to a a new species ...`
+- causal: `the fish they caught were smaller than the ones they caught in the sea.`
+
+Interpretation:
+
+- **Gumbel removes repetition but not the underlying problem.** The metrics look
+  excellent (rep 0%, Dist-2 0.85) because sampling near-flat distributions
+  produces mostly unique tokens; the text is word salad. Diversity metrics
+  cannot be read without the decoded samples — random tokens score best.
+- **Position decay alone does nothing here** (38.2% vs 37.6% repeat). With
+  C=32, k=8 only four slots are picked on step 1, and the model already prefers
+  early positions. Combined with Gumbel it changes the sample but does not
+  improve it.
+- **Gumbel costs throughput** (23.2 → 17.8 TPS) because it materialises a
+  full `(B, C, vocab)` noise tensor each step.
+- The bottleneck is the checkpoint's conditional distribution, not the
+  unmasking order. The implemented 20%-`t=1` training change is the right next
+  experiment; sampler tweaks alone will not produce coherent prose.
+
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.
@@ -202,6 +238,9 @@ Interpretation:
   levers.
 - The margin floor needs a sweep above 1.0 (2.0, 3.0) and a stronger checkpoint
   before judging the idea; at 1.0 it did not beat the rigid quota.
+- Gumbel sampling below T=0.7 (e.g. 0.3-0.5) might trade some diversity for
+  coherence; only 0.7 was measured, and it produced word salad.
+- The 20%-full-mask training change is implemented but not yet trained.
 - Reference texts repeat every 10 prompts in the benchmark, so per-prefix scores
   are correlated; only 12 prompts were used in the timed sweep.
 - No comparison against standard block-autoregressive decoding or other

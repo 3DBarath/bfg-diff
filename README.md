@@ -77,10 +77,11 @@ Xeons and is slower than fp32 there.
 
 ```bash
 python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 100 \
-  --canvas_len 32 --steps 2 4 8 --floors 0.0 1.0 --show 3
+  --canvas_len 32 --steps 2 4 8 --floors 0.0 1.0 \
+  --temps 0.0 0.7 --pos_decay 0.0 1.5 --show 3
 ```
 
-Reports, for every checkpoint x step-count x margin-floor combination:
+Reports, for every step-count x margin-floor x temperature x decay combination:
 
 - masked-token recovery on 50%-masked real text,
 - 4-gram entropy, 4-gram repeat rate, Dist-1 and Dist-2,
@@ -103,15 +104,17 @@ reported and the base model is benchmarked instead.
    queries see the whole prefix and the whole canvas block. Prefix queries never
    see canvas tokens. The mask is a `(B, 1, P+C, P+C)` additive float tensor
    (`finfo.min` for blocked, `0.0` for allowed), passed through SDPA.
-3. **Training.** Per sample, `t ~ U(0.15, 0.95)` and exactly `floor(t*C)` canvas
-   tokens are replaced with the mask. Cross-entropy is computed only on those
-   positions.
+3. **Training.** 20% of batches are fully masked (`t=1`); the rest draw
+   `t ~ U(0.20, 1.0)` per sample and replace exactly `floor(t*C)` canvas tokens
+   with the mask. Cross-entropy is computed only on those positions.
 4. **Sampling.** Start from an all-mask canvas. Each step, score every masked
    slot by `log p(1) - log p(2)`, unmask the `floor(s/K*C)` highest-margin
    slots, and freeze them. With a partially filled canvas only the remaining
    masked slots are eligible. `margin_floor` optionally holds back slots whose
    top-1 is not clearly ahead of the runner-up; held-back slots are filled by
-   argmax at the end.
+   argmax at the end. `temperature > 0` samples tokens with Gumbel noise
+   (ranking still uses clean margins), and `position_decay > 0` biases step 1
+   toward the canvas start.
 
 See `docs/research.md` for the reasoning and `docs/findings.md` for measured
 numbers, including the CPU smoke-test results.

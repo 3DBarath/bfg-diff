@@ -55,14 +55,16 @@ offset into the canvas.
 
 ## Corruption and loss
 
-For every sample independently, draw `t ~ U(0.15, 0.95)` and mask exactly
-`floor(t*C)` positions. Exact counts matter for a predictable difficulty
-schedule; independent per-position Bernoulli draws would only match `t*C` in
-expectation.
+For every sample, 20% of batches are fully masked (`t = 1.0`); the remaining
+batches draw `t ~ U(0.20, 1.0)` per sample and mask exactly `floor(t*C)`
+positions. Full-mask batches teach from-scratch generation — without them the
+model never sees the all-mask canvas it actually starts from at inference.
+Exact counts matter for a predictable difficulty schedule; independent
+per-position Bernoulli draws would only match `t*C` in expectation.
 
 Loss is plain cross-entropy on masked positions only. No weighting, no
 reconstruction of unmasked tokens. The model is not trained to copy clean
-tokens, so the objective at `t → 0` is undefined by construction; the 0.15
+tokens, so the objective at `t → 0` is undefined by construction; the 0.20
 floor avoids wasting compute on near-clean canvases.
 
 ## Sampler
@@ -113,6 +115,26 @@ windows eagerly.
 
 On hyper-threaded Xeons, setting `--threads` to the physical core count can beat
 the default all-cores setting.
+
+## Stochastic token choice and position prior
+
+Greedy argmax in parallel unmasking commits confidently to one token per slot
+and tends to collapse into a repeated phrase. Two optional, sampler-only knobs
+address this without retraining:
+
+- **Gumbel temperature.** When `temperature > 0`, the token written to each
+  selected slot is `argmax(logits / T + Gumbel(0,1))`, which is equivalent to
+  sampling from `softmax(logits / T)`. The rank order (which slots to unmask)
+  still comes from the clean log-probs, so confidence estimates are not
+  distorted by noise. `T = 0` keeps the previous greedy behavior.
+- **Step-1 position decay.** Token 0 of the canvas directly follows the prefix;
+  token 25 is separated from it by 25 masks. On the first step only, margins
+  are multiplied by `exp(-lambda * i / C)`, so the left boundary settles first
+  and later steps condition on concrete causal anchors. `lambda = 1.5` makes
+  the first 2-4 slots strongly preferred for `C = 32`.
+
+Both knobs leave frozen/pre-filled tokens untouched, so reconstruction and
+partial-canvas decoding keep their guarantees.
 
 ## Cost model
 
