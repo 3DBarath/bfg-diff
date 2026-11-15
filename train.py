@@ -126,6 +126,9 @@ def save_checkpoint(path, model, mask_id, args, step):
             "dropout": args.lora_dropout,
             "targets": list(LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS),
         }
+        emb = model.get_input_embeddings().weight
+        if emb.requires_grad:
+            ck["mask_emb"] = emb[mask_id].detach().cpu().clone()
     else:
         ck["model"] = model.state_dict()
     torch.save(ck, path)
@@ -150,7 +153,7 @@ def main():
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     if args.lora:
         targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
-        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets)
+        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets, mask_id=mask_id)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         print(
@@ -181,12 +184,18 @@ def main():
         f"train={len(train_ds)} val={len(val_ds)} chunks"
     )
 
+    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_tokens" not in n]
     opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        lora_params,
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
     )
+    # Track Adam moments for the single mask embedding row to avoid 136M buffer allocations
+    emb_weight = model.get_input_embeddings().weight
+    mask_m = torch.zeros(emb_weight.shape[1], device=device)
+    mask_v = torch.zeros(emb_weight.shape[1], device=device)
+    mask_t = 0
 
     def lr_lambda(update):
         update += 1  # first update should not use lr=0
@@ -234,10 +243,24 @@ def main():
         tokens += prefix.numel() + target.numel()
 
         if step % args.grad_accum == 0 or step == args.steps:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
             opt.step()
             sched.step()  # one schedule step per optimizer update
             opt.zero_grad(set_to_none=True)
+
+            # Update the single [MASK] row with Adam moments
+            if emb_weight.requires_grad and emb_weight.grad is not None:
+                g = emb_weight.grad[mask_id]
+                mask_t += 1
+                beta1, beta2, eps = 0.9, 0.95, 1e-8
+                mask_m = beta1 * mask_m + (1.0 - beta1) * g
+                mask_v = beta2 * mask_v + (1.0 - beta2) * (g ** 2)
+                m_hat = mask_m / (1.0 - beta1 ** mask_t)
+                v_hat = mask_v / (1.0 - beta2 ** mask_t)
+                lr = sched.get_last_lr()[0]
+                with torch.no_grad():
+                    emb_weight[mask_id] -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+                emb_weight.grad.zero_()
 
         if step % args.log_every == 0 or step == 1:
             now = time.time()

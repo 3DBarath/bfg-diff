@@ -68,10 +68,13 @@ def sample_canvas_block(
     frozen = canvas != mask_id  # pre-filled input slots: never touched
     decoded = torch.zeros_like(frozen)  # slots this sampler has filled
     prefix_len = prefix_ids.shape[1]
-    kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix encoded once
+    kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix[:-1] encoded once
     for s in range(1, steps + 1):
-        logits = canvas_step_with_cache(model, canvas, kv, prefix_len, prefix_keep)
-        kv.crop(-canvas_len)  # drop the canvas rows; keep the prefix cache
+        if kv is None:
+            logits = canvas_forward(model, prefix_ids, canvas, prefix_keep)
+        else:
+            logits = canvas_step_with_cache(model, prefix_ids[:, -1:], canvas, kv, prefix_len, prefix_keep)
+            kv.crop(-(1 + canvas_len))  # drop active [prefix_last, canvas] tokens; keep prefix cache
         assert logits.shape[:2] == (B, canvas_len), logits.shape
         z = logits.float()  # log p(i) - log p(j) == z(i) - z(j): softmax shift cancels
         top2 = z.topk(2, dim=-1)
@@ -186,8 +189,59 @@ def sample_canvas_block(
     return canvas
 
 
+def sample_canvas(
+    model,
+    prefix_ids,
+    canvas_len=32,
+    sub_canvas_len=None,
+    steps=8,
+    sub_steps=None,
+    prefix_keep=None,
+    **kwargs,
+):
+    """Generate canvas_len tokens either in one block or sliding through sub-blocks.
+
+    When `sub_canvas_len` is provided (e.g. sub_canvas_len=16 or 8), splits the generation
+    into successive sub-blocks. Each completed sub-block is appended to the prefix context,
+    providing strong causal anchors while taking fewer FLOPs per step.
+    """
+    if sub_canvas_len is None or sub_canvas_len >= canvas_len:
+        return sample_canvas_block(
+            model,
+            prefix_ids,
+            canvas_len=canvas_len,
+            steps=steps,
+            prefix_keep=prefix_keep,
+            **kwargs,
+        )
+
+    k_sub = sub_steps if sub_steps is not None else max(1, math.ceil(steps * (sub_canvas_len / canvas_len)))
+    cur_prefix = prefix_ids
+    cur_keep = prefix_keep
+    generated_blocks = []
+    rem = canvas_len
+
+    while rem > 0:
+        c_sub = min(sub_canvas_len, rem)
+        block = sample_canvas_block(
+            model,
+            cur_prefix,
+            canvas_len=c_sub,
+            steps=k_sub,
+            prefix_keep=cur_keep,
+            **kwargs,
+        )
+        generated_blocks.append(block)
+        cur_prefix = torch.cat([cur_prefix, block], dim=1)
+        if cur_keep is not None:
+            cur_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1)
+        rem -= c_sub
+
+    return torch.cat(generated_blocks, dim=1)
+
+
 @torch.no_grad()
 def sample_canvas_text(model, tokenizer, prefix_ids, **kwargs):
     """Convenience wrapper: (decoded_text, canvas_ids) for a single prompt."""
-    canvas = sample_canvas_block(model, prefix_ids, **kwargs)
+    canvas = sample_canvas(model, prefix_ids, **kwargs)
     return [tokenizer.decode(c, skip_special_tokens=True) for c in canvas], canvas

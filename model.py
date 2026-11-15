@@ -44,11 +44,12 @@ def prepare(model_name, device=None, dtype=None):
     return model, tok, mask_id
 
 
-def apply_lora(model, r=16, alpha=32, dropout=0.05, targets=("q_proj", "k_proj", "v_proj", "o_proj")):
-    """Wrap the frozen model with trainable low-rank adapters (PEFT LoRA)."""
+def apply_lora(model, r=16, alpha=32, dropout=0.05, targets=("q_proj", "k_proj", "v_proj", "o_proj"), mask_id=None):
+    """Wrap the frozen model with trainable low-rank adapters (PEFT LoRA).
+    If `mask_id` is provided, unfreezes only the `mask_id` row of the input embedding matrix."""
     from peft import LoraConfig, get_peft_model
 
-    return get_peft_model(
+    peft_model = get_peft_model(
         model,
         LoraConfig(
             r=r,
@@ -59,6 +60,18 @@ def apply_lora(model, r=16, alpha=32, dropout=0.05, targets=("q_proj", "k_proj",
             task_type="CAUSAL_LM",
         ),
     )
+    if mask_id is not None:
+        emb = peft_model.get_input_embeddings().weight
+        emb.requires_grad = True
+
+        def hook(grad):
+            g = torch.zeros_like(grad)
+            g[mask_id] = grad[mask_id]
+            return g
+
+        emb.register_hook(hook)
+
+    return peft_model
 
 
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
@@ -68,17 +81,18 @@ LORA_TARGETS_MLP = LORA_TARGETS + ("gate_proj", "up_proj", "down_proj")
 def build_hybrid_attention_mask(
     prefix_len, canvas_len, batch_size=1, dtype=torch.bfloat16, device="cuda", prefix_keep=None
 ):
-    """Additive mask (B, 1, P+C, P+C): prefix sees only past prefix; canvas sees all.
+    """Additive mask (B, 1, P+C, P+C): prefix queries 0..P-2 see only past prefix;
+    prefix query P-1 and canvas queries P..P+C-1 see all past prefix and all canvas.
     `prefix_keep` (B, P) bool hides left-padding keys."""
     T = prefix_len + canvas_len
     allow = torch.zeros(batch_size, T, T, dtype=torch.bool, device=device)
     causal = torch.tril(torch.ones(prefix_len, prefix_len, dtype=torch.bool, device=device))
     allow[:, :prefix_len, :prefix_len] = causal
-    allow[:, prefix_len:, :] = True
+    allow[:, prefix_len - 1 :, :] = True
     if prefix_keep is not None:
         keep = prefix_keep.to(device=device, dtype=torch.bool).view(batch_size, 1, prefix_len)
         allow[:, :prefix_len, :prefix_len] &= keep
-        allow[:, prefix_len:, :prefix_len] &= keep
+        allow[:, prefix_len - 1 :, :prefix_len] &= keep
     return torch.zeros(batch_size, 1, T, T, dtype=dtype, device=device).masked_fill_(
         ~allow.unsqueeze(1), torch.finfo(dtype).min
     )
@@ -95,53 +109,61 @@ def mask_position_ids(prefix_keep, canvas_len):
 
 
 def prefill_prefix(model, prefix_ids, prefix_keep=None):
-    """Run the prefix once with a KV cache; canvas steps then reuse it."""
+    """Run prefix_ids[:, :-1] once with a KV cache; canvas steps then reuse it."""
     B, P = prefix_ids.shape
+    if P <= 1:
+        # If prefix is only 1 token, there is no past to prefill
+        return None
     pos = (
-        torch.arange(P, device=prefix_ids.device).unsqueeze(0).expand(B, P)
+        torch.arange(P - 1, device=prefix_ids.device).unsqueeze(0).expand(B, P - 1)
         if prefix_keep is None
-        else mask_position_ids(prefix_keep, 0)
+        else mask_position_ids(prefix_keep, 0)[:, : P - 1]
     )
+    keep = prefix_keep[:, : P - 1] if prefix_keep is not None else None
     return model(
-        input_ids=prefix_ids,
-        attention_mask=prefix_keep,
+        input_ids=prefix_ids[:, :-1],
+        attention_mask=keep,
         position_ids=pos,
         use_cache=True,
     ).past_key_values
 
 
-def canvas_step_with_cache(model, canvas_ids, past_key_values, prefix_len, prefix_keep=None):
-    """Logits (B, C, vocab) for a canvas that cross-attends to a cached prefix.
+def canvas_step_with_cache(model, prefix_last_id, canvas_ids, past_key_values, prefix_len, prefix_keep=None):
+    """Logits (B, C, vocab) for canvas positions using cached prefix[:P-1] and active [prefix_last, canvas].
 
-    Canvas tokens see every prefix position (minus left padding) and every canvas
-    position, matching the full-sequence hybrid mask.
+    Slot 0 (canvas[0]) is predicted by prefix_last_id (pos P-1) attending to all prefix and canvas.
+    Slot j (canvas[j]) is predicted by canvas[j-1] (pos P-1+j) attending to all prefix and canvas.
     """
     B, C = canvas_ids.shape
     device = canvas_ids.device
     dtype = model.get_input_embeddings().weight.dtype
-    allow = torch.ones(B, 1, C, prefix_len + C, dtype=torch.bool, device=device)
-    if prefix_keep is not None:
-        allow[..., :prefix_len] &= prefix_keep.to(device=device, dtype=torch.bool).view(B, 1, 1, prefix_len)
-    attn = torch.zeros(B, 1, C, prefix_len + C, dtype=dtype, device=device).masked_fill_(
+    active_ids = torch.cat([prefix_last_id, canvas_ids], dim=1)  # length 1 + C
+    T = prefix_len + C
+
+    allow = torch.ones(B, 1, 1 + C, T, dtype=torch.bool, device=device)
+    if prefix_keep is not None and prefix_len > 1:
+        allow[..., : prefix_len - 1] &= prefix_keep[:, : prefix_len - 1].to(device=device, dtype=torch.bool).view(B, 1, 1, prefix_len - 1)
+
+    attn = torch.zeros(B, 1, 1 + C, T, dtype=dtype, device=device).masked_fill_(
         ~allow, torch.finfo(dtype).min
     )
     pos = (
-        torch.arange(prefix_len, prefix_len + C, device=device).unsqueeze(0).expand(B, C)
+        torch.arange(prefix_len - 1, prefix_len + C, device=device).unsqueeze(0).expand(B, 1 + C)
         if prefix_keep is None
-        else mask_position_ids(prefix_keep, C)[:, prefix_len:]
+        else mask_position_ids(prefix_keep, C)[:, prefix_len - 1 :]
     )
     out = model(
-        input_ids=canvas_ids,
+        input_ids=active_ids,
         attention_mask=attn,
         position_ids=pos,
         past_key_values=past_key_values,
         use_cache=True,
     )
-    return out.logits
+    return out.logits[:, :C, :]
 
 
 def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None):
-    """Logits for the canvas block only: (B, C, vocab)."""
+    """Logits for the canvas block only: (B, C, vocab), aligned with Qwen's k -> k+1 prediction."""
     B, P = prefix_ids.shape
     C = canvas_ids.shape[1]
     device = prefix_ids.device
@@ -154,4 +176,4 @@ def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None):
         else mask_position_ids(prefix_keep, C)
     )
     out = model(input_ids=input_ids, attention_mask=attn, position_ids=pos, use_cache=False)
-    return out.logits[:, P:, :]
+    return out.logits[:, P - 1 : P + C - 1, :]

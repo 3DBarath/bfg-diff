@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from model import LORA_TARGETS, apply_lora, prepare
-from sampler import sample_canvas_block
+from sampler import sample_canvas, sample_canvas_block
 
 # Long reference documents (prose, docs, markdown, JSON) for masked reconstruction.
 REFERENCE_TEXTS = [
@@ -96,6 +96,10 @@ def parse_args():
                    help="truncate stochastic sampling to the top-k logits")
     p.add_argument("--remask_ratio", type=float, nargs="+", default=[0.0],
                    help="fraction of decoded slots that may be re-masked per step")
+    p.add_argument("--sub_canvas_len", type=int, default=None,
+                   help="sub-block canvas length for sliding generation (e.g. 16 or 8)")
+    p.add_argument("--sub_steps", type=int, default=None,
+                   help="steps per sub-block (defaults to proportional steps)")
     p.add_argument("--prefix_sweep", action="store_true",
                    help="TPS vs prefix length for causal and bfg-diff at batch 1 and 4")
     p.add_argument("--no_adj_suppress", action="store_true",
@@ -220,8 +224,9 @@ def run_sampler_generation(
     start = time.perf_counter()
     for i in range(0, len(prompt_ids), args.batch_size):
         ids, keep = left_pad(prompt_ids[i : i + args.batch_size], tok.pad_token_id, device)
-        canvas = sample_canvas_block(
-            model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
+        canvas = sample_canvas(
+            model, ids, canvas_len=args.canvas_len, sub_canvas_len=args.sub_canvas_len,
+            steps=steps, sub_steps=args.sub_steps, mask_id=mask_id,
             prefix_keep=keep, margin_floor=margin_floor,
             temperature=temperature, position_decay=position_decay, top_k=args.top_k,
             remask_ratio=remask_ratio, suppress_adjacent=not args.no_adj_suppress,
@@ -311,6 +316,9 @@ def main():
                 cfg.get("targets", LORA_TARGETS),
             )
             set_peft_model_state_dict(model, ck["lora"])
+            if "mask_emb" in ck:
+                with torch.no_grad():
+                    model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
         else:
             model.load_state_dict(ck["model"])
         mask_id = ck.get("mask_id", mask_id)
