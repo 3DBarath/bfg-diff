@@ -279,7 +279,8 @@ proportion to prefix length.
 Throughput depends on batch size. At batch 4 (same 12 prompts):
 k=8 T=0 is 31.3 TPS vs causal 29.2, and k=8 T=0.5 is 30.3 TPS. So the "k=8
 beats causal" target holds at batch 4 and is a tie at batch 2; k=4 is ~2x
-causal either way.
+causal either way. That was measured with `P ~= 15-20`, the most favourable
+prompt length; see the systems finding below for where the advantage ends.
 
 Decoded k=8 completions with top-k=50 (`runs/bench-samples.log`):
 
