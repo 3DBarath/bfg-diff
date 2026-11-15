@@ -199,3 +199,57 @@ time python benchmark.py --smoke_test
 Stage-3 gate was "launch `--lora_mlp` only if rep4 at `T=0`, `r=0.25` is still
 > 20%". Measured 10.1% (k=8). **No `--lora_mlp` run launched.** The residual
 failure is grammatical, not a repeated-4-gram attractor.
+
+## 15. Second pass: mutable-slot quota, collision suppression, CPU crossover
+
+### Code
+
+- `sampler.py`: quota now interpolates over the mutable slots,
+  `floor(s/K * (C - n_frozen))`, instead of `floor(s/K*C) - n_frozen`. On a
+  50%-masked canvas the old form had `budget <= 0` for the first `K/2` steps, so
+  k=8 behaved like k=4 and k=2 was single-shot.
+- `sampler.py`: adjacent-token collision suppression (`suppress_adjacent=True`).
+  Adjacent slots whose effective token is identical are compared on margin; the
+  weaker one is scored `-inf` for that step and re-predicts next step with its
+  neighbour committed. Only still-masked slots are held back, so a committed
+  token is never revoked and the quota stays monotone.
+- `benchmark.py`: `rep2` (2-gram repeat rate) and `adj` (adjacent identical
+  tokens) columns, plus `--no_adj_suppress` for the A/B.
+
+### Verification
+
+- Mask counts before each forward, `C=32`, 16 frozen, suppression off:
+  k=8 `16,14,12,10,8,6,4,2`, k=4 `16,12,8,4`, k=2 `16,8` — exactly the
+  requested schedules. With suppression on, k=8 ends `...,4,4` (one pair
+  collided at the last interior step); the final canvas still has 0 masks.
+- `n_frozen=0` still reduces to `floor(s/K*C)`: token-identical to `21812a7` for
+  steps 1/2/3/4/8 x {greedy, T=0.5, decay, floor}, suppression off (20/20).
+- Mechanism check on the base model: `adj` 0.976 -> 0.898 at T=0 and
+  0.961 -> 0.843 at T=0.3.
+- `train.py --smoke_test`: `5.7694 -> 3.7964 PASS`. `benchmark.py --smoke_test`
+  runs with the new columns.
+
+### Measurements
+
+- Reconstruction with the fixed quota: **89.7 / 92.3 / 96.4%** at k=2/4/8
+  (`runs/bench-adj.log`), up from 80.4 / 88.1 / 90.7.
+- Suppression A/B at k=8, r=0.25: T=0 rep4 10.1% -> 5.7%, adj 31.5% -> 24.2%,
+  H4 0.949 -> 0.967, TPS unchanged; at T>=0.3 the deltas are inside noise.
+  At k=4 T=0: rep4 45.1% -> 22.1%, adj 65.6% -> 41.1%.
+- `not not not` disappears from the k=8/T=0 sample; runs of `the` committed in
+  different steps survive.
+- Systems result recorded in `docs/findings.md`: CPU block diffusion only beats
+  causal GEMV for `k <= 4` and `P <= 256`; beyond that the `k*C` redundant
+  evaluations saturate fp32 compute (k=4 1.87x -> 1.14x, k=8 0.88x at P=512).
+- Full decoded text of the shipped sampler: `docs/decoded-samples-suppressed.md`.
+
+### Stage 3 launched
+
+```bash
+python train.py --cpu --lora --lora_mlp --threads 20 --steps 3000 \
+  --batch_size 4 --grad_accum 2 --data /tmp/bfg-corpus --max_tokens 2000000 \
+  --out runs/bfg-lora-mlp > runs/train-lora-mlp.log
+```
+
+Same seed (default 0), batch 4 x accum 2, same corpus as `runs/bfg-lora`;
+8.80M trainable params. Comparison benchmark pending its completion.

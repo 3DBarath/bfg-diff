@@ -109,17 +109,24 @@ How to read this:
 5. **Pre-filled slots ate the whole diffusion budget (found 2026-11-15 while
    writing the Task 1 table).** The quota-preserving re-mask rewrite selected
    `topk(budget)` over the *entire* canvas, and frozen reconstruction slots carry
-   score `+inf`. With 16 of 32 slots pre-filled, `budget = floor(s/K*C) - 16` was
-   won entirely by frozen slots, so no masked slot was ever chosen before the
-   final step: all infilling collapsed into one shot, and reconstruction recovery
-   came out flat (79.9 / 79.9 / 82.0% for k=2/4/8, versus 63.9 / 81.4 / 90.2%
-   with the old sampler). Fix: frozen slots never compete; protected decoded
-   slots keep their token and only the remaining
-   `budget - n_protected` slots are chosen from the highest margins. Verified:
-   mask counts before each forward at `C=32`, 16 frozen, k=8 are now
-   `16,16,16,16,16,12,8,4`, pre-filled tokens are unchanged, and
-   `remask_ratio=0.0` is still token-identical to commit `e2b7886` across steps
+   score `+inf`. Fix: frozen slots never compete; protected decoded slots keep
+   their token and only the remaining `budget - n_protected` slots are chosen
+   from the highest margins. Verified: pre-filled tokens are unchanged and
+   `remask_ratio=0.0` is token-identical to commit `e2b7886` across steps
    1/2/3/4/8 × {greedy, T=0.5, position_decay}.
+
+6. **The reconstruction quota spent half its schedule before the first fill
+   (found 2026-11-15, review of bug 5).** `budget = floor(s/K*C) - n_frozen`
+   subtracts the visible slots from a quota that also counts them, so with a
+   50%-masked canvas the first `K/2` steps all evaluated `budget <= 0`:
+   k=8 filled `16,16,16,16,16,12,8,4` and behaved like k=4, and k=2 never
+   iterated at all. Fix: interpolate over the mutable slots,
+   `floor(s/K * (C - n_frozen))`. Mask counts before each forward are now
+   exactly `16,14,12,10,8,6,4,2` (k=8), `16,12,8,4` (k=4), `16,8` (k=2) for
+   `C=32, n_frozen=16`, and reconstruction recovery rose
+   80.4→89.7 / 88.1→92.3 / 90.7→96.4% at k=2/4/8. With `n_frozen=0` the formula
+   reduces to `floor(s/K*C)`, so free generation stays token-identical
+   (re-verified against `21812a7` with suppression off, 20/20 cases).
 
 ## CPU sprint: preset, corpus, floor
 
@@ -317,7 +324,38 @@ python train.py --cpu --lora --threads 20 --steps 3000 --batch_size 4 \
   Full curve in `docs/loss-curve.csv`.
 - Checkpoints are adapter-only, 8.4 MB each, in `runs/bfg-lora/`.
 
+## Systems finding: where CPU block diffusion stops paying
+
+**On CPU, block diffusion's parallel-GEMM advantage only beats causal GEMV while
+`k <= 4` and `P <= 256`. Past that point the `k*C` redundant token evaluations
+saturate fp32 compute and the speedup disappears.**
+
+Supporting cells from the sweep above (batch 4, the realistic serving shape):
+
+| P | k=4 | k=8 |
+|---|---|---|
+| 32 | 1.87x | 0.88x |
+| 128 | 1.56x | 0.99x |
+| 256 | 1.35x | 0.94x |
+| 512 | 1.14x | 0.88x |
+
+- k=8 is already at parity at `P=128` and below causal from `P=256` on, so the
+  "more steps is better quality" argument is bought at a compute loss on this
+  hardware.
+- k=4 never falls below 1.0 in the measured range, but it decays monotonically
+  toward it (1.87x → 1.14x) and extrapolates through 1.0 just past `P=512`,
+  which is the ceiling for this box with `C=32`.
+- Mechanism: each diffusion step is a `32 x d` GEMM over `P+32` cached keys,
+  repeated `k` times; causal decoding is `32` sequential `1 x d` GEMV passes.
+  The GEMM wins on arithmetic intensity (the 0.5B weights are read once per
+  canvas step instead of once per token), but it computes `k*C` token slots, of
+  which only `C` survive. At fp32 on 10 physical cores the extra work overtakes
+  the weight amortisation once `P` makes the KV term dominant.
+- Practical rule: use `k=4` for `P <= 256`, fall back to causal `generate()` for
+  long prefixes, and only use `k=8` when quality is worth ~10-15% throughput.
+
 ## Task 1: evaluation of the 3000-step attention-LoRA checkpoint
+
 
 Checkpoint `runs/bfg-lora/last.pt` (step 3000, r=16 attention adapters, 2.16M
 trainable). Training: 13,211 s = 3 h 40 min, 4.2 s/step, 153 tok/s at the tail,
@@ -373,23 +411,27 @@ python benchmark.py --checkpoint runs/bfg-lora/last.pt --num_prompts 12 \
 
 | method | recovery | TPS | 1000-step full FT recovery |
 |---|---|---|---|
-| bfg-diff k=2 | 80.4% | 47.1 | 63.9% |
-| bfg-diff k=4 | 88.1% | 32.5 | 81.4% |
-| bfg-diff k=8 | 90.7% | 20.0 | 90.2% |
+| bfg-diff k=2 | 89.7% | 47.0 | 63.9% |
+| bfg-diff k=4 | 92.3% | 32.7 | 81.4% |
+| bfg-diff k=8 | 96.4% | 20.2 | 90.2% |
 
-- **The LoRA checkpoint is a better infiller than the full fine-tune at every
-  `k`** (+16.5, +6.7, +0.5 points) and roughly 2x faster, because of the prefix KV
-  cache added since. The 3000 steps did buy reconstruction quality; they bought
-  nothing for free generation.
-- Recovery is monotone in `k` again (80.4 → 88.1 → 90.7). An earlier run of the
-  same command read 79.9 / 79.9 / 82.0, which was bug #5: frozen slots consumed
-  the whole step budget, so every fill happened at the last step regardless of
-  `k`. The numbers above are post-fix (`runs/bench-recon-fixed.log`); the mask
-  draw is fixed-seed, so they are directly comparable.
-- `k=2` is single-shot by construction here. The quota at step 1 is `C/2 = 16`,
-  which is already the number of visible slots, so there is no budget until the
-  final step. That is the designed behaviour of a canvas-wide quota, not a bug:
-  half-canvas infilling with 2 steps has no interior step to iterate on.
+- **Fixing the quota schedule (bug #6) is the largest quality gain of the
+  sprint, and it is pure sampling math.** With `budget = floor(s/K*C) - n_frozen`
+  the first four steps of k=8 unmasked nothing (quota 4/8/12/16 minus 16 visible
+  slots), so a 50%-masked canvas got four real steps, not eight. Interpolating
+  over the `C - n_frozen` mutable slots gives the scheduled
+  `16,14,12,10,8,6,4,2` and lifts recovery 80.4→89.7, 88.1→92.3, 90.7→96.4%.
+- **The LoRA checkpoint is now a better infiller than the full fine-tune at
+  every `k`** (+25.8, +10.9, +6.2 points) at roughly 2x the TPS, because of the
+  prefix KV cache. Reconstruction quality was never the binding constraint on
+  free generation; this table says the 3000 adapter steps did learn infilling.
+- Recovery is monotone in `k` (89.7 → 92.3 → 96.4) and k=2 now iterates: its
+  first budget is 8 mutable slots, not 0.
+- With collision suppression on (default), the k=8 mask schedule deviates at the
+  last interior step (`...,4,4` instead of `...,4,2`): one adjacent pair sampled
+  the same token, the weaker was held back, and the final step filled it. The
+  canvas still ends with zero masks. With `--no_adj_suppress` the schedule is
+  exactly `16,14,12,10,8,6,4,2`.
 - `run_reconstruction` always samples with `remask_ratio=0.0`; re-masking is a
   generation-time knob here, so this table is a pure `k` ablation.
 
@@ -419,12 +461,16 @@ python benchmark.py --checkpoint runs/bfg-lora/last.pt --num_prompts 12 \
 
 Exact decoded text for all 12 prompts × 19 configs: `docs/decoded-samples.md`.
 The three `r=0` rows were re-measured after the frozen-budget fix (bug #5) with
-identical H4/rep4/Dist and TPS within 0.5% (`runs/bench-recon-fixed.log`).
+identical H4/rep4/Dist and TPS within 0.5% (`runs/bench-recon-fixed.log`). This
+table predates collision suppression, so its `adj` column was not recorded; the
+same configs re-measured with suppression on/off are below.
 
-### Task 3: quota-preserving re-masking
+### Re-masking ablation (Task 3, no collision suppression)
 
 Each `k` group holds the same config twice, `r=0` then `r=0.25`; that pair is the
-Task 3 ablation. Interpretation of both tables:
+Task 3 ablation, measured before adjacent-token suppression existed. The
+shipped-default numbers (suppression on) are in the next section. Interpretation
+of both tables:
 
 - **Re-masking is the single largest sampler win measured.** At T=0, k=8 it moves
   rep4 42.2% → 10.1% and H4 0.658 → 0.949 at *zero* TPS cost (24.5 either way;
@@ -450,7 +496,54 @@ Task 3 ablation. Interpretation of both tables:
   k=2 it is also worse (rep4 56.0% → 67.5%). The headline improvement over the
   old checkpoint comes from the sampler (`r=0.25`), not from the weights.
 
-### Task 2: prefix KV cache scaling
+### Collision suppression A/B (shipped default)
+
+`runs/bench-adj.log` (suppression on, default) vs `runs/bench-noadj.log`
+(`--no_adj_suppress`), same checkpoint, same prompts, fixed quota, `r=0.25`:
+
+| k | T | H4 off → on | rep4 off → on | rep2 off → on | adj off → on | Dist-2 off → on |
+|---|---|---|---|---|---|---|
+| 2 | 0.0 | 0.385 → 0.583 | 67.5% → 49.7% | 77.7% → 69.9% | 82.5% → 68.8% | 0.164 → 0.226 |
+| 4 | 0.0 | 0.642 → 0.874 | 45.1% → 22.1% | 65.6% → 53.8% | 65.6% → 41.1% | 0.258 → 0.363 |
+| 8 | 0.0 | 0.949 → **0.967** | 10.1% → **5.7%** | 42.7% → 37.4% | 31.5% → **24.2%** | 0.444 → 0.478 |
+| 2 | 0.3 | 0.925 → 0.982 | 11.8% → 3.7% | 41.1% → 32.8% | 32.8% → 20.2% | 0.422 → 0.449 |
+| 4 | 0.3 | 0.903 → 0.972 | 14.4% → 5.7% | 45.4% → 33.6% | 36.0% → 23.9% | 0.470 → 0.540 |
+| 8 | 0.3 | 0.986 → 0.990 | 2.9% → 2.3% | 23.9% → 25.3% | 19.1% → 17.2% | 0.702 → 0.656 |
+| 2 | 0.5 | 0.995 → 0.998 | 1.1% → 0.6% | 20.7% → 14.5% | 18.0% → 12.4% | 0.618 → 0.739 |
+| 4 | 0.5 | 0.992 → 0.993 | 1.7% → 1.7% | 18.8% → 20.2% | 15.3% → 9.4% | 0.723 → 0.707 |
+| 8 | 0.5 | 0.996 → 0.995 | 0.9% → 1.1% | 15.1% → 13.7% | 14.0% → 11.6% | 0.788 → 0.831 |
+| causal | | 0.964 | 7.8% | 20.7% | 0.0% | 0.653 |
+
+Metrics added in this pass: `rep2` = 1 - unique 2-grams / total 2-grams within a
+sequence, `adj` = fraction of neighbouring token pairs that are identical.
+`adj` is the column `rep4` was hiding: at k=8/T=0 the old sampler produced a
+31.5% adjacent-duplicate rate that barely moved the 4-gram number.
+
+Findings:
+
+- **Suppression works best where the collision problem is worst.** At `k=2`
+  sixteen slots commit in one step: rep4 67.5% → 49.7%, adj 82.5% → 68.8%,
+  H4 0.385 → 0.583. At `k=8` only one or two slots commit per step, so the gain
+  is small but still there at T=0 (rep4 10.1% → 5.7%, adj 31.5% → 24.2%).
+- **`not not not` is gone, `the the the` is not.** k=8 T=0 decodes
+  `the were able able to to fish the fish of the the the the same of the fish
+  were fish fish were not the the fish were not same the fish were`: the
+  three-token `not not not` run has disappeared, but runs of `the` survive
+  because they are committed in *different* steps. The mechanism can only see
+  simultaneous predictions, and that is exactly its stated scope.
+- **At T>=0.3 the effect is inside noise** (rep2 and Dist-2 move in both
+  directions, ±2 points). Sampling noise already breaks up many pairs, so the
+  deterministic setting is where the mechanism pays.
+- **Causal still wins** on `adj` (0.0% by construction: `generate()` conditions
+  on the previous token) and on Dist-2. Diffusion is now at H4 parity
+  (0.967 vs 0.964) with more adjacent stutter left.
+- Cost: none measurable (same forward count, TPS within noise: 24.5 vs 24.4 at
+  k=8/T=0).
+
+Full decoded text for this build: `docs/decoded-samples-suppressed.md` (120
+blocks, 12 prompts × 9 configs).
+
+### Prefix KV cache scaling (Task 2)
 
 ```bash
 python benchmark.py --checkpoint runs/bfg-lora/last.pt --prefix_sweep \
@@ -520,10 +613,15 @@ smoke convergence: 5.4177 -> 3.5945 PASS
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.
-- Infilling separates from generation strongly (90% recovery vs 10-40% repeat),
+- Infilling separates from generation strongly (96.4% recovery vs 5.7% rep4),
   but 3000 LoRA steps on 2M tokens still do not give coherent free generation.
   Larger `C`, a longer canvas, or a curriculum on `t` are the remaining levers;
   more steps at this corpus size are not (the val curve is flat after 2600).
+- Adjacent-collision suppression only sees *simultaneous* predictions. Runs
+  committed across different steps (`the the the` after three separate steps)
+  survive it: 24.2% adjacent duplicates at k=8/T=0 versus 0% causal. A variant
+  that compares the surviving token of a committed slot against its neighbour's
+  candidate would close that gap and is not implemented.
 - The margin floor was only measured at 1.0 on the 1000-step full fine-tune
   (it lost to the rigid quota). It is now redundant with `remask_ratio` for the
   repetition failure mode and has not been re-swept on the LoRA checkpoint.

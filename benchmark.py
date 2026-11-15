@@ -98,6 +98,8 @@ def parse_args():
                    help="fraction of decoded slots that may be re-masked per step")
     p.add_argument("--prefix_sweep", action="store_true",
                    help="TPS vs prefix length for causal and bfg-diff at batch 1 and 4")
+    p.add_argument("--no_adj_suppress", action="store_true",
+                   help="disable adjacent-token collision suppression")
     p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -164,6 +166,16 @@ def distinct(seqs, n):
     return len(unique) / total if total else 0.0
 
 
+def adj_dup(seqs):
+    """Fraction of neighbouring token pairs that are the same token."""
+    hits = pairs = 0
+    for s in seqs:
+        for a, b in zip(s, s[1:]):
+            pairs += 1
+            hits += a == b
+    return hits / pairs if pairs else 0.0
+
+
 @torch.inference_mode()
 def run_reconstruction(model, tok, args, mask_id, device, steps):
     n = args.num_prompts
@@ -212,7 +224,7 @@ def run_sampler_generation(
             model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
             prefix_keep=keep, margin_floor=margin_floor,
             temperature=temperature, position_decay=position_decay, top_k=args.top_k,
-            remask_ratio=remask_ratio,
+            remask_ratio=remask_ratio, suppress_adjacent=not args.no_adj_suppress,
         )
         token_ids.extend(canvas.tolist())
     sync(device)
@@ -320,7 +332,10 @@ def main():
         print(f"{f'bfg-diff k={steps}':<18}{rec:>9.1%}{tps:>12,.1f}")
 
     print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len} | top_k={args.top_k}")
-    print(f"{'method':<34}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
+    print(
+        f"{'method':<34}{'H4':>7}{'rep4':>7}{'rep2':>7}{'adj':>7}"
+        f"{'Dist1':>7}{'Dist2':>7}{'TPS':>10}"
+    )
     outputs = {}
     for floor in args.floors:
         for temp in args.temps:
@@ -336,12 +351,14 @@ def main():
                         outputs[name] = texts
                         print(
                             f"{name:<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+                            f"{repeat_rate(ids, 2):>7.1%}{adj_dup(ids):>7.1%}"
                             f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
                         )
     ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
     outputs["causal generate"] = texts
     print(
         f"{'causal generate':<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+        f"{repeat_rate(ids, 2):>7.1%}{adj_dup(ids):>7.1%}"
         f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
     )
 

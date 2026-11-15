@@ -95,12 +95,12 @@ Parallel unmasking commits tokens that later steps cannot revisit: a slot decode
 at step 1 never sees the tokens decoded at step 2. `remask_ratio` (default 0)
 re-opens the weakest fraction of already-decoded slots at every interior step.
 
-The quota is defined over the whole canvas: after step `s` the canvas holds
-`floor(s/K*C)` unmasked slots. Pre-filled reconstruction slots are part of that
-count and are frozen, so they never take part in the margin competition — when
-half the canvas is visible, the early steps have no budget left and iteration
-only starts once `floor(s/K*C)` exceeds the number of visible slots
-(`s > K/2`). A masked slot that is not re-selected goes back to `[MASK]`.
+The quota runs over the mutable slots only: after step `s` the canvas holds
+`n_frozen + floor(s/K * (C - n_frozen))` unmasked slots. Pre-filled
+reconstruction slots are frozen, so they neither compete on margin nor consume
+the schedule — a 50%-masked canvas with `K=8` still gets 8 real steps
+(`16,14,12,10,8,6,4,2` masks before each forward), not 4. A masked slot that is
+not re-selected goes back to `[MASK]`.
 
 At each interior step, for every batch row:
 
@@ -109,16 +109,31 @@ At each interior step, for every batch row:
    they keep their token and count against the quota but are not re-selected.
 3. The remaining decoded slots compete with the masked slots on their raw
    margin, so a stale commitment can lose to a confident new position.
-4. Fill the remaining budget `floor(s/K*C) - n_frozen - n_protected` with the
+4. Fill the remaining budget `floor(s/K * (C - n_frozen)) - n_protected` with the
    highest-scoring candidates.
 5. Rebuild the row: frozen slots keep their token, non-selected slots return to
    `[MASK]`, protected slots keep theirs, and newly selected slots take the
    freshly sampled token.
 
 The final step fills every remaining mask, so the canvas is always complete.
-Because the quota is defined over the whole canvas, `margin_floor` no longer
-adds catch-up slots for held-back positions: a floor can leave the canvas under
-quota for a step, and those slots are filled at the end.
+`margin_floor` only blocks slots; it never adds catch-up slots, so a floor can
+leave the canvas under quota for a step and those slots are filled at the end.
+
+### Adjacent-token suppression
+
+Two slots decoded in the same step cannot see each other's choice, so they can
+both commit the same high-prior token and produce `not not` / `the the`. Before
+the budget is spent, adjacent slots whose effective token (stored for committed
+slots, sampled otherwise) is identical are compared on margin: the weaker one is
+scored `-inf` for this step, so only the stronger anchor commits and the loser
+re-predicts next step with its neighbour in the canvas.
+
+Only still-masked slots can be held back — a token that is already committed is
+never revoked here, so the quota stays monotone. Two consequences: the loser
+costs one step of latency at the tail (with `C=32, K=8`, 50% masked, the mask
+schedule becomes `16,14,12,10,8,6,4,4` instead of `...,4,2`), and a collision
+between two tokens committed in *different* steps is out of scope, because the
+two slots never predicted simultaneously.
 
 ### Margin floor
 

@@ -20,6 +20,7 @@ def sample_canvas_block(
     position_decay=0.0,
     top_k=50,
     remask_ratio=0.0,
+    suppress_adjacent=True,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -35,10 +36,15 @@ def sample_canvas_block(
 
     `remask_ratio > 0` lets the weakest fraction of already-decoded slots re-enter
     the competition: they lose their protected status and can be reset to the mask
-    if a still-masked slot outscores them. After step `s` the canvas holds exactly
-    `floor(s/K*C)` unmasked slots, counting pre-filled slots, which are frozen and
-    never compete for budget. Re-masking changes which slots hold the quota, not
+    if a still-masked slot outscores them. After step `s` the canvas holds
+    `n_frozen + floor(s/K * (C - n_frozen))` unmasked slots, so pre-filled slots
+    never starve the schedule. Re-masking changes which slots hold the quota, not
     how many are held.
+
+    `suppress_adjacent` drops the weaker of two adjacent slots that predict the
+    same token in the same step, so a stutter (`not not`) cannot be committed by
+    two slots that never saw each other. The loser stays masked and re-predicts
+    next step with the winner in the canvas.
     """
     assert steps >= 1 and canvas_len >= 1
     B = prefix_ids.shape[0]
@@ -91,6 +97,21 @@ def sample_canvas_block(
                     keep_token[i, idx[margin[i, idx].topk(n).indices]] = True
             rank = rank.masked_fill(keep_token, float("inf"))
 
+            # Two neighbours predicting the same token would commit a stutter.
+            # Only slots that are still masked can be held back: a committed
+            # token is never revoked here. The loser re-predicts next step with
+            # its neighbour in the canvas.
+            if suppress_adjacent:
+                eff = torch.where(keep_token, canvas, sampled)  # token that would stand
+                same = (eff[:, :-1] == eff[:, 1:]) & ~(frozen[:, :-1] & frozen[:, 1:])
+                open_l = ~keep_token[:, :-1]  # still masked, may commit this step
+                open_r = ~keep_token[:, 1:]
+                ml, mr = margin[:, :-1], margin[:, 1:]
+                kill = torch.zeros_like(frozen)
+                kill[:, :-1] = same & open_l & (~open_r | (ml < mr))
+                kill[:, 1:] = same & open_r & (~open_l | (mr <= ml))
+                rank = rank.masked_fill(kill, -float("inf"))
+
         for i in range(B):
             n_frozen = int(frozen[i].sum())
             if s == steps:  # final step: fill every remaining mask, keep the rest
@@ -98,8 +119,10 @@ def sample_canvas_block(
                 row = canvas[i].clone()
                 row[pick] = sampled[i, pick]
             else:
-                budget = min(max(0, int(s / steps * canvas_len) - n_frozen),
-                             canvas_len - n_frozen)
+                # Interpolate strictly over the slots this sampler can fill:
+                # pre-filled slots hold their own share of the canvas for free.
+                n_mutable = canvas_len - n_frozen
+                budget = min(max(0, int(s / steps * n_mutable)), n_mutable)
                 if not budget:
                     continue
                 # Protected decoded slots keep their token; the rest of the budget

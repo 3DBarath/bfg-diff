@@ -95,14 +95,17 @@ python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 100 \
 Reports, for every step-count x margin-floor x temperature x decay combination:
 
 - masked-token recovery on 50%-masked real text,
-- 4-gram entropy, 4-gram repeat rate, Dist-1 and Dist-2,
+- 4-gram entropy, 4-gram repeat rate, **2-gram repeat rate** and **`adj`**
+  (fraction of neighbouring tokens that are identical), Dist-1 and Dist-2,
 - wall-clock tokens/s, alongside Hugging Face causal `generate()`.
 
 `--top_k` truncates the stochastic sampler to the `k` most likely tokens per
 slot (default 50); it has no effect at `--temps 0.0`. `--remask_ratio 0.25`
 re-opens the weakest 25% of decoded slots every step, keeping the quota exact.
-`--prefix_sweep` instead prints a Markdown TPS table for `P = 32, 128, 256, 512`
-x batch 1/4, comparing causal `generate()` with cached `k=4` and `k=8`.
+Adjacent-token collision suppression is on by default; `--no_adj_suppress`
+turns it off for the A/B comparison. `--prefix_sweep` instead prints a Markdown
+TPS table for `P = 32, 128, 256, 512` x batch 1/4, comparing causal `generate()`
+with cached `k=4` and `k=8`.
 
 It also prints side-by-side completions for the first `--show` prompts
 (diffusion vs causal), so repetition and phrasing can be inspected directly.
@@ -126,14 +129,17 @@ reported and the base model is benchmarked instead.
    with the mask. Cross-entropy is computed only on those positions.
 4. **Sampling.** Start from an all-mask canvas. Each step, score every masked
    slot by `log p(1) - log p(2)`, unmask the `floor(s/K*C)` highest-margin
-   slots, and freeze them. With a partially filled canvas only the remaining
-   masked slots are eligible. `margin_floor` optionally holds back slots whose
-   top-1 is not clearly ahead of the runner-up; held-back slots are filled by
-   argmax at the end. `temperature > 0` samples tokens with Gumbel noise over
-   the `top_k` most likely logits (ranking still uses clean margins), and
-   `position_decay > 0` biases step 1 toward the canvas start. `remask_ratio`
-   lets the weakest decoded slots re-compete against masked ones each step
-   without changing the per-step quota.
+   slots, and freeze them. With a partially filled canvas the schedule runs over
+   the `C - n_frozen` mutable slots only, so pre-filled slots never starve it.
+   `margin_floor` optionally holds back slots whose top-1 is not clearly ahead
+   of the runner-up; held-back slots are filled by argmax at the end.
+   `temperature > 0` samples tokens with Gumbel noise over the `top_k` most
+   likely logits (ranking still uses clean margins), and `position_decay > 0`
+   biases step 1 toward the canvas start. `remask_ratio` lets the weakest
+   decoded slots re-compete against masked ones each step without changing the
+   quota. Adjacent slots that sample the same token in the same step keep only
+   the more confident one, so the weaker slot re-predicts with its neighbour in
+   context.
 5. **Prefix KV cache.** The prefix is prefilled once per prompt; each diffusion
    step forwards only the `C` canvas tokens against the cached prefix keys and
    values, so a step costs `C` tokens instead of `P+C`.
