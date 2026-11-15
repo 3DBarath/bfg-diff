@@ -61,6 +61,10 @@ def apply_lora(model, r=16, alpha=32, dropout=0.05, targets=("q_proj", "k_proj",
     )
 
 
+LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
+LORA_TARGETS_MLP = LORA_TARGETS + ("gate_proj", "up_proj", "down_proj")
+
+
 def build_hybrid_attention_mask(
     prefix_len, canvas_len, batch_size=1, dtype=torch.bfloat16, device="cuda", prefix_keep=None
 ):

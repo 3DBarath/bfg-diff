@@ -1,4 +1,6 @@
 """Iterative non-autoregressive canvas decoding, highest Top-1 margin first."""
+import math
+
 import torch
 
 from model import MASK_TOKEN_ID, canvas_forward, canvas_step_with_cache, prefill_prefix
@@ -17,6 +19,7 @@ def sample_canvas_block(
     temperature=0.0,
     position_decay=0.0,
     top_k=50,
+    remask_ratio=0.0,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -29,6 +32,13 @@ def sample_canvas_block(
     logits instead of taking the clean argmax; the margin ranking still uses the
     clean log-probs. `position_decay > 0` multiplies step-1 margins by
     `exp(-lambda * i / C)`, anchoring the canvas start to the prefix.
+
+    `remask_ratio > 0` lets the weakest fraction of already-decoded slots re-enter
+    the competition: they lose their protected status and can be reset to the mask
+    if a still-masked slot outscores them. After step `s` the canvas holds exactly
+    `floor(s/K*C)` unmasked slots, counting pre-filled slots, which are frozen and
+    never compete for budget. Re-masking changes which slots hold the quota, not
+    how many are held.
     """
     assert steps >= 1 and canvas_len >= 1
     B = prefix_ids.shape[0]
@@ -47,7 +57,8 @@ def sample_canvas_block(
             / canvas_len
         )
 
-    prev_quota = 0
+    frozen = canvas != mask_id  # pre-filled input slots: never touched
+    decoded = torch.zeros_like(frozen)  # slots this sampler has filled
     prefix_len = prefix_ids.shape[1]
     kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix encoded once
     for s in range(1, steps + 1):
@@ -57,14 +68,9 @@ def sample_canvas_block(
         z = logits.float()  # log p(i) - log p(j) == z(i) - z(j): softmax shift cancels
         top2 = z.topk(2, dim=-1)
         margin = top2.values[..., 0] - top2.values[..., 1]  # clean confidence
-        score = margin * decay if (decay is not None and s == 1) else margin
-        score = score.masked_fill(canvas != mask_id, -float("inf"))
-        quota = min(canvas_len, int(s / steps * canvas_len))
-        budget = quota - prev_quota
-        prev_quota = quota
-        eligible = canvas == mask_id
+        rank = margin * decay if (decay is not None and s == 1) else margin
         if margin_floor > 0.0 and s < steps:
-            eligible &= margin >= margin_floor
+            rank = rank.masked_fill((canvas == mask_id) & (margin < margin_floor), -float("inf"))
 
         if temperature > 0.0:
             vals, idx = z.topk(min(top_k or z.shape[-1], z.shape[-1]), dim=-1)
@@ -74,11 +80,46 @@ def sample_canvas_block(
         else:
             sampled = top2.indices[..., 0]
 
-        for i in range(B):  # per-sample count: a pre-filled canvas may have fewer slots
-            n = min(budget, int(eligible[i].sum()))
-            if n:
-                idx = score[i].topk(n).indices
-                canvas[i, idx] = sampled[i, idx]
+        # Slots whose existing token survives: frozen input plus the confident
+        # fraction of already-decoded slots. The rest of `decoded` competes again.
+        keep_token = frozen.clone()
+        if s < steps:
+            for i in range(B):
+                idx = decoded[i].nonzero().flatten()
+                if idx.numel():
+                    n = math.ceil((1.0 - remask_ratio) * idx.numel())
+                    keep_token[i, idx[margin[i, idx].topk(n).indices]] = True
+            rank = rank.masked_fill(keep_token, float("inf"))
+
+        for i in range(B):
+            n_frozen = int(frozen[i].sum())
+            if s == steps:  # final step: fill every remaining mask, keep the rest
+                pick = (canvas[i] == mask_id).nonzero().flatten()
+                row = canvas[i].clone()
+                row[pick] = sampled[i, pick]
+            else:
+                budget = min(max(0, int(s / steps * canvas_len) - n_frozen),
+                             canvas_len - n_frozen)
+                if not budget:
+                    continue
+                # Protected decoded slots keep their token; the rest of the budget
+                # is filled from the strongest remaining slots. Frozen slots never
+                # compete: they already hold quota and are restored below.
+                keep = keep_token[i] & ~frozen[i]
+                need = budget - int(keep.sum())
+                pick = keep.nonzero().flatten()
+                if need > 0:
+                    cand = (rank[i] > -float("inf")) & ~frozen[i] & ~keep
+                    cand = cand.nonzero().flatten()
+                    if cand.numel():
+                        order = rank[i, cand].topk(min(need, cand.numel())).indices
+                        pick = torch.cat([pick, cand[order]])
+                old = canvas[i].clone()
+                row = torch.full_like(old, mask_id)
+                row[frozen[i]] = old[frozen[i]]
+                row[pick] = torch.where(keep_token[i, pick], old[pick], sampled[i, pick])
+            canvas[i] = row
+            decoded[i] = (row != mask_id) & ~frozen[i]
 
     leftover = canvas == mask_id  # only if steps/canvas_len rounding left holes
     if leftover.any():

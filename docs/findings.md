@@ -52,31 +52,31 @@ Notes:
 ## Benchmark smoke test
 
 Command: `python benchmark.py --smoke_test` (2 prefixes, `C=16`, k=2, 12-step
-checkpoint). Runtime ~17 s.
+checkpoint). Runtime ~20 s. Re-measured 2026-11-15 with the re-mask sampler:
 
 ```
 Reconstruction
-bfg-diff k=2     recovery 5.3%   16.4 TPS
+bfg-diff k=2     recovery 15.8%   18.4 TPS
 
 Generation
-bfg-diff k=2     4-gram H 0.532   repeat 46.2%   38.1 TPS
-causal generate  4-gram H 1.000   repeat  0.0%   13.3 TPS
+bfg-diff k=2     4-gram H 0.251   repeat 73.1%   27.4 TPS
+causal generate  4-gram H 1.000   repeat  0.0%   13.2 TPS
 ```
 
 How to read this:
 
-- 5.3% recovery is far above the ~0.0007% chance rate, but a 12-step checkpoint
+- 15.8% recovery is far above the ~0.0007% chance rate, but a 12-step checkpoint
   has not learned denoising. Do not use these numbers as quality results.
 - The repeated 4-grams and low entropy of the k=2 sampler are exactly the
   degeneration the margin ordering is meant to fight; two steps are too few and
   the model is undertrained. The k=4/k=8 defaults on a trained model are the
   intended setting.
 - TPS includes prompt tokenisation and batch padding. Causal generation is
-  slower by ~2.9x here even though each diffusion step itself is a full
+  slower by ~2x here even though each diffusion step itself is a full
   `P+C` forward.
 - Extrapolating the measured rates (optimistically, since causal context grows):
-  100 prompts x 128 tokens is roughly 16 min for `generate()` and 5–6 min for
-  k=4 diffusion on this CPU. Use a GPU or lower `--num_prompts`/`--canvas_len`
+  100 prompts x 128 tokens is roughly 13 min for `generate()` and 6 min for
+  k=2 diffusion on this CPU. Use a GPU or lower `--num_prompts`/`--canvas_len`
   for exploratory runs.
 
 ## Bugs found and fixed
@@ -105,6 +105,21 @@ How to read this:
 4. **CPU dtype.** Auto-selecting bf16 on CPU makes the smoke run slower and
    tests an emulated path; the loader now chooses fp32 on CPU and bf16 on CUDA
    unless overridden with `--dtype`.
+
+5. **Pre-filled slots ate the whole diffusion budget (found 2026-11-15 while
+   writing the Task 1 table).** The quota-preserving re-mask rewrite selected
+   `topk(budget)` over the *entire* canvas, and frozen reconstruction slots carry
+   score `+inf`. With 16 of 32 slots pre-filled, `budget = floor(s/K*C) - 16` was
+   won entirely by frozen slots, so no masked slot was ever chosen before the
+   final step: all infilling collapsed into one shot, and reconstruction recovery
+   came out flat (79.9 / 79.9 / 82.0% for k=2/4/8, versus 63.9 / 81.4 / 90.2%
+   with the old sampler). Fix: frozen slots never compete; protected decoded
+   slots keep their token and only the remaining
+   `budget - n_protected` slots are chosen from the highest margins. Verified:
+   mask counts before each forward at `C=32`, 16 frozen, k=8 are now
+   `16,16,16,16,16,12,8,4`, pre-filled tokens are unchanged, and
+   `remask_ratio=0.0` is still token-identical to commit `e2b7886` across steps
+   1/2/3/4/8 × {greedy, T=0.5, position_decay}.
 
 ## CPU sprint: preset, corpus, floor
 
@@ -298,22 +313,235 @@ python train.py --cpu --lora --threads 20 --steps 3000 --batch_size 4 \
 - Therefore 3000 steps ≈ 3.5 h plus ~15 min of evaluation, not the ~45 min
   estimated in the task brief. Effective batch is 8 (1500 optimizer updates),
   so this is 12x the optimizer updates of the earlier 1000-step full fine-tune.
-- Checkpoints are adapter-only, a few MB, in `runs/bfg-lora/`.
+- Actual run: 13,211 s (3 h 40 min), final val 3.7263, best 3.6254 @2600.
+  Full curve in `docs/loss-curve.csv`.
+- Checkpoints are adapter-only, 8.4 MB each, in `runs/bfg-lora/`.
+
+## Task 1: evaluation of the 3000-step attention-LoRA checkpoint
+
+Checkpoint `runs/bfg-lora/last.pt` (step 3000, r=16 attention adapters, 2.16M
+trainable). Training: 13,211 s = 3 h 40 min, 4.2 s/step, 153 tok/s at the tail,
+effective batch 8, 1500 optimizer updates.
+
+### Loss curve
+
+166 logged points, extracted verbatim to `docs/loss-curve.csv`
+(`step,loss,split`; train is a 20-step mean, val is 64 chunks with a fresh 50%
+mask). Every tenth point:
+
+| step | train | val | | step | train | val |
+|---|---|---|---|---|---|---|
+| 1 | 16.7940 | — | | 1600 | 4.3845 | 3.8302 |
+| 20 | 12.6339 | — | | 1800 | 4.5324 | 4.0500 |
+| 100 | 5.5466 | — | | 2000 | 4.8721 | 3.9739 |
+| 200 | 5.5351 | 4.5726 | | 2200 | 5.0892 | 4.0071 |
+| 400 | 4.9582 | 4.3238 | | 2400 | 4.8446 | 4.1155 |
+| 600 | 5.2872 | 4.3598 | | 2600 | 4.6397 | **3.6254** |
+| 800 | 5.1294 | 4.9353 | | 2800 | 4.8162 | 4.0966 |
+| 1000 | 5.1107 | 3.8867 | | 3000 | 4.6068 | 3.7263 |
+| 1200 | 5.2887 | 4.2450 | | | | |
+| 1400 | 4.9299 | 4.4857 | | | | |
+
+How to read it:
+
+- **The train curve stops moving at ~step 300.** From step 200 to 3000 the 20-step
+  mean sits in 4.38–5.29 with no trend; the LR schedule decays from 5e-4 to 0
+  over that window and the loss does not follow. The task is
+  `mask ~ U(0.20, 1.0)` plus 20% fully masked batches, redrawn every step, so the
+  per-step number is dominated by how many tokens were masked, not by fit.
+- **Validation is the only usable signal** and it is noisy: ±0.3 between adjacent
+  evals at the same nominal quality. Best 3.6254 @2600, final 3.7263 @3000. The
+  2600→2800 jump (3.63 → 4.10) is larger than any plausible real regression at
+  lr≈2e-7, so treat the tail as flat.
+- **Step 1 is an outlier, not a bug in logging.** Train loss 16.79 is above
+  `ln(151936) = 11.93`, which a mean cross-entropy can only reach if the first
+  batch produces extreme logits — that batch is entirely unseen
+  `[MASK]`-filled canvases at `t≈1`. It recovers to 5.5 within 100 steps.
+- Attainable floor: the 1000-step full fine-tune reached val 3.6395 @800 with
+  100% of the weights; attention-only LoRA reaches 3.6254 @2600 with 0.43%.
+  **The adapter is not under-trained relative to the full fine-tune; it is
+  simply a different (and much smaller) parameter budget.**
+
+### Reconstruction (50% masked, P=128, C=32, 12 prefixes, batch 2)
+
+```bash
+python benchmark.py --checkpoint runs/bfg-lora/last.pt --num_prompts 12 \
+  --prefix_len 128 --canvas_len 32 --batch_size 2 --steps 2 4 8 \
+  --temps 0.0 0.3 0.5 --top_k 50 --remask_ratio 0.0 0.25 --show 12 --threads 10
+```
+
+| method | recovery | TPS | 1000-step full FT recovery |
+|---|---|---|---|
+| bfg-diff k=2 | 80.4% | 47.1 | 63.9% |
+| bfg-diff k=4 | 88.1% | 32.5 | 81.4% |
+| bfg-diff k=8 | 90.7% | 20.0 | 90.2% |
+
+- **The LoRA checkpoint is a better infiller than the full fine-tune at every
+  `k`** (+16.5, +6.7, +0.5 points) and roughly 2x faster, because of the prefix KV
+  cache added since. The 3000 steps did buy reconstruction quality; they bought
+  nothing for free generation.
+- Recovery is monotone in `k` again (80.4 → 88.1 → 90.7). An earlier run of the
+  same command read 79.9 / 79.9 / 82.0, which was bug #5: frozen slots consumed
+  the whole step budget, so every fill happened at the last step regardless of
+  `k`. The numbers above are post-fix (`runs/bench-recon-fixed.log`); the mask
+  draw is fixed-seed, so they are directly comparable.
+- `k=2` is single-shot by construction here. The quota at step 1 is `C/2 = 16`,
+  which is already the number of visible slots, so there is no budget until the
+  final step. That is the designed behaviour of a canvas-wide quota, not a bug:
+  half-canvas infilling with 2 steps has no interior step to iterate on.
+- `run_reconstruction` always samples with `remask_ratio=0.0`; re-masking is a
+  generation-time knob here, so this table is a pure `k` ablation.
+
+### Free generation (100% masked, C=32, top_k=50 for T>0)
+
+| method | H4 | rep4 | Dist-1 | Dist-2 | TPS |
+|---|---|---|---|---|---|
+| k=2, T=0, r=0 | 0.385 | 67.5% | 0.086 | 0.164 | 78.3 |
+| k=4, T=0, r=0 | 0.527 | 58.0% | 0.107 | 0.220 | 45.2 |
+| k=8, T=0, r=0 | 0.658 | 42.2% | 0.161 | 0.309 | 24.5 |
+| k=2, T=0, r=0.25 | 0.385 | 67.5% | 0.086 | 0.164 | 78.3 |
+| k=4, T=0, r=0.25 | 0.642 | 45.1% | 0.122 | 0.258 | 45.3 |
+| k=8, T=0, r=0.25 | **0.949** | **10.1%** | 0.180 | 0.444 | 24.5 |
+| k=2, T=0.3, r=0 | 0.924 | 12.4% | 0.122 | 0.376 | 75.7 |
+| k=4, T=0.3, r=0 | 0.933 | 10.6% | 0.151 | 0.449 | 44.2 |
+| k=8, T=0.3, r=0 | 0.953 | 10.3% | 0.185 | 0.508 | 23.9 |
+| k=2, T=0.3, r=0.25 | 0.899 | 14.9% | 0.117 | 0.401 | 77.1 |
+| k=4, T=0.3, r=0.25 | 0.914 | 14.4% | 0.167 | 0.473 | 44.3 |
+| k=8, T=0.3, r=0.25 | 0.969 | 6.0% | 0.240 | 0.624 | 23.9 |
+| k=2, T=0.5, r=0 | 0.992 | 1.7% | 0.185 | 0.656 | 77.1 |
+| k=4, T=0.5, r=0 | 0.975 | 4.6% | 0.203 | 0.581 | 44.3 |
+| k=8, T=0.5, r=0 | 0.983 | 3.7% | 0.247 | 0.664 | 23.9 |
+| k=2, T=0.5, r=0.25 | 0.996 | 0.9% | 0.201 | 0.608 | 75.7 |
+| k=4, T=0.5, r=0.25 | 0.988 | 2.9% | 0.286 | 0.715 | 44.4 |
+| k=8, T=0.5, r=0.25 | 0.959 | 7.8% | 0.302 | 0.688 | 24.0 |
+| causal generate | 0.964 | 7.8% | 0.411 | 0.653 | 22.6 |
+
+Exact decoded text for all 12 prompts × 19 configs: `docs/decoded-samples.md`.
+The three `r=0` rows were re-measured after the frozen-budget fix (bug #5) with
+identical H4/rep4/Dist and TPS within 0.5% (`runs/bench-recon-fixed.log`).
+
+### Task 3: quota-preserving re-masking
+
+Each `k` group holds the same config twice, `r=0` then `r=0.25`; that pair is the
+Task 3 ablation. Interpretation of both tables:
+
+- **Re-masking is the single largest sampler win measured.** At T=0, k=8 it moves
+  rep4 42.2% → 10.1% and H4 0.658 → 0.949 at *zero* TPS cost (24.5 either way;
+  the forward count is unchanged). It also helps k=4 (58.0% → 45.1%) and is a
+  no-op at k=2, which is expected: k=2 has no interior step with both committed
+  tokens and a smaller quota, so nothing can be re-opened.
+- **It does not produce grammar.** The best greedy sample is still
+  `caught were not not not the the the same of the caught caught fish ...`:
+  re-masking removes the *static* "the the the" attractor, not the model's
+  inability to plan 32 tokens. Dist-2 0.444 vs causal 0.653 says the same thing.
+- **Greedy is now competitive with T=0.3 and better than T=0.5 for the `rep4`
+  metric.** With `r=0.25`, k=8 T=0 gives rep4 10.1%/Dist-2 0.444 while T=0.3
+  gives 6.0%/0.624 and T=0.5 gives 7.8%/0.688. The T>0 rows look better because
+  sampling noise raises diversity; their raw text (see the samples file) is a
+  word-salad at 0.5, e.g. `the proxy port0000.00.000000000.00000 of 0.00`. Judge
+  quality at T=0.
+- **k=8 + r=0.25 is the first diffusion setting to reach causal-level H4**
+  (0.949 vs 0.964) while staying within 9% of its TPS (24.5 vs 22.6). It does
+  not beat it: causal still has 2.3 points less repetition and much higher
+  Dist-2.
+- **The LoRA run did not fix free generation either.** At k=8 T=0 it is worse
+  than the 1000-step full fine-tune: H4 0.757 → 0.658, rep4 37.6% → 42.2%; at
+  k=2 it is also worse (rep4 56.0% → 67.5%). The headline improvement over the
+  old checkpoint comes from the sampler (`r=0.25`), not from the weights.
+
+### Task 2: prefix KV cache scaling
+
+```bash
+python benchmark.py --checkpoint runs/bfg-lora/last.pt --prefix_sweep \
+  --num_prompts 12 --canvas_len 32 --threads 10
+```
+
+A real corpus document is truncated to exactly `P` tokens and used as the prefix
+for all 12 prompts (one prefix, repeated); `C=32` fixed, greedy, `k=4`/`k=8` with
+`prefill_prefix` + `canvas_step_with_cache`. Output is `runs/prefix-sweep.log`.
+
+| P | batch | causal | k=4 | k=4 / causal | k=8 | k=8 / causal |
+|---|---|---|---|---|---|---|
+| 32 | 1 | 11.9 | 28.4 | **2.38x** | 15.6 | 1.31x |
+| 32 | 4 | 26.7 | 50.1 | **1.87x** | 23.5 | 0.88x |
+| 128 | 1 | 8.5 | 17.3 | 2.04x | 13.6 | 1.61x |
+| 128 | 4 | 22.9 | 35.8 | 1.56x | 22.6 | 0.99x |
+| 256 | 1 | 10.3 | 19.0 | 1.85x | 12.3 | 1.19x |
+| 256 | 4 | 19.5 | 26.4 | 1.35x | 18.3 | 0.94x |
+| 512 | 1 | 8.5 | 12.9 | 1.51x | 9.3 | 1.09x |
+| 512 | 4 | 14.5 | 16.6 | 1.14x | 12.8 | 0.88x |
+
+Interpretation:
+
+- **The speedup is real but it decays with prefix length, it does not grow.**
+  k=4 goes 2.38x → 1.51x (batch 1) and 1.87x → 1.14x (batch 4) as `P` goes
+  32 → 512; at `P=512`, batch 4, diffusion is a tie (16.6 vs 14.5 TPS).
+- **k=8 only beats causal for short prefixes.** 1.31x at `P=32`, 1.61x at
+  `P=128` batch 1 (noise), then 0.94x/0.88x from `P=256` on at batch 4 — i.e.
+  the 12 default benchmark prompts (`P≈15-20`) were the *most* favourable case,
+  not a hostile one. The earlier "short prompts hide the cache advantage" guess
+  was wrong: caching is what makes 2.4x possible at `P=32`, and the same
+  mechanism runs out of headroom as `P` grows.
+- **Why it decays:** with the prefix cached, a diffusion step is a `32 × d` matmul
+  over `P+32` keys, while causal decoding is 32 sequential single-token matmuls
+  over the same keys. The theoretical FLOP ratio is 32/k (8x at k=4), but a
+  1-token causal matmul is memory-bound on the 0.5B weights and a 32-token
+  diffusion matmul is not, so real speedups land at 1.1-2.4x. The larger the
+  prefix, the more of every forward is KV attention, which both methods pay.
+- **Batch 4 helps causal more than diffusion** (P=32: causal 2.2x, k=4 1.8x,
+  k=8 1.5x from batch 1 to 4). Batching amortizes the weight reads that causal
+  decoding is bottlenecked on; the diffusion forward is already compute-bound.
+- Batch-1 causal values are not monotone in `P` (11.9, 8.5, 10.3, 8.5): 12
+  prompts × 32 tokens is a ~2-8 s measurement, so ±20% is run noise. The
+  batch-4 column and the k=4/k=8 columns are the ones to quote.
+
+### Task 4: `--lora_mlp` and the stage-3 gate
+
+```bash
+python train.py --smoke_test --lora --lora_mlp --threads 8 --out /tmp/smoke-mlp
+LoRA r=16 alpha=32 targets=7: 8,798,208 / 502,830,976 params trainable
+smoke probe loss (before): 5.4177
+smoke convergence: 5.4177 -> 3.5945 PASS
+```
+
+- MLP targets add 6,636,096 parameters (2.16M → 8.80M, 0.43% → 1.75%), i.e.
+  **4.1x the trainable budget** for the 65% of weights that were frozen.
+- The flag implies `--lora`, and `targets` is stored in `lora_config`, so
+  `benchmark.py` rebuilds the correct 7-target wrapper from the checkpoint
+  alone. The pre-existing `runs/bfg-lora/last.pt` has no `targets` key and still
+  loads as attention-only (default `LORA_TARGETS`).
+- **Decision gate: NOT triggered.** The gate was "rep4 at T=0.0 with
+  `remask_ratio=0.25` still > 20%". Measured 10.1% at k=8 (45.1% at k=4, which
+  is expected — fewer steps). The remaining failure is grammatical structure,
+  not a repeated-4-gram attractor, and it is not obviously caused by frozen MLPs.
+  No 3000-step `--lora_mlp` run is launched.
 
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.
-- Infilling separates from generation strongly (90% recovery vs 56% repeat),
-  but 1000 steps on 2M tokens is not enough for coherent free generation.
-  Longer training, larger `C`, or a curriculum on `t` are the obvious next
-  levers.
-- The margin floor needs a sweep above 1.0 (2.0, 3.0) and a stronger checkpoint
-  before judging the idea; at 1.0 it did not beat the rigid quota.
-- Gumbel sampling below T=0.7 (e.g. 0.3-0.5) might trade some diversity for
-  coherence; only 0.7 was measured, and it produced word salad.
-- The 20%-full-mask training change is implemented but not yet trained.
+- Infilling separates from generation strongly (90% recovery vs 10-40% repeat),
+  but 3000 LoRA steps on 2M tokens still do not give coherent free generation.
+  Larger `C`, a longer canvas, or a curriculum on `t` are the remaining levers;
+  more steps at this corpus size are not (the val curve is flat after 2600).
+- The margin floor was only measured at 1.0 on the 1000-step full fine-tune
+  (it lost to the rigid quota). It is now redundant with `remask_ratio` for the
+  repetition failure mode and has not been re-swept on the LoRA checkpoint.
+- `remask_ratio` was swept at 0.0 and 0.25 only. 0.5 and 1.0 (re-open
+  everything) are untested; the protection fraction is the obvious next knob.
+- Gumbel temperatures 0.3 and 0.5 were measured on the LoRA checkpoint: the
+  4-gram metrics improve monotonically with T, but the decoded text at 0.5 is
+  word salad (`the proxy port0000.00...`), so the metric is rewarding noise.
+  No temperature between 0.1 and 0.3 was tried.
+- The 20%-fully-masked schedule is now trained (3000 steps) and did not fix free
+  generation, but it was never ablated against the old `U(0.15,0.95)` schedule
+  at equal compute.
 - Reference texts repeat every 10 prompts in the benchmark, so per-prefix scores
-  are correlated; only 12 prompts were used in the timed sweep.
+  are correlated; only 12 prompts were used in the timed sweep. The prefix sweep
+  additionally reuses a single prefix for all 12 prompts.
 - No comparison against standard block-autoregressive decoding or other
   diffusion samplers; only HF greedy `generate()`.
 - The 0.15–0.95 corruption range is fixed as specified, not tuned.
+- Reconstruction recovery is now monotone in `k` again (see Task 1), but the
+  k=2 path is single-shot by construction when half the canvas is visible: the
+  first quota equals the number of frozen slots, so there is nothing to fill
+  until the final step.

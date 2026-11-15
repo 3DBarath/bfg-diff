@@ -141,3 +141,61 @@ time python benchmark.py --smoke_test
   `__pycache__`; kept `runs/smoke/last.pt` so the benchmark smoke runs
   immediately.
 - Added `README.md`, `docs/research.md`, `docs/findings.md`, this log.
+
+## 14. Strict evaluation sprint: LoRA checkpoint, prefix sweep, re-masking
+
+### Code
+
+- `sampler.py`: added `remask_ratio` (default 0.0) implementing the
+  quota-preserving re-mask spec. Frozen pre-filled slots are counted against the
+  quota and never compete for budget; the strongest `ceil((1-r) * n_decoded)`
+  decoded slots are protected; the rest of the budget goes to the highest-margin
+  candidates; the final step fills every remaining mask. `margin_floor` now only
+  blocks slots instead of adding catch-up slots (documented behaviour change).
+- Fixed bug #5 found during this sprint: frozen slots with `+inf` score were
+  winning the whole `topk`, collapsing reconstruction to a single final fill.
+  Mask counts before each forward (`C=32`, 16 frozen, `k=8`) are now
+  `16,16,16,16,16,12,8,4`.
+- `benchmark.py`: `--remask_ratio` (sweepable list), `--prefix_sweep` with
+  `run_prefix_sweep` (warm-up, then causal vs cached `k=4`/`k=8` at
+  `P=32/128/256/512` x batch 1/4, Markdown table), adapter reload now honours
+  `lora_config["targets"]`.
+- `train.py` / `model.py`: `--lora_mlp` (implies `--lora`) targeting
+  `q,k,v,o,gate,up,down`; `targets` stored in `lora_config`.
+
+### Verification
+
+- `remask_ratio=0.0` is token-identical to commit `e2b7886` for steps
+  1/2/3/4/8 x {greedy, T=0.5, position_decay=1.5}. The only intended difference
+  is `margin_floor`, where the quota no longer over-fills.
+- Quota invariant (`C=8`, `k=4`): masks before each forward `8,6,4,2`, then no
+  masks; pre-filled slots unchanged; `r=0.25` changes the output at `k=4/k=8`
+  and is a no-op at `k=2` (no interior step).
+- `train.py --smoke_test`: `5.7695 -> 3.7964 PASS`.
+- `benchmark.py --smoke_test`: runs (recovery 15.8%, k=2), garbage numbers by
+  design.
+- `train.py --smoke_test --lora --lora_mlp`: `targets=7`,
+  `8,798,208 / 502,830,976` trainable, `5.4177 -> 3.5945 PASS`.
+
+### Measurements (all on the 3000-step LoRA checkpoint)
+
+- Loss curve: `docs/loss-curve.csv` (166 points, extracted from
+  `runs/train-lora.log`). Run finished in 13,211 s, final val 3.7263, best
+  3.6254 @2600.
+- Task 1/3 benchmark: `runs/bench-lora.log` — reconstruction (fixed sampler)
+  80.4 / 88.1 / 90.7% at k=2/4/8; generation k=8 T=0 rep4 42.2% -> 10.1% with
+  `remask_ratio=0.25`, TPS unchanged; causal H4 0.964 / rep4 7.8% / 22.6 TPS.
+- Task 2 prefix sweep: `runs/prefix-sweep.log` — k=4 speedup over causal 2.38x
+  at `P=32` decaying to 1.14x at `P=512` (batch 4); k=8 wins only for short
+  prefixes.
+- Task 1 decoded text: `docs/decoded-samples.md` (12 prompts x 19 configs,
+  verbatim).
+- Re-ran reconstruction after the frozen-budget fix
+  (`runs/bench-recon-fixed.log`); greedy generation metrics reproduced exactly,
+  confirming the fix only touched the pre-filled path.
+
+### Decision
+
+Stage-3 gate was "launch `--lora_mlp` only if rep4 at `T=0`, `r=0.25` is still
+> 20%". Measured 10.1% (k=8). **No `--lora_mlp` run launched.** The residual
+failure is grammatical, not a repeated-4-gram attractor.

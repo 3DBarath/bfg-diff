@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from model import apply_lora, prepare
+from model import LORA_TARGETS, apply_lora, prepare
 from sampler import sample_canvas_block
 
 # Long reference documents (prose, docs, markdown, JSON) for masked reconstruction.
@@ -94,6 +94,10 @@ def parse_args():
                    help="step-1 position decay lambdas")
     p.add_argument("--top_k", type=int, default=50,
                    help="truncate stochastic sampling to the top-k logits")
+    p.add_argument("--remask_ratio", type=float, nargs="+", default=[0.0],
+                   help="fraction of decoded slots that may be re-masked per step")
+    p.add_argument("--prefix_sweep", action="store_true",
+                   help="TPS vs prefix length for causal and bfg-diff at batch 1 and 4")
     p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -196,7 +200,8 @@ def run_reconstruction(model, tok, args, mask_id, device, steps):
 
 @torch.inference_mode()
 def run_sampler_generation(
-    model, tok, prompt_ids, args, mask_id, device, steps, margin_floor, temperature, position_decay
+    model, tok, prompt_ids, args, mask_id, device, steps, margin_floor, temperature, position_decay,
+    remask_ratio=0.0,
 ):
     token_ids = []
     sync(device)
@@ -207,6 +212,7 @@ def run_sampler_generation(
             model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
             prefix_keep=keep, margin_floor=margin_floor,
             temperature=temperature, position_decay=position_decay, top_k=args.top_k,
+            remask_ratio=remask_ratio,
         )
         token_ids.extend(canvas.tolist())
     sync(device)
@@ -237,6 +243,36 @@ def run_causal_generation(model, tok, prompt_ids, args, device):
     return token_ids, texts, sum(len(s) for s in token_ids) / elapsed
 
 
+@torch.inference_mode()
+def run_prefix_sweep(model, tok, args, mask_id, device):
+    """TPS vs prefix length: causal generate() against cached diffusion steps."""
+    text_ids = tokenize(tok, " ".join(REFERENCE_TEXTS))
+    assert len(text_ids) >= 512, f"need 512 tokens of reference text, have {len(text_ids)}"
+    prompts = args.num_prompts
+    warm = [text_ids[:32]] * min(2, prompts)
+    run_sampler_generation(model, tok, warm, args, mask_id, device, 2, 0.0, 0.0, 0.0)
+    run_causal_generation(model, tok, warm, args, device)
+
+    print(f"\nPrefix sweep | C={args.canvas_len} | {prompts} prompts | tokens/s")
+    print("| P | batch | causal | k=4 | k=4 x causal | k=8 | k=8 x causal |")
+    print("|---|---|---|---|---|---|---|")
+    for plen in (32, 128, 256, 512):
+        prompt_ids = [text_ids[:plen]] * prompts
+        for bs in (1, 4):
+            args.batch_size = bs
+            _, _, causal = run_causal_generation(model, tok, prompt_ids, args, device)
+            _, _, k4 = run_sampler_generation(
+                model, tok, prompt_ids, args, mask_id, device, 4, 0.0, 0.0, 0.0
+            )
+            _, _, k8 = run_sampler_generation(
+                model, tok, prompt_ids, args, mask_id, device, 8, 0.0, 0.0, 0.0
+            )
+            print(
+                f"| {plen} | {bs} | {causal:,.1f} | {k4:,.1f} | {k4 / causal:.2f}x "
+                f"| {k8:,.1f} | {k8 / causal:.2f}x |"
+            )
+
+
 def main():
     args = parse_args()
     torch.set_num_threads(args.threads or (torch.get_num_threads()))
@@ -259,7 +295,8 @@ def main():
 
             cfg = ck.get("lora_config", {})
             model = apply_lora(
-                model, cfg.get("r", 16), cfg.get("alpha", 32), cfg.get("dropout", 0.05)
+                model, cfg.get("r", 16), cfg.get("alpha", 32), cfg.get("dropout", 0.05),
+                cfg.get("targets", LORA_TARGETS),
             )
             set_peft_model_state_dict(model, ck["lora"])
         else:
@@ -271,6 +308,10 @@ def main():
 
     prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
     prompt_ids = [tokenize(tok, p) for p in prompts]
+
+    if args.prefix_sweep:
+        run_prefix_sweep(model, tok, args, mask_id, device)
+        return
 
     print(f"\nReconstruction | {args.num_prompts} prefixes | P={args.prefix_len} C={args.canvas_len}")
     print(f"{'method':<18}{'recovery':>10}{'TPS':>12}")
@@ -284,17 +325,19 @@ def main():
     for floor in args.floors:
         for temp in args.temps:
             for decay in args.pos_decay:
-                for steps in args.steps:
-                    ids, texts, tps = run_sampler_generation(
-                        model, tok, prompt_ids, args, mask_id, device, steps, floor, temp, decay
-                    )
-                    label = f"k={steps} T={temp:g} d={decay:g} f={floor:g}"
-                    name = f"bfg-diff {label}"
-                    outputs[name] = texts
-                    print(
-                        f"{name:<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
-                        f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
-                    )
+                for remask in args.remask_ratio:
+                    for steps in args.steps:
+                        ids, texts, tps = run_sampler_generation(
+                            model, tok, prompt_ids, args, mask_id, device, steps,
+                            floor, temp, decay, remask,
+                        )
+                        label = f"k={steps} T={temp:g} d={decay:g} f={floor:g} r={remask:g}"
+                        name = f"bfg-diff {label}"
+                        outputs[name] = texts
+                        print(
+                            f"{name:<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+                            f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
+                        )
     ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
     outputs["causal generate"] = texts
     print(

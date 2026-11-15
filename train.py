@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from dataset import GeneralTextDataset, synthetic_texts
-from model import apply_lora, canvas_forward, prepare
+from model import LORA_TARGETS, LORA_TARGETS_MLP, apply_lora, canvas_forward, prepare
 
 
 def parse_args():
@@ -40,6 +40,8 @@ def parse_args():
     p.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     p.add_argument("--cpu", action="store_true", help="CPU-friendly preset (P=128, C=32, 1k steps)")
     p.add_argument("--lora", action="store_true", help="train LoRA adapters, freeze the base model")
+    p.add_argument("--lora_mlp", action="store_true",
+                   help="also adapt gate_proj/up_proj/down_proj (stage 3 ablation)")
     p.add_argument("--lora_r", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
@@ -52,6 +54,8 @@ def parse_args():
             log_every=20, eval_every=200, warmup=20, lora=True,
         )
     args = p.parse_args()
+    if args.lora_mlp:
+        args.lora = True
     if args.lr is None:
         args.lr = 5e-4 if args.lora else 5e-5
     if args.smoke_test:
@@ -120,6 +124,7 @@ def save_checkpoint(path, model, mask_id, args, step):
             "r": args.lora_r,
             "alpha": args.lora_alpha,
             "dropout": args.lora_dropout,
+            "targets": list(LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS),
         }
     else:
         ck["model"] = model.state_dict()
@@ -144,10 +149,14 @@ def main():
 
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     if args.lora:
-        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
+        targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
+        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        print(f"LoRA r={args.lora_r} alpha={args.lora_alpha}: {trainable:,} / {total:,} params trainable")
+        print(
+            f"LoRA r={args.lora_r} alpha={args.lora_alpha} targets={len(targets)}: "
+            f"{trainable:,} / {total:,} params trainable"
+        )
     ds = (
         GeneralTextDataset(
             args.data, tok, args.prefix_len, args.canvas_len,

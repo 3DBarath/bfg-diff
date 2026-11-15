@@ -78,10 +78,12 @@ Xeons and is slower than fp32 there.
 
 `--lora` freezes the base model and trains rank-16 adapters on
 `q_proj, k_proj, v_proj, o_proj` (`--lora_r`, `--lora_alpha 32`,
-`--lora_dropout 0.05`), 2.16M of 496M parameters. `--lr` defaults to `5e-4`
-with `--lora` and `5e-5` without. Checkpoints then hold only the adapter
-(`~9 MB` instead of 1.9 GB) plus `lora_config`; `benchmark.py` rebuilds the
-PEFT wrapper when it sees a `lora` key, and still reads full-model checkpoints.
+`--lora_dropout 0.05`), 2.16M of 496M parameters. `--lora_mlp` adds
+`gate_proj, up_proj, down_proj` (8.80M parameters) for the stage-3 ablation.
+`--lr` defaults to `5e-4` with `--lora` and `5e-5` without. Checkpoints then
+hold only the adapter (`~9-20 MB` instead of 1.9 GB) plus `lora_config`;
+`benchmark.py` rebuilds the PEFT wrapper when it sees a `lora` key, and still
+reads full-model checkpoints.
 
 ## Benchmark
 
@@ -97,7 +99,10 @@ Reports, for every step-count x margin-floor x temperature x decay combination:
 - wall-clock tokens/s, alongside Hugging Face causal `generate()`.
 
 `--top_k` truncates the stochastic sampler to the `k` most likely tokens per
-slot (default 50); it has no effect at `--temps 0.0`.
+slot (default 50); it has no effect at `--temps 0.0`. `--remask_ratio 0.25`
+re-opens the weakest 25% of decoded slots every step, keeping the quota exact.
+`--prefix_sweep` instead prints a Markdown TPS table for `P = 32, 128, 256, 512`
+x batch 1/4, comparing causal `generate()` with cached `k=4` and `k=8`.
 
 It also prints side-by-side completions for the first `--show` prompts
 (diffusion vs causal), so repetition and phrasing can be inspected directly.
@@ -126,7 +131,9 @@ reported and the base model is benchmarked instead.
    top-1 is not clearly ahead of the runner-up; held-back slots are filled by
    argmax at the end. `temperature > 0` samples tokens with Gumbel noise over
    the `top_k` most likely logits (ranking still uses clean margins), and
-   `position_decay > 0` biases step 1 toward the canvas start.
+   `position_decay > 0` biases step 1 toward the canvas start. `remask_ratio`
+   lets the weakest decoded slots re-compete against masked ones each step
+   without changing the per-step quota.
 5. **Prefix KV cache.** The prefix is prefilled once per prompt; each diffusion
    step forwards only the `C` canvas tokens against the cached prefix keys and
    values, so a step costs `C` tokens instead of `P+C`.

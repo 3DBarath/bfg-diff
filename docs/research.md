@@ -89,6 +89,37 @@ capped per sample at the number still masked; otherwise `topk` could pull in
 The final step has `k = C`, so the canvas is fully concrete. A last argmax pass
 covers any rounding leftovers.
 
+### Re-masking
+
+Parallel unmasking commits tokens that later steps cannot revisit: a slot decoded
+at step 1 never sees the tokens decoded at step 2. `remask_ratio` (default 0)
+re-opens the weakest fraction of already-decoded slots at every interior step.
+
+The quota is defined over the whole canvas: after step `s` the canvas holds
+`floor(s/K*C)` unmasked slots. Pre-filled reconstruction slots are part of that
+count and are frozen, so they never take part in the margin competition — when
+half the canvas is visible, the early steps have no budget left and iteration
+only starts once `floor(s/K*C)` exceeds the number of visible slots
+(`s > K/2`). A masked slot that is not re-selected goes back to `[MASK]`.
+
+At each interior step, for every batch row:
+
+1. Score all `C` positions by the current margin (logit top-1 minus top-2).
+2. Protect the strongest `ceil((1 - remask_ratio) * n_decoded)` decoded slots:
+   they keep their token and count against the quota but are not re-selected.
+3. The remaining decoded slots compete with the masked slots on their raw
+   margin, so a stale commitment can lose to a confident new position.
+4. Fill the remaining budget `floor(s/K*C) - n_frozen - n_protected` with the
+   highest-scoring candidates.
+5. Rebuild the row: frozen slots keep their token, non-selected slots return to
+   `[MASK]`, protected slots keep theirs, and newly selected slots take the
+   freshly sampled token.
+
+The final step fills every remaining mask, so the canvas is always complete.
+Because the quota is defined over the whole canvas, `margin_floor` no longer
+adds catch-up slots for held-back positions: a floor can leave the canvas under
+quota for a step, and those slots are filled at the end.
+
 ### Margin floor
 
 A rigid linear quota forces the model to commit to `C/K` tokens per step even
@@ -96,12 +127,10 @@ when it is unsure. Early wrong commitments cannot be revised, and repeated
 phrases are the usual symptom.
 
 `margin_floor` adds an absolute gate: a masked slot is eligible for unmasking
-only if `margin >= floor`. The per-step budget stays linear
-(`quota_s - quota_{s-1}`), so held-back slots are not dumped later; they remain
-masked until the final argmax fill. This trades a little latency for fewer
-early mistakes. A high floor can leave most of the canvas to the final fill, so
-the floor is meant to be small (roughly 0.5-2.0 in log-prob units) and tuned in
-`benchmark.py --floors`.
+only if `margin >= floor`. Held-back slots stay masked until a later step or the
+final fill. This trades a little latency for fewer early mistakes. A high floor
+can leave most of the canvas to the final fill, so the floor is meant to be
+small (roughly 0.5-2.0 in log-prob units) and tuned in `benchmark.py --floors`.
 
 ## CPU execution
 
@@ -175,6 +204,11 @@ pretrained model and the loss starts where the base model is. LoRA tolerates a
 higher learning rate than full fine-tuning; `--lr` defaults to `5e-4` with
 `--lora` and `5e-5` without.
 
+`--lora_mlp` extends the targets to `gate_proj, up_proj, down_proj`, the MLP
+blocks that hold most of the weights. Attention-only adapts 2.16M parameters
+(0.43%); adding the MLP adapts 8.80M (1.75%). That is the stage-3 ablation knob:
+if attention-only re-masking still repeats, the frozen MLP is the next suspect.
+
 ## Cost model
 
 A diffusion step with the cache is one forward over `C` tokens plus a one-off
@@ -184,3 +218,9 @@ token each. The diffusion decoder is therefore cheaper per token at small `K`
 and parallel across the canvas, at the price of needing a model fine-tuned for
 bidirectional denoising. Logits for a canvas step are `(B, C, vocab)`, which is
 the dominant memory term at large `C`.
+
+`--prefix_sweep` measures that trade-off directly: it fixes `C`, pads or
+truncates a real document to exactly `P = 32, 128, 256, 512` tokens, and times
+causal `generate()` against cached `k=4` and `k=8` at batch 1 and 4. Prompt
+length is the variable that matters: with `P` around 15 (the default generation
+prompts), the prefix is a rounding error and the cache cannot help.
