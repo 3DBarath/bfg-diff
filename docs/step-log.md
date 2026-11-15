@@ -260,3 +260,30 @@ The run first started as a harness background shell at 13:49 (step 1 loss
 is identical, confirming the same seed and data order). Steady rate is 5.85 s/step
 (111 tok/s), so 3000 steps is ~4.9 h, ETA ~19:05. A watcher fires when the tmux
 session exits.
+
+## 16. Cross-step repulsion + Stage 3 result (2026-11-15)
+
+### Cross-step repulsion
+
+`sampler.py`: `suppress_adjacent` now repels committed neighbours from an open
+slot's logits (cross-step), in addition to the existing same-step margin
+deferral. Prefix's last token is repelled at position 0. Final-step fill goes
+left-to-right so a collision still resolves to a distinct token.
+
+Verified:
+- `n_frozen=0` still token-identical to `21812a7` (suppression off, 20/20).
+- Quota schedules unchanged: k=8 `16,14,12,10,8,6,4,2`.
+- Mechanism on base model: adj 0.976 -> 0.126 at T=0.
+- Real checkpoint, k=8, r=0.25: adj 24.2% -> 4.6% at T=0, 17.2% -> 3.8% at
+  T=0.3; rep4 5.7% -> 0.9% at T=0.
+- `train.py --smoke_test`: 5.7695 -> 3.7964 PASS.
+
+### Stage 3 result
+
+`runs/bfg-lora-mlp` finished 19:04, val_loss 4.1111 (best 4.0123 @2600) vs
+`runs/bfg-lora` 3.7263 (best 3.6254). The MLP adapter is ~0.4 nats worse at
+every checkpoint and worse on generation (k=8/T=0 rep4 0.9% -> 6.0%, Dist-2
+0.570 -> 0.530). Hypothesis not supported. `--lora_mlp` is not needed.
+
+Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
+`runs/bench-mlp.log`. Full table in `docs/findings.md`.

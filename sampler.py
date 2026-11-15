@@ -41,10 +41,12 @@ def sample_canvas_block(
     never starve the schedule. Re-masking changes which slots hold the quota, not
     how many are held.
 
-    `suppress_adjacent` drops the weaker of two adjacent slots that predict the
-    same token in the same step, so a stutter (`not not`) cannot be committed by
-    two slots that never saw each other. The loser stays masked and re-predicts
-    next step with the winner in the canvas.
+    `suppress_adjacent` removes adjacent identical tokens. Two mechanisms:
+    cross-step logit repulsion (an open slot next to a committed token has that
+    token removed from its logits, so even the final step picks a distinct
+    continuation) and same-step margin deferral (two open neighbours that propose
+    the same token hold the weaker one back for a step). Neither revokes a
+    committed token.
     """
     assert steps >= 1 and canvas_len >= 1
     B = prefix_ids.shape[0]
@@ -74,6 +76,40 @@ def sample_canvas_block(
         z = logits.float()  # log p(i) - log p(j) == z(i) - z(j): softmax shift cancels
         top2 = z.topk(2, dim=-1)
         margin = top2.values[..., 0] - top2.values[..., 1]  # clean confidence
+
+        # Slots whose existing token survives: frozen input plus the confident
+        # fraction of already-decoded slots. The rest of `decoded` competes again.
+        # On the last step every decoded token is an anchor.
+        keep_token = frozen.clone()
+        if s < steps:
+            for i in range(B):
+                idx = decoded[i].nonzero().flatten()
+                if idx.numel():
+                    n = math.ceil((1.0 - remask_ratio) * idx.numel())
+                    keep_token[i, idx[margin[i, idx].topk(n).indices]] = True
+        else:
+            keep_token |= decoded
+
+        # Cross-step repulsion: an open slot next to a committed token cannot
+        # predict that token, so its top-1 is already a distinct continuation and
+        # its margin is measured between the two best *valid* choices. Without
+        # this, holding the slot back as [MASK] just delays the stutter.
+        if suppress_adjacent:
+            left = keep_token[:, :-1]
+            right = keep_token[:, 1:]
+            idx = torch.where(left, canvas[:, :-1], torch.zeros_like(canvas[:, :-1]))
+            rep = z[:, 1:].scatter(-1, idx.unsqueeze(-1), -float("inf"))
+            z[:, 1:] = torch.where(left.unsqueeze(-1), rep, z[:, 1:])
+            idx = torch.where(right, canvas[:, 1:], torch.zeros_like(canvas[:, 1:]))
+            rep = z[:, :-1].scatter(-1, idx.unsqueeze(-1), -float("inf"))
+            z[:, :-1] = torch.where(right.unsqueeze(-1), rep, z[:, :-1])
+            if prefix_len:
+                last = prefix_ids[:, -1:]
+                rep = z[:, :1].scatter(-1, last.unsqueeze(-1), -float("inf"))
+                z[:, :1] = torch.where(~keep_token[:, :1].unsqueeze(-1), rep, z[:, :1])
+            top2 = z.topk(2, dim=-1)
+            margin = top2.values[..., 0] - top2.values[..., 1]
+
         rank = margin * decay if (decay is not None and s == 1) else margin
         if margin_floor > 0.0 and s < steps:
             rank = rank.masked_fill((canvas == mask_id) & (margin < margin_floor), -float("inf"))
@@ -86,21 +122,13 @@ def sample_canvas_block(
         else:
             sampled = top2.indices[..., 0]
 
-        # Slots whose existing token survives: frozen input plus the confident
-        # fraction of already-decoded slots. The rest of `decoded` competes again.
-        keep_token = frozen.clone()
         if s < steps:
-            for i in range(B):
-                idx = decoded[i].nonzero().flatten()
-                if idx.numel():
-                    n = math.ceil((1.0 - remask_ratio) * idx.numel())
-                    keep_token[i, idx[margin[i, idx].topk(n).indices]] = True
             rank = rank.masked_fill(keep_token, float("inf"))
 
-            # Two neighbours predicting the same token would commit a stutter.
-            # Only slots that are still masked can be held back: a committed
-            # token is never revoked here. The loser re-predicts next step with
-            # its neighbour in the canvas.
+            # Two open neighbours predicting the same token would commit a
+            # stutter. Only slots that are still masked can be held back; next
+            # step the winner is an anchor, so repulsion above forces the loser
+            # onto a distinct continuation.
             if suppress_adjacent:
                 eff = torch.where(keep_token, canvas, sampled)  # token that would stand
                 same = (eff[:, :-1] == eff[:, 1:]) & ~(frozen[:, :-1] & frozen[:, 1:])
@@ -115,9 +143,16 @@ def sample_canvas_block(
         for i in range(B):
             n_frozen = int(frozen[i].sum())
             if s == steps:  # final step: fill every remaining mask, keep the rest
-                pick = (canvas[i] == mask_id).nonzero().flatten()
                 row = canvas[i].clone()
-                row[pick] = sampled[i, pick]
+                for j in (canvas[i] == mask_id).nonzero().flatten().tolist():
+                    tok = int(sampled[i, j])
+                    if suppress_adjacent:
+                        prev = int(row[j - 1]) if j > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
+                        if prev is not None and tok == prev:
+                            cand = z[i, j].clone()
+                            cand[prev] = -float("inf")
+                            tok = int(cand.argmax())
+                    row[j] = tok
             else:
                 # Interpolate strictly over the slots this sampler can fill:
                 # pre-filled slots hold their own share of the canvas for free.

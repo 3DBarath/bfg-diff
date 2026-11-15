@@ -622,6 +622,81 @@ smoke convergence: 5.4177 -> 3.5945 PASS
   generation `k=8, r=0.25, T=0/0.3/0.5` with `rep2`/`rep4`/`adj` for both
   checkpoints.
 
+## Stage 3 ablation: Attn-LoRA (2.16M) vs Attn+MLP-LoRA (8.80M)
+
+`runs/bfg-lora-mlp` finished 2026-11-15 19:04 (step 3000, val_loss 4.1111).
+Same seed (0), corpus, batch (4 x accum 2) as `runs/bfg-lora`.
+
+Loss (val, every 200 steps):
+
+| step | Attn-LoRA | Attn+MLP-LoRA |
+|---|---|---|
+| 200 | 3.80 | 5.20 |
+| 1000 | 3.72 | 5.33 |
+| 2000 | 3.72 | 4.26 |
+| 2600 | **3.6254 (best)** | 4.0123 (best) |
+| 3000 | 3.7263 (final) | 4.1111 (final) |
+
+The MLP run is **~0.4 nats worse at every checkpoint**, including its own best
+(4.01 vs 3.63). Adding 6.6M trainable parameters to the frozen causal MLPs did
+not help; it hurt. The hypothesis that frozen MLPs were the bottleneck for
+bidirectional n-grams is **not supported** by this ablation.
+
+Reconstruction (50% masked, P=128, C=32, 12 prefixes):
+
+| k | Attn-LoRA | Attn+MLP-LoRA |
+|---|---|---|
+| 2 | 89.7% | 91.8% |
+| 4 | 92.3% | 91.2% |
+| 8 | 96.4% | 94.8% |
+
+Generation, k=8, r=0.25 (suppression on):
+
+| T | metric | Attn-LoRA | Attn+MLP-LoRA |
+|---|---|---|---|
+| 0.0 | H4 | 0.996 | 0.975 |
+| 0.0 | rep4 | 0.9% | 6.0% |
+| 0.0 | rep2 | 26.9% | 31.5% |
+| 0.0 | adj | 4.6% | 4.3% |
+| 0.0 | Dist-2 | 0.570 | 0.530 |
+| 0.3 | H4 | 0.988 | 0.992 |
+| 0.3 | rep4 | 2.9% | 1.7% |
+| 0.3 | adj | 3.8% | 3.2% |
+| 0.3 | Dist-2 | 0.726 | 0.710 |
+| 0.5 | H4 | 0.999 | 0.995 |
+| 0.5 | rep4 | 0.3% | 1.1% |
+| 0.5 | Dist-2 | 0.836 | 0.798 |
+
+Conclusion: the attention-only adapter (2.16M) is the better checkpoint on every
+generation metric that matters; the MLP adapter trades nothing useful for its
+4x parameter count. The 3000-step recipe does not need `--lora_mlp`.
+
+### Cross-step repulsion (second sampler fix, 2026-11-15)
+
+`suppress_adjacent` now has two parts:
+
+1. **Cross-step logit repulsion.** An open slot next to a committed token has
+   that token removed from its logits, so even on the final fill step it picks a
+   distinct continuation. This is the fix for the surviving `the the the` (the
+   earlier same-step-only rule could only delay it). The prefix's last token is
+   also repelled at position 0.
+2. **Same-step margin deferral** (unchanged): two open neighbours proposing the
+   same token hold the weaker one back for a step.
+
+Result on `runs/bfg-lora/last.pt`, k=8, r=0.25, suppression default-on:
+
+| T | adj before | adj after | rep4 before | rep4 after |
+|---|---|---|---|---|
+| 0.0 | 24.2% | 4.6% | 5.7% | 0.9% |
+| 0.3 | 17.2% | 3.8% | 2.3% | 2.9% |
+| 0.5 | 11.6% | 2.4% | 1.1% | 0.3% |
+
+`adj` is not zero (the left-to-right final fill still occasionally has to
+fall back to the repelled slot's #2, and cross-step pairs committed in
+different steps are only partially covered), but the three-token runs are gone
+from the decoded text. Mechanism check on the base model: adj 0.976 -> 0.126
+at T=0.
+
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.
