@@ -327,7 +327,8 @@ effective batch 8, 1500 optimizer updates.
 
 166 logged points, extracted verbatim to `docs/loss-curve.csv`
 (`step,loss,split`; train is a 20-step mean, val is 64 chunks with a fresh 50%
-mask). Every tenth point:
+mask). The log has no step-0 entry: the first training line is step 1 and the
+first validation is at step 200, so the curve starts at the first batch. Every tenth point:
 
 | step | train | val | | step | train | val |
 |---|---|---|---|---|---|---|
