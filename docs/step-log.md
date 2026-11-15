@@ -115,7 +115,27 @@ time python benchmark.py --smoke_test
 - Changed the training mask schedule to 20% fully masked batches and
   `U(0.20, 1.0)` otherwise; not yet trained.
 
-## 12. Cleanup
+## 12. Top-k sampling, KV cache, LoRA
+
+- `sampler.py`: Gumbel now samples from a `top_k` mini-batch (default 50) instead
+  of the full vocabulary; margins use raw logits (`z1 - z2`), removing the
+  151k-row `log_softmax`. Verified greedy output is token-identical to the
+  `log_softmax` version, top-k is respected, and the margin identity is exact.
+- `model.py`: `prefill_prefix` + `canvas_step_with_cache` cache prefix keys and
+  values; each step forwards only `C` tokens. Cached logits differ from a full
+  `(P+C)` forward by ~3e-5 and argmax is identical (checked with and without
+  left padding). Sampler crops the canvas rows after each step.
+- Measured: reconstruction TPS k=4 16.9 → 33.4, k=8 8.5 → 20.8; generation
+  unchanged (short prompts). k=8 at batch 4 is 31.3 TPS vs causal 29.2; at
+  batch 2 it is 25.6 vs 25.6.
+- `train.py`: `--lora` (PEFT), adapter-only checkpoints, `--lr` 5e-4 default
+  with LoRA, `torch.set_num_interop_threads(2)`, CPU preset enables LoRA.
+  `benchmark.py` loads adapter checkpoints and gained `--top_k`.
+- `train.py --smoke_test --lora` PASS 5.7332 → 4.2757; `benchmark.py
+  --smoke_test` runs. 3000-step LoRA run started in tmux `bfg-lora`, 4.2 s/step
+  (~3.5 h).
+
+## 13. Cleanup
 
 - Removed `runs/smoke/ckpt-*.pt` (numbered smoke checkpoints) and
   `__pycache__`; kept `runs/smoke/last.pt` so the benchmark smoke runs

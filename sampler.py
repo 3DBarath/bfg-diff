@@ -1,8 +1,7 @@
 """Iterative non-autoregressive canvas decoding, highest Top-1 margin first."""
 import torch
-import torch.nn.functional as F
 
-from model import MASK_TOKEN_ID, canvas_forward
+from model import MASK_TOKEN_ID, canvas_forward, canvas_step_with_cache, prefill_prefix
 
 
 @torch.no_grad()
@@ -17,6 +16,7 @@ def sample_canvas_block(
     margin_floor=0.0,
     temperature=0.0,
     position_decay=0.0,
+    top_k=50,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -25,9 +25,9 @@ def sample_canvas_block(
     unmasked when its top-1 is at least this much more likely than its runner-up.
     Slots below the floor stay masked until a later step (or the final argmax fill).
 
-    `temperature > 0` samples tokens with Gumbel noise from `logits / temperature`
-    instead of taking the clean argmax; the margin ranking still uses the clean
-    log-probs. `position_decay > 0` multiplies step-1 margins by
+    `temperature > 0` samples tokens with Gumbel noise from the `top_k` most likely
+    logits instead of taking the clean argmax; the margin ranking still uses the
+    clean log-probs. `position_decay > 0` multiplies step-1 margins by
     `exp(-lambda * i / C)`, anchoring the canvas start to the prefix.
     """
     assert steps >= 1 and canvas_len >= 1
@@ -48,11 +48,14 @@ def sample_canvas_block(
         )
 
     prev_quota = 0
+    prefix_len = prefix_ids.shape[1]
+    kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix encoded once
     for s in range(1, steps + 1):
-        logits = canvas_forward(model, prefix_ids, canvas, prefix_keep)
+        logits = canvas_step_with_cache(model, canvas, kv, prefix_len, prefix_keep)
+        kv.crop(-canvas_len)  # drop the canvas rows; keep the prefix cache
         assert logits.shape[:2] == (B, canvas_len), logits.shape
-        lp = F.log_softmax(logits.float(), dim=-1)
-        top2 = lp.topk(2, dim=-1)
+        z = logits.float()  # log p(i) - log p(j) == z(i) - z(j): softmax shift cancels
+        top2 = z.topk(2, dim=-1)
         margin = top2.values[..., 0] - top2.values[..., 1]  # clean confidence
         score = margin * decay if (decay is not None and s == 1) else margin
         score = score.masked_fill(canvas != mask_id, -float("inf"))
@@ -64,8 +67,10 @@ def sample_canvas_block(
             eligible &= margin >= margin_floor
 
         if temperature > 0.0:
-            u = torch.rand_like(logits.float()).clamp_min(1e-9)
-            sampled = (logits.float() / temperature - torch.log(-torch.log(u))).argmax(-1)
+            vals, idx = z.topk(min(top_k or z.shape[-1], z.shape[-1]), dim=-1)
+            u = torch.rand_like(vals).clamp(1e-9, 1.0 - 1e-9)
+            pick = (vals / temperature - torch.log(-torch.log(u))).argmax(-1, keepdim=True)
+            sampled = idx.gather(-1, pick).squeeze(-1)
         else:
             sampled = top2.indices[..., 0]
 

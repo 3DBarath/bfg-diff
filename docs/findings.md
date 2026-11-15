@@ -229,6 +229,77 @@ Interpretation:
   unmasking order. The implemented 20%-`t=1` training change is the right next
   experiment; sampler tweaks alone will not produce coherent prose.
 
+### Top-k truncation and prefix KV cache
+
+The TPS column above predates two sampler changes: Gumbel now runs over the
+top-50 logits only (a mini-batch of 50, not the full 151,936-row vocabulary),
+and the softmax pass is gone because `log p(1) - log p(2) == z(1) - z(2)`.
+The prefix is also prefilled once per prompt into a KV cache; each step
+forwards only the 32 canvas tokens. Re-measured on the same `last.pt`
+(12 prompts, P=128, C=32, batch 2, 10 threads), greedy is token-identical to
+the previous sampler:
+
+| config | H4 | rep4 | Dist-1 | Dist-2 | TPS |
+|---|---|---|---|---|---|
+| k=4, T=0 | 0.548 | 54.6% | 0.099 | 0.196 | 47.2 |
+| k=8, T=0 | 0.757 | 37.6% | 0.141 | 0.288 | 25.6 |
+| k=4, T=0.3, top_k=50 | 0.908 | 15.5% | 0.143 | 0.387 | 46.5 |
+| k=8, T=0.3, top_k=50 | 0.914 | 17.5% | 0.180 | 0.452 | 25.0 |
+| k=4, T=0.5, top_k=50 | 0.975 | 4.9% | 0.219 | 0.645 | 46.4 |
+| k=8, T=0.5, top_k=50 | 0.983 | 3.7% | 0.250 | 0.677 | 25.1 |
+| causal generate | 0.938 | 13.5% | 0.362 | 0.578 | 25.6 |
+
+Reconstruction TPS: k=4 16.9 → 33.4, k=8 8.5 → 20.8 (2.0-2.4x). Generation TPS
+barely moved because benchmark prompts are only ~15-20 tokens, so the full
+`P+C` forward was already dominated by the canvas; caching pays off in
+proportion to prefix length.
+
+Throughput depends on batch size. At batch 4 (same 12 prompts):
+k=8 T=0 is 31.3 TPS vs causal 29.2, and k=8 T=0.5 is 30.3 TPS. So the "k=8
+beats causal" target holds at batch 4 and is a tie at batch 2; k=4 is ~2x
+causal either way.
+
+Decoded k=8 completions with top-k=50 (`runs/bench-samples.log`):
+
+- `Once upon a time, ... noticed that` → T=0.3: `the fish of the sea the the sea
+  of the sea and the sea of the sea ...`; T=0.5: `the fish of the day the the
+  sea, and the to the sea, and to the., the fish, the the the sea, ...`
+- `## Quick start\n\nInstall the package, then run` → T=0.3: `` `make. . . The
+  is a ` ...`` (backtick salad); T=0.5: more of the same.
+- `To configure the proxy, ... set` → T=0.5: `` the `proxy` by. ` `export --
+  `proxyproxyproxy `hostproxyhost`` ...``
+
+Interpretation:
+
+- **Top-k helps the prose prompts, not the format-heavy ones.** Repetition
+  drops from 54.6%/37.6% to 4.9%/3.7% for T=0.5, and the coastal-village prompt
+  stays readable. For markdown/code prompts the model's top-50 is itself full
+  of backticks, so truncation cannot help; the 4-gram metrics still report
+  "diverse" because the salad is unique.
+- **Truncation alone does not fix the degenerate distribution.** Same
+  conclusion as the T=0.7 run: metrics improve because sampling is more random,
+  not because the checkpoint knows what to say.
+- **KV caching is a real 2x** where the prefix is long, and costs nothing
+  elsewhere (greedy output unchanged, ~3e-5 logit difference).
+
+## LoRA training run (3000 steps)
+
+```bash
+python train.py --cpu --lora --threads 20 --steps 3000 --batch_size 4 \
+  --grad_accum 2 --data /tmp/bfg-corpus --max_tokens 2000000 --out runs/bfg-lora
+```
+
+- Adapters: 2,162,688 of 496,195,456 parameters trainable (0.4%) on
+  `q_proj, k_proj, v_proj, o_proj`, r=16, alpha=32, dropout 0.05, lr 5e-4.
+- Smoke test with LoRA: probe 5.7332 → 4.2757 `PASS` (12 steps, synthetic).
+- Measured step time at B=4, P=128, C=32: 4.2 s/step. `--threads 10`, `14` and
+  `20` all land within noise (4.1-4.2 s), so 10 physical cores saturate; the
+  20-thread setting is not faster.
+- Therefore 3000 steps ≈ 3.5 h plus ~15 min of evaluation, not the ~45 min
+  estimated in the task brief. Effective batch is 8 (1500 optimizer updates),
+  so this is 12x the optimizer updates of the earlier 1000-step full fine-tune.
+- Checkpoints are adapter-only, a few MB, in `runs/bfg-lora/`.
+
 ## Open questions / not verified
 
 - bf16 numerics, SDPA mask handling, and memory use on a real GPU.

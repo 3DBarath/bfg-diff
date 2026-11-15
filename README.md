@@ -11,7 +11,7 @@ task-specific tokens.
 
 | Path | Purpose |
 |---|---|
-| `model.py` | Tokenizer/`[MASK]` aliasing, model loading, 4D hybrid attention mask, canvas forward |
+| `model.py` | Tokenizer/`[MASK]` aliasing, model loading, 4D hybrid mask, canvas forward, prefix KV cache, LoRA wrapper |
 | `dataset.py` | `GeneralTextDataset` over text dirs/files/string lists; synthetic text for smoke runs |
 | `sampler.py` | Top-1-margin iterative unmasking (`sample_canvas_block`) |
 | `train.py` | Training loop, dynamic masking, checkpointing, `--smoke_test` |
@@ -23,7 +23,7 @@ task-specific tokens.
 ## Requirements
 
 ```bash
-pip install torch transformers
+pip install torch transformers peft
 ```
 
 CUDA is optional. On CUDA the model loads and trains in `bfloat16`; on CPU it
@@ -60,25 +60,34 @@ decay, weight decay `0.01`, AdamW, checkpoint every 500 steps to
 ### CPU preset
 
 `--cpu` sets `P=128`, `C=32`, batch 2 x gradient accumulation 8 (effective 16),
-1000 steps, checkpoints every 200 steps, `float32`, and `--device cpu`. Warmup is
-20 optimizer updates (1000 micro-steps / 8 = 125 updates total). Explicit flags
-override the preset. Threads default to all cores; on a 10-core/20-thread Xeon,
-`--threads 10` avoids oversubscription.
+1000 steps, checkpoints every 200 steps, `float32`, `--device cpu`, and enables
+`--lora`. Explicit flags override the preset. Threads default to all cores; on
+a 10-core/20-thread Xeon, `--threads 10` matches `--threads 20` in measured
+throughput, so either is fine.
 
 ```bash
-python train.py --cpu --threads 10 \
+python train.py --cpu --threads 20 --lora \
+  --steps 3000 --batch_size 4 --grad_accum 2 \
   --data /path/to/docs --limit 2000 --max_tokens 2000000
 ```
 
 CPU training is fp32 on purpose: bf16/AMX is emulated on pre-Sapphire-Rapids
 Xeons and is slower than fp32 there.
 
+### LoRA
+
+`--lora` freezes the base model and trains rank-16 adapters on
+`q_proj, k_proj, v_proj, o_proj` (`--lora_r`, `--lora_alpha 32`,
+`--lora_dropout 0.05`), 2.16M of 496M parameters. `--lr` defaults to `5e-4`
+with `--lora` and `5e-5` without. Checkpoints then hold only the adapter
+(`~9 MB` instead of 1.9 GB) plus `lora_config`; `benchmark.py` rebuilds the
+PEFT wrapper when it sees a `lora` key, and still reads full-model checkpoints.
+
 ## Benchmark
 
 ```bash
 python benchmark.py --checkpoint runs/bfg-diff/last.pt --num_prompts 100 \
-  --canvas_len 32 --steps 2 4 8 --floors 0.0 1.0 \
-  --temps 0.0 0.7 --pos_decay 0.0 1.5 --show 3
+  --canvas_len 32 --steps 4 8 --temps 0.0 0.3 0.5 --top_k 50 --show 3
 ```
 
 Reports, for every step-count x margin-floor x temperature x decay combination:
@@ -86,6 +95,9 @@ Reports, for every step-count x margin-floor x temperature x decay combination:
 - masked-token recovery on 50%-masked real text,
 - 4-gram entropy, 4-gram repeat rate, Dist-1 and Dist-2,
 - wall-clock tokens/s, alongside Hugging Face causal `generate()`.
+
+`--top_k` truncates the stochastic sampler to the `k` most likely tokens per
+slot (default 50); it has no effect at `--temps 0.0`.
 
 It also prints side-by-side completions for the first `--show` prompts
 (diffusion vs causal), so repetition and phrasing can be inspected directly.
@@ -112,9 +124,12 @@ reported and the base model is benchmarked instead.
    slots, and freeze them. With a partially filled canvas only the remaining
    masked slots are eligible. `margin_floor` optionally holds back slots whose
    top-1 is not clearly ahead of the runner-up; held-back slots are filled by
-   argmax at the end. `temperature > 0` samples tokens with Gumbel noise
-   (ranking still uses clean margins), and `position_decay > 0` biases step 1
-   toward the canvas start.
+   argmax at the end. `temperature > 0` samples tokens with Gumbel noise over
+   the `top_k` most likely logits (ranking still uses clean margins), and
+   `position_decay > 0` biases step 1 toward the canvas start.
+5. **Prefix KV cache.** The prefix is prefilled once per prompt; each diffusion
+   step forwards only the `C` canvas tokens against the cached prefix keys and
+   values, so a step costs `C` tokens instead of `P+C`.
 
 See `docs/research.md` for the reasoning and `docs/findings.md` for measured
 numbers, including the CPU smoke-test results.

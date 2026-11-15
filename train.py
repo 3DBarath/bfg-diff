@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from dataset import GeneralTextDataset, synthetic_texts
-from model import canvas_forward, prepare
+from model import apply_lora, canvas_forward, prepare
 
 
 def parse_args():
@@ -25,7 +25,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--steps", type=int, default=4000)
-    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--lr", type=float, default=None, help="default 5e-5 full FT, 5e-4 LoRA")
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--log_every", type=int, default=10)
@@ -39,15 +39,21 @@ def parse_args():
     p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp32"])
     p.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     p.add_argument("--cpu", action="store_true", help="CPU-friendly preset (P=128, C=32, 1k steps)")
+    p.add_argument("--lora", action="store_true", help="train LoRA adapters, freeze the base model")
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--smoke_test", action="store_true", help="tiny synthetic run + convergence check")
     if "--cpu" in sys.argv:  # preset only changes defaults; explicit flags still win
         p.set_defaults(
             device="cpu", dtype="fp32", prefix_len=128, canvas_len=32,
             batch_size=2, grad_accum=8, steps=1000, save_every=200,
-            log_every=20, eval_every=200, warmup=20,
+            log_every=20, eval_every=200, warmup=20, lora=True,
         )
     args = p.parse_args()
+    if args.lr is None:
+        args.lr = 5e-4 if args.lora else 5e-5
     if args.smoke_test:
         args.steps = 12
         args.prefix_len, args.canvas_len = 128, 64
@@ -103,17 +109,21 @@ def evaluate(model, loader, mask_id, device, batches):
 
 
 def save_checkpoint(path, model, mask_id, args, step):
+    """LoRA runs save ~10 MB of adapters; full fine-tunes save the whole model."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "mask_id": mask_id,
-            "model_name": args.model,
-            "step": step,
-            "args": vars(args),
-        },
-        path,
-    )
+    ck = {"mask_id": mask_id, "model_name": args.model, "step": step, "args": vars(args)}
+    if args.lora:
+        from peft import get_peft_model_state_dict
+
+        ck["lora"] = get_peft_model_state_dict(model)
+        ck["lora_config"] = {
+            "r": args.lora_r,
+            "alpha": args.lora_alpha,
+            "dropout": args.lora_dropout,
+        }
+    else:
+        ck["model"] = model.state_dict()
+    torch.save(ck, path)
 
 
 def main():
@@ -121,6 +131,10 @@ def main():
     torch.manual_seed(args.seed)
     n_threads = args.threads or (os.cpu_count() or 1)
     torch.set_num_threads(n_threads)
+    try:
+        torch.set_num_interop_threads(2)
+    except RuntimeError:  # already set by an earlier import
+        pass
     device = pick_device(args.device)
     dtype = (
         torch.bfloat16
@@ -129,6 +143,11 @@ def main():
     )
 
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
+    if args.lora:
+        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"LoRA r={args.lora_r} alpha={args.lora_alpha}: {trainable:,} / {total:,} params trainable")
     ds = (
         GeneralTextDataset(
             args.data, tok, args.prefix_len, args.canvas_len,
@@ -154,7 +173,10 @@ def main():
     )
 
     opt = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
     )
 
     def lr_lambda(update):

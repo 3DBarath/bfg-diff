@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from model import prepare
+from model import apply_lora, prepare
 from sampler import sample_canvas_block
 
 # Long reference documents (prose, docs, markdown, JSON) for masked reconstruction.
@@ -92,6 +92,8 @@ def parse_args():
                    help="Gumbel temperatures (0 = greedy)")
     p.add_argument("--pos_decay", type=float, nargs="+", default=[0.0],
                    help="step-1 position decay lambdas")
+    p.add_argument("--top_k", type=int, default=50,
+                   help="truncate stochastic sampling to the top-k logits")
     p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -204,7 +206,7 @@ def run_sampler_generation(
         canvas = sample_canvas_block(
             model, ids, canvas_len=args.canvas_len, steps=steps, mask_id=mask_id,
             prefix_keep=keep, margin_floor=margin_floor,
-            temperature=temperature, position_decay=position_decay,
+            temperature=temperature, position_decay=position_decay, top_k=args.top_k,
         )
         token_ids.extend(canvas.tolist())
     sync(device)
@@ -252,7 +254,16 @@ def main():
         tok.pad_token = tok.eos_token
     if Path(args.checkpoint).exists():
         ck = torch.load(args.checkpoint, map_location="cpu")
-        model.load_state_dict(ck["model"])
+        if ck.get("lora") is not None:
+            from peft import set_peft_model_state_dict
+
+            cfg = ck.get("lora_config", {})
+            model = apply_lora(
+                model, cfg.get("r", 16), cfg.get("alpha", 32), cfg.get("dropout", 0.05)
+            )
+            set_peft_model_state_dict(model, ck["lora"])
+        else:
+            model.load_state_dict(ck["model"])
         mask_id = ck.get("mask_id", mask_id)
     else:
         print(f"warning: checkpoint {args.checkpoint!r} not found; benchmarking base model")
@@ -267,8 +278,8 @@ def main():
         rec, tps = run_reconstruction(model, tok, args, mask_id, device, steps)
         print(f"{f'bfg-diff k={steps}':<18}{rec:>9.1%}{tps:>12,.1f}")
 
-    print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len}")
-    print(f"{'method':<30}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
+    print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len} | top_k={args.top_k}")
+    print(f"{'method':<34}{'H4':>7}{'rep4':>7}{'Dist1':>7}{'Dist2':>7}{'TPS':>10}")
     outputs = {}
     for floor in args.floors:
         for temp in args.temps:
@@ -281,13 +292,13 @@ def main():
                     name = f"bfg-diff {label}"
                     outputs[name] = texts
                     print(
-                        f"{name:<30}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+                        f"{name:<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
                         f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
                     )
     ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
     outputs["causal generate"] = texts
     print(
-        f"{'causal generate':<30}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
+        f"{'causal generate':<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
         f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
     )
 

@@ -127,6 +127,13 @@ address this without retraining:
   sampling from `softmax(logits / T)`. The rank order (which slots to unmask)
   still comes from the clean log-probs, so confidence estimates are not
   distorted by noise. `T = 0` keeps the previous greedy behavior.
+- **Top-k truncation.** Qwen2.5 has 151,936 output tokens. Standard Gumbel noise
+  is unbounded, and a token sitting 10 nats below the top-1 can win the argmax
+  when its noise draw is extreme; over 32 slots this happens often enough to
+  produce punctuation and subword salad. With `top_k = 50`, logits below the
+  50th largest per slot are set to `-inf` before the noise is added, so sampling
+  stays inside the plausible head of the distribution. Truncation is applied
+  only when `temperature > 0`.
 - **Step-1 position decay.** Token 0 of the canvas directly follows the prefix;
   token 25 is separated from it by 25 masks. On the first step only, margins
   are multiplied by `exp(-lambda * i / C)`, so the left boundary settles first
@@ -136,11 +143,44 @@ address this without retraining:
 Both knobs leave frozen/pre-filled tokens untouched, so reconstruction and
 partial-canvas decoding keep their guarantees.
 
+## Prefix KV cache
+
+The prefix is clean context: its hidden states and therefore its key/value
+tensors are identical at every diffusion step. Recomputing them is pure waste,
+and at `P = 128`, `C = 32` it is 80% of the per-step token count.
+
+`prefill_prefix` runs the prefix once with `use_cache=True` and keeps the
+returned `DynamicCache`. `canvas_step_with_cache` then feeds only the `C`
+canvas ids with a custom 4D mask of shape `(B, 1, C, P+C)`: every canvas query
+sees all prefix keys and all canvas keys, which is exactly the canvas row of the
+hybrid mask. Canvas RoPE positions still start at the real prefix length, so
+they are identical to the full-sequence pass. After each step the canvas rows
+are cropped from the cache (`crop(-C)`), leaving the prefix cache reusable.
+
+Measured fp32 difference against a full `(P+C)` forward is ~3e-5 in logits and
+token-identical argmax. A diffusion step therefore costs `C` tokens instead of
+`P+C`.
+
+## LoRA training
+
+Full fp32 fine-tuning updates 496M parameters and stores two AdamW moments for
+each, which dominates both compute and the 1.9 GB checkpoints. `--lora` freezes
+the base model and trains rank-16 adapters on `q_proj, k_proj, v_proj, o_proj`
+(2.16M parameters, 0.4%), alpha 32, dropout 0.05, bias none. Only the adapter
+matrices receive gradients and optimizer state, so checkpoints shrink to a few
+MB and the backward pass skips the frozen MLP blocks.
+
+The adapter starts at zero (`B = 0`), so the initial forward pass is the
+pretrained model and the loss starts where the base model is. LoRA tolerates a
+higher learning rate than full fine-tuning; `--lr` defaults to `5e-4` with
+`--lora` and `5e-5` without.
+
 ## Cost model
 
-A diffusion step is one forward over `P+C` tokens and produces `C` positions at
-once, so `K` steps cost `K` forwards. Autoregressive generation costs one
-forward per new token, growing its context each time. The diffusion decoder is
-therefore much cheaper per token at small `K`, at the price of needing a model
-fine-tuned for bidirectional denoising. Logits for a canvas step are
-`(B, C, vocab)`, which is the dominant memory term at large `C`.
+A diffusion step with the cache is one forward over `C` tokens plus a one-off
+`P`-token prefill, so `K` steps cost `P + K*C` token evaluations. Causal
+generation costs `P + C` but strictly sequentially: 32 kernel launches of one
+token each. The diffusion decoder is therefore cheaper per token at small `K`
+and parallel across the canvas, at the price of needing a model fine-tuned for
+bidirectional denoising. Logits for a canvas step are `(B, C, vocab)`, which is
+the dominant memory term at large `C`.
