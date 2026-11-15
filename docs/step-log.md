@@ -253,3 +253,10 @@ python train.py --cpu --lora --lora_mlp --threads 20 --steps 3000 \
 
 Same seed (default 0), batch 4 x accum 2, same corpus as `runs/bfg-lora`;
 8.80M trainable params. Comparison benchmark pending its completion.
+
+The run first started as a harness background shell at 13:49 (step 1 loss
+14.6225) and was moved into tmux session `bfg-lora-mlp` at 14:09 for durability
+(`reptyr` could not steal the process, so it restarted from step 1; step-1 loss
+is identical, confirming the same seed and data order). Steady rate is 5.85 s/step
+(111 tok/s), so 3000 steps is ~4.9 h, ETA ~19:05. A watcher fires when the tmux
+session exits.
