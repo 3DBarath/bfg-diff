@@ -531,6 +531,9 @@ Findings:
   three-token `not not not` run has disappeared, but runs of `the` survive
   because they are committed in *different* steps. The mechanism can only see
   simultaneous predictions, and that is exactly its stated scope.
+  Counted on the rendered text (word-level, so a different measure than the
+  token-level `adj` column): 27.7% of adjacent pairs identical before
+  suppression, 15.0% after, and the longest run is still 3 tokens in both.
 - **At T>=0.3 the effect is inside noise** (rep2 and Dist-2 move in both
   directions, ±2 points). Sampling noise already breaks up many pairs, so the
   deterministic setting is where the mechanism pays.
@@ -605,10 +608,18 @@ smoke convergence: 5.4177 -> 3.5945 PASS
   alone. The pre-existing `runs/bfg-lora/last.pt` has no `targets` key and still
   loads as attention-only (default `LORA_TARGETS`).
 - **Decision gate: NOT triggered.** The gate was "rep4 at T=0.0 with
-  `remask_ratio=0.25` still > 20%". Measured 10.1% at k=8 (45.1% at k=4, which
-  is expected — fewer steps). The remaining failure is grammatical structure,
-  not a repeated-4-gram attractor, and it is not obviously caused by frozen MLPs.
-  No 3000-step `--lora_mlp` run is launched.
+  `remask_ratio=0.25` still > 20%". Measured 10.1% at k=8 (45.1% at k=4). The
+  remaining failure is grammatical structure, not a repeated-4-gram attractor,
+  and it is not obviously caused by frozen MLPs. No 3000-step `--lora_mlp` run
+  was launched by the gate itself.
+- **Run launched anyway, as a controlled ablation** (2026-11-15): the qualitative
+  text showed adjacent stutter (`not not not`) that `rep4` under-reported, and
+  the hypothesis that frozen causal MLPs cannot form fluent bidirectional
+  n-grams is testable by the same 3000-step recipe at 8.80M parameters.
+  `runs/bfg-lora-mlp` / `runs/train-lora-mlp.log`, same seed (0), same corpus,
+  same batch (4 x accum 2). Comparison pending: reconstruction `k=2,4,8` and
+  generation `k=8, r=0.25, T=0/0.3/0.5` with `rep2`/`rep4`/`adj` for both
+  checkpoints.
 
 ## Open questions / not verified
 
