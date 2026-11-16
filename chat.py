@@ -244,7 +244,7 @@ def generate_causal(model, tok, prompt_text, max_new_tokens=32):
     return {"text": text, "tokens": gen_tokens, "elapsed": elapsed, "tps": tps}
 
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -504,8 +504,8 @@ async function runGeneration() {
   const causalMetrics = document.getElementById('causalMetrics');
   const traceLogs = document.getElementById('traceLogs');
 
-  bfgOutput.innerText = 'Waiting for diffusion steps...';
-  causalOutput.innerText = 'Starting autoregressive stream...';
+  bfgOutput.innerText = 'Starting parallel unmasking...';
+  causalOutput.innerText = 'Waiting for causal stream...';
   bfgMetrics.innerText = '0.0 TPS';
   causalMetrics.innerText = '0.0 TPS';
   traceLogs.innerHTML = '';
@@ -530,25 +530,29 @@ async function runGeneration() {
     });
 
     if (!response.ok) {
-      throw new Error(`Server returned HTTP ${response.status}`);
+      throw new Error("Server returned HTTP " + response.status);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    const NL = String.fromCharCode(10);
+    const CR = String.fromCharCode(13);
+    const DBL_NL = NL + NL;
 
-      // Normalize CRLF to LF and split by double newline
-      const normalized = buffer.replaceAll('\r\n', '\n');
-      const parts = normalized.split('\n\n');
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+
+      // Cleanly normalize CRLF to LF using char codes
+      const normalized = buffer.split(CR + NL).join(NL);
+      const parts = normalized.split(DBL_NL);
       buffer = parts.pop(); // keep last incomplete chunk
 
-      for (const block of parts) {
-        const trimmed = block.trim();
+      for (const rawBlock of parts) {
+        const trimmed = rawBlock.trim();
         if (!trimmed.startsWith('data:')) continue;
         const jsonStr = trimmed.replace(/^data:\s*/, '').trim();
         if (!jsonStr) continue;
@@ -557,38 +561,37 @@ async function runGeneration() {
         try {
           evt = JSON.parse(jsonStr);
         } catch (e) {
-          console.error("JSON parse error:", e, jsonStr);
           continue;
         }
 
         if (evt.type === 'causal_token') {
           causalAccum += evt.token;
           causalOutput.innerText = causalAccum;
-          causalMetrics.innerText = `${evt.tps.toFixed(1)} TPS (${evt.elapsed.toFixed(2)}s)`;
+          causalMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
         } else if (evt.type === 'causal_done') {
           causalOutput.innerText = evt.causal.text;
-          causalMetrics.innerText = `${evt.causal.tps.toFixed(1)} TPS (${evt.causal.elapsed.toFixed(2)}s)`;
+          causalMetrics.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
         } else if (evt.type === 'bfg_step') {
-          bfgMetrics.innerText = `${evt.tps.toFixed(1)} TPS (${evt.elapsed.toFixed(2)}s)`;
+          bfgMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
 
           // Ensure block container exists
           let bDiv = blockContainers[evt.block_idx];
           if (!bDiv) {
             bDiv = document.createElement('div');
             bDiv.className = 'block-trace';
-            bDiv.innerHTML = `<div class="block-header" style="font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px;">Sub-Block ${evt.block_idx + 1}</div><div class="steps-list"></div>`;
+            bDiv.innerHTML = '<div class="block-header" style="font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px;">Sub-Block ' + (evt.block_idx + 1) + '</div><div class="steps-list"></div>';
             traceLogs.appendChild(bDiv);
             blockContainers[evt.block_idx] = bDiv;
           }
 
           // In-place step update or append without layout thrashing
           const stepsList = bDiv.querySelector('.steps-list');
-          let stepRow = stepsList.querySelector(`[data-step="${evt.step}"]`);
+          let stepRow = stepsList.querySelector('[data-step="' + evt.step + '"]');
           if (!stepRow) {
             stepRow = document.createElement('div');
             stepRow.className = 'step-line';
             stepRow.setAttribute('data-step', evt.step);
-            stepRow.innerHTML = `<span class="step-num">Step ${evt.step}</span><div class="tokens-canvas"></div>`;
+            stepRow.innerHTML = '<span class="step-num">Step ' + evt.step + '</span><div class="tokens-canvas"></div>';
             stepsList.appendChild(stepRow);
           }
 
@@ -597,7 +600,7 @@ async function runGeneration() {
           evt.tokens.forEach(tok => {
             const isMask = tok === '░';
             const safeTok = escapeHtml(tok);
-            chipsHtml += `<span class="token-chip ${isMask ? 'mask' : ''}">${isMask ? '░' : safeTok}</span>`;
+            chipsHtml += '<span class="token-chip ' + (isMask ? 'mask' : '') + '">' + (isMask ? '░' : safeTok) + '</span>';
           });
           canvasDiv.innerHTML = chipsHtml;
 
@@ -617,12 +620,12 @@ async function runGeneration() {
             bDiv._final = cleanText;
             const header = bDiv.querySelector('.block-header');
             if (header) {
-              header.innerText = `Sub-Block ${evt.block_idx + 1}: Final: "${escapeHtml(cleanText)}"`;
+              header.innerText = 'Sub-Block ' + (evt.block_idx + 1) + ': Final: "' + escapeHtml(cleanText) + '"';
             }
           }
         } else if (evt.type === 'bfg_done') {
           bfgOutput.innerText = evt.bfg.text;
-          bfgMetrics.innerText = `${evt.bfg.tps.toFixed(1)} TPS (${evt.bfg.elapsed.toFixed(2)}s)`;
+          bfgMetrics.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
         }
       }
     }
@@ -684,20 +687,39 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             # Streaming SSE endpoint
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
+            # 2KB comment padding to force immediate flush through proxy buffers (e.g. Cloudflare)
+            pad = ": " + (" " * 2048) + "\n\n"
+
             def send_sse(evt_data):
-                msg = f"data: {json.dumps(evt_data)}\n\n".encode("utf-8")
+                msg = (f"data: {json.dumps(evt_data)}\n\n" + pad).encode("utf-8")
                 try:
                     self.wfile.write(msg)
                     self.wfile.flush()
                 except Exception:
                     pass
 
-            # 1. Stream Causal Baseline token by token in real-time
+            # 1. Stream BFG Discrete Diffusion step-by-step FIRST for instant visual response
+            bfg_res = generate_bfg_stream(
+                self.model,
+                self.tok,
+                self.mask_id,
+                prompt,
+                canvas_len=canvas_len,
+                sub_canvas_len=sub_canvas_len,
+                sub_steps=sub_steps,
+                temperature=temp,
+                stop_tokens=stop_tokens,
+                step_callback=lambda evt: send_sse(evt),
+            )
+            send_sse({"type": "bfg_done", "bfg": bfg_res})
+
+            # 2. Stream Causal Baseline token by token in real-time
             causal_res = generate_causal_stream(
                 self.model,
                 self.tok,
@@ -712,21 +734,6 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 }),
             )
             send_sse({"type": "causal_done", "causal": causal_res})
-
-            # 2. Stream BFG Discrete Diffusion step-by-step
-            bfg_res = generate_bfg_stream(
-                self.model,
-                self.tok,
-                self.mask_id,
-                prompt,
-                canvas_len=canvas_len,
-                sub_canvas_len=sub_canvas_len,
-                sub_steps=sub_steps,
-                temperature=temp,
-                stop_tokens=stop_tokens,
-                step_callback=lambda evt: send_sse(evt),
-            )
-            send_sse({"type": "bfg_done", "bfg": bfg_res})
         else:
             self.send_response(404)
             self.end_headers()
