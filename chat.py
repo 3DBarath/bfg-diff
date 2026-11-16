@@ -97,7 +97,14 @@ def generate_bfg_traced(
 
     elapsed = time.perf_counter() - start_time
     total_tokens = canvas_out.shape[1]
-    full_text = tok.decode(canvas_out[0], skip_special_tokens=True)
+    raw_text = tok.decode(canvas_out[0], skip_special_tokens=False)
+
+    # In chat mode, truncate cleanly at stop tokens
+    if stop_tokens:
+        for st in stop_tokens:
+            if st in raw_text:
+                raw_text = raw_text.split(st)[0]
+    full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
     tps = total_tokens / max(1e-5, elapsed)
 
     trace = []
@@ -326,8 +333,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="control-group">
       <label>Mode</label>
       <select id="mode">
-        <option value="completion" selected>Completion</option>
-        <option value="chat">Chat (<|im_start|>)</option>
+        <option value="chat" selected>Chat (&lt;|im_start|&gt;)</option>
+        <option value="completion">Completion</option>
       </select>
     </div>
     <div class="control-group">
@@ -350,7 +357,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div class="prompt-card">
     <label style="display:block; margin-bottom:8px;">Input Prompt</label>
-    <textarea id="prompt">Once upon a time, in a small coastal village, the fishermen noticed that</textarea>
+    <textarea id="prompt">How are you doing today?</textarea>
     <div style="margin-top: 12px; display: flex; justify-content: flex-end;">
       <button id="runBtn" onclick="runGeneration()">Generate & Compare</button>
     </div>
