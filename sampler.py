@@ -26,6 +26,7 @@ def sample_canvas_block(
     anchor_thresh=2.5,
     kv=None,
     step_callback=None,
+    stop_token_ids=None,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -340,6 +341,16 @@ def sample_canvas_block(
         if step_callback is not None:
             step_callback(s, canvas)
 
+        # Early exit 1: All tokens verified in this sub-block
+        if verified.all():
+            break
+
+        # Early exit 2: Stop token verified in this sub-block
+        if stop_token_ids:
+            stop_set = set(stop_token_ids)
+            if any(int(canvas[i, j]) in stop_set for i in range(B) for j in range(canvas_len) if verified[i, j]):
+                break
+
     leftover = canvas == mask_id  # only if steps/canvas_len rounding left holes
     if leftover.any():
         fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
@@ -357,6 +368,7 @@ def sample_canvas(
     prefix_keep=None,
     carrier_priority=True,
     block_callback=None,
+    stop_token_ids=None,
     **kwargs,
 ):
     """Generate canvas_len tokens either in one block or sliding through sub-blocks.
@@ -402,11 +414,18 @@ def sample_canvas(
             carrier_priority=carrier_priority,
             kv=kv,
             step_callback=step_cb,
+            stop_token_ids=stop_token_ids,
             **kwargs,
         )
         generated_blocks.append(block)
         block_idx += 1
         rem -= c_sub
+
+        # Early exit across sub-blocks if a stop token was generated
+        if stop_token_ids:
+            stop_set = set(stop_token_ids)
+            if any(int(tok) in stop_set for tok in block[0]):
+                break
 
         if rem > 0 and kv is not None:
             # Advance KV cache by appending [cur_prefix[:, -1:], block[:, :-1]] (exactly c_sub tokens).

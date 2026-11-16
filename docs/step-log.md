@@ -366,3 +366,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
    - Tested against live API at `http://127.0.0.1:8766/api/generate` with 6 multi-prompt test cases (3 chat, 3 completion).
    - Traces confirmed zero lookahead draft stutters: `"What is the capital of France?"` cleanly generated `"The capital of France is Paris."`, and `"How are you doing today?"` generated `"I'm doing well, thank you. How can I assist you today?"`.
+
+## 22. Web UI Streaming Polish & Stop Token Early Termination (2026-11-16)
+
+1. **Web UI SSE Streaming Fixes (`chat.py`):**
+   - Converted `HTML_PAGE` to a raw Python triple-quoted string (`r"""..."""`) and used `String.fromCharCode(10)` / `String.fromCharCode(13)` in client JavaScript to prevent CRLF parsing syntax errors. Verified with `node --check` (0 errors).
+   - Set HTTP response headers `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`.
+   - Appended 2048-byte comment padding (`": " + (" " * 2048) + "\n\n"`) to each SSE chunk, forcing Cloudflare's 4KB edge chunk buffer to flush each diffusion step immediately.
+   - Reordered streaming execution to run BFG Discrete Diffusion first, delivering instant animation.
+2. **Stop Token Early Exit (`sampler.py`):**
+   - Added `stop_token_ids` parameter to `sample_canvas` and `sample_canvas_block`.
+   - Enabled early `break` on step loop when all tokens are verified (`verified.all()`) or when any verified token in the canvas belongs to `stop_token_ids`.
+   - Enabled early `break` across sub-blocks in `sample_canvas` when a block contains a stop token, dropping 16-token latency on short chat answers from 3.42s to 1.75s (50% reduction).
+3. **Verification:**
+   - `python train.py --smoke_test`: `smoke convergence: 11.9798 -> 4.0549 PASS`.
+   - `python benchmark.py --smoke_test`: `Reconstruction 63.2% TPS 9.2, Generation TPS 5.0 PASS`.
+   - Live endpoints verified locally (`http://127.0.0.1:8766`) and through Cloudflare tunnel (`https://bfg-dff.gces.net.in`).

@@ -835,3 +835,26 @@ Evaluated via `http://127.0.0.1:8766/api/generate` with $C_{\text{sub}}=8, k_{\t
 
 - **Smoke test verification:** `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
 
+## Web Streaming & Early-Exit Optimization Benchmarks (2026-11-16)
+
+Evaluated via `chat.py` on `runs/bfg-instruct/last.pt` with early-exit stop tokens (`<|im_end|>`, `<|endoftext|>`):
+
+### 6-Prompt Benchmark Comparison
+
+| Prompt | Mode | BFG-Diff Output | BFG Latency | BFG Blocks | Causal Output | Causal Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `"How are you doing today?"` | Chat | `"I'm doing well, thank you. How can I assist you today?"` | **3.43s** (4.7 TPS) | 2 | `"I'm good, thanks for asking! How about you?"` | 1.18s (11.0 TPS) |
+| `"What is the capital of France?"` | Chat | `"The capital of France is Paris."` | **1.75s** (4.6 TPS) | 1 | `"The capital of France is Paris."` | 0.76s (10.5 TPS) |
+| `"Tell me a short story about a fisherman."` | Chat | `"A fisherman named John was fishing in the ocean when he caught a beautiful fish. He named it "Fishy" and named it "Day" for the"` | **6.85s** (4.7 TPS) | 4 | `"A fisherman named Jack was fishing in the ocean..."` | 2.76s (11.6 TPS) |
+| `"The quick brown fox"` | Completion | `"jumps over the lazy dog.\nThis is a classic poem that has been around for centuries. It's a great example of a poem that is both beautiful and easy"` | **6.77s** (4.7 TPS) | 4 | `" jumps over the lazy dog.\nThis is a classic poem..."` | 2.68s (11.9 TPS) |
+| `"Machine learning is a subset of"` | Completion | `"artificial intelligence that enables computers to learn from data. It involves the use of algorithms to analyze patterns in data and make predictions or decisions based on that data. The"` | **7.24s** (4.4 TPS) | 4 | `" artificial intelligence that involves the use of algorithms..."` | 2.70s (11.8 TPS) |
+| `"In a galaxy far, far away"` | Completion | `", there is a galaxy of stars. The stars are arranged in a circle, and each star is connected to its two nearest neighbors by a straight line. The"` | **6.75s** (4.7 TPS) | 4 | `", there is a planet with the same mass as Earth..."` | 2.71s (11.8 TPS) |
+
+### Verification Smoke Tests
+- `python train.py --smoke_test`: `smoke convergence: 11.9798 -> 4.0549 PASS`.
+- `python benchmark.py --smoke_test`:
+  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 63.2%`, `TPS = 9.2`.
+  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 6.7%`, `TPS = 5.0`.
+  - Causal generate: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `TPS = 13.6`.
+
+

@@ -97,6 +97,13 @@ def generate_bfg_stream(
                 "elapsed": elapsed,
             })
 
+    stop_token_ids = []
+    if stop_tokens:
+        for st in stop_tokens:
+            tid = tok.convert_tokens_to_ids(st)
+            if tid is not None and tid != tok.unk_token_id:
+                stop_token_ids.append(tid)
+
     canvas_out = sample_canvas(
         model,
         prefix_ids,
@@ -107,6 +114,7 @@ def generate_bfg_stream(
         temperature=temperature,
         carrier_priority=carrier_priority,
         block_callback=block_trace_cb,
+        stop_token_ids=stop_token_ids,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -156,6 +164,13 @@ def generate_bfg_traced(
         step_tokens = [tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas_tensor[0]]
         trace_blocks[b_idx].append({"step": s, "tokens": step_tokens, "text": "".join(step_tokens)})
 
+    stop_token_ids = []
+    if stop_tokens:
+        for st in stop_tokens:
+            tid = tok.convert_tokens_to_ids(st)
+            if tid is not None and tid != tok.unk_token_id:
+                stop_token_ids.append(tid)
+
     canvas_out = sample_canvas(
         model,
         prefix_ids,
@@ -166,6 +181,7 @@ def generate_bfg_traced(
         temperature=temperature,
         carrier_priority=carrier_priority,
         block_callback=block_trace_cb,
+        stop_token_ids=stop_token_ids,
     )
 
     elapsed = time.perf_counter() - start_time
