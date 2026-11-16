@@ -16,19 +16,20 @@ import torch
 from peft import set_peft_model_state_dict
 
 from model import LORA_TARGETS, apply_lora, prepare
-from sampler import sample_canvas_block
+from sampler import sample_canvas
 
 
-def load_bfg_model(checkpoint_path, device="cpu"):
+def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B-Instruct", device="cpu"):
     """Load base Qwen model and apply checkpoint adapters."""
+    torch.set_num_threads(10)
     device = torch.device(device)
-    model, tok, mask_id = prepare("Qwen/Qwen2.5-0.5B", device=device, dtype=torch.float32)
+    model, tok, mask_id = prepare(model_name, device=device, dtype=torch.float32)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
     ck_file = Path(checkpoint_path)
     if not ck_file.exists():
-        fallback = Path("runs/bfg-shifted/last.pt")
+        fallback = Path("runs/bfg-polished/last.pt") if Path("runs/bfg-polished/last.pt").exists() else Path("runs/bfg-shifted/last.pt")
         if fallback.exists():
             print(f"Notice: {checkpoint_path} not found. Falling back to {fallback}")
             ck_file = fallback
@@ -66,211 +67,48 @@ def generate_bfg_traced(
     carrier_priority=True,
     stop_tokens=None,
 ):
-    """Generate tokens using BFG-Diff while capturing block-by-block and step-by-step traces."""
+    """Generate tokens using unified sampler.py while capturing step-by-step traces."""
+    torch.set_num_threads(10)
     with torch.no_grad():
         prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
-    k_sub = sub_steps
-    cur_prefix = prefix_ids
-    cur_keep = None
-    generated_blocks = []
-    rem = canvas_len
-    trace = []
-    block_idx = 0
+
     start_time = time.perf_counter()
+    trace_blocks = {}
 
-    # Pre-encode prefix into KV cache
-    from model import mask_position_ids, prefill_prefix
+    def block_trace_cb(b_idx, s, canvas_tensor):
+        if b_idx not in trace_blocks:
+            # Initial step 0
+            init_tokens = [tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas_tensor[0]]
+            trace_blocks[b_idx] = [{"step": 0, "tokens": init_tokens, "text": "".join(init_tokens)}]
+        step_tokens = [tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas_tensor[0]]
+        trace_blocks[b_idx].append({"step": s, "tokens": step_tokens, "text": "".join(step_tokens)})
 
-    kv = prefill_prefix(model, cur_prefix, cur_keep)
-
-    while rem > 0:
-        c_sub = min(sub_canvas_len, rem)
-        B = cur_prefix.shape[0]
-        canvas = torch.full((B, c_sub), mask_id, dtype=torch.long, device=cur_prefix.device)
-        block_steps_trace = []
-
-        # Run step-by-step decoding within sub-block
-        frozen = canvas != mask_id
-        decoded = torch.zeros_like(frozen)
-        prefix_len = cur_prefix.shape[1]
-
-        # Initial all-mask state
-        init_tokens = [tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas[0]]
-        block_steps_trace.append({"step": 0, "tokens": init_tokens, "text": "".join(init_tokens)})
-
-        for s in range(1, k_sub + 1):
-            from model import canvas_step_with_cache
-
-            logits = canvas_step_with_cache(
-                model, cur_prefix[:, -1:], canvas, kv, prefix_len, cur_keep
-            )
-            kv.crop(-(1 + c_sub))
-            z = logits.float()
-            top2 = z.topk(2, dim=-1)
-            margin = top2.values[..., 0] - top2.values[..., 1]
-
-            keep_token = frozen.clone()
-            if s == k_sub:
-                keep_token |= decoded
-
-            if carrier_priority and s < k_sub:
-                has_carrier = torch.zeros_like(frozen)
-                has_carrier[:, 0] = True
-                has_carrier[:, 1:] = keep_token[:, :-1] | frozen[:, :-1]
-                anchor = margin >= 2.5
-                is_priority = has_carrier | anchor
-                rank = margin + torch.where(is_priority, 10.0, 0.0)
-            else:
-                rank = margin.clone()
-
-            # Cross-step repulsion
-            left = keep_token[:, :-1]
-            right = keep_token[:, 1:]
-            idx_rep = torch.where(left, canvas[:, :-1], torch.zeros_like(canvas[:, :-1]))
-            rep = z[:, 1:].scatter(-1, idx_rep.unsqueeze(-1), -float("inf"))
-            z[:, 1:] = torch.where(left.unsqueeze(-1), rep, z[:, 1:])
-            idx_rep = torch.where(right, canvas[:, 1:], torch.zeros_like(canvas[:, 1:]))
-            rep = z[:, :-1].scatter(-1, idx_rep.unsqueeze(-1), -float("inf"))
-            z[:, :-1] = torch.where(right.unsqueeze(-1), rep, z[:, :-1])
-            if prefix_len:
-                last_t = cur_prefix[:, -1:]
-                rep = z[:, :1].scatter(-1, last_t.unsqueeze(-1), -float("inf"))
-                z[:, :1] = torch.where(~keep_token[:, :1].unsqueeze(-1), rep, z[:, :1])
-
-            if temperature > 0.0:
-                vals, top_idx = z.topk(min(50, z.shape[-1]), dim=-1)
-                u = torch.rand_like(vals).clamp(1e-9, 1.0 - 1e-9)
-                pick_samp = (vals / temperature - torch.log(-torch.log(u))).argmax(-1, keepdim=True)
-                sampled = top_idx.gather(-1, pick_samp).squeeze(-1)
-            else:
-                sampled = top2.indices[..., 0]
-
-            if s == k_sub:
-                row = canvas[0].clone()
-                for j in (canvas[0] == mask_id).nonzero().flatten().tolist():
-                    tok_id = int(sampled[0, j])
-                    prev_id = (
-                        int(row[j - 1])
-                        if j > 0
-                        else (int(cur_prefix[0, -1]) if prefix_len else None)
-                    )
-                    if prev_id is not None and tok_id == prev_id:
-                        cand = z[0, j].clone()
-                        cand[prev_id] = -float("inf")
-                        tok_id = int(cand.argmax())
-                    row[j] = tok_id
-                canvas[0] = row
-            else:
-                n_mutable = c_sub - int(frozen[0].sum())
-                budget = min(max(0, int(s / k_sub * n_mutable)), n_mutable)
-                keep = keep_token[0] & ~frozen[0]
-                pick = set(keep.nonzero().flatten().tolist())
-
-                if carrier_priority:
-                    # 1. Concrete carriers
-                    has_carrier_0 = has_carrier[0]
-                    cand_c = [
-                        j
-                        for j in range(c_sub)
-                        if has_carrier_0[j] and j not in pick and not frozen[0, j]
-                    ]
-                    cand_c.sort(key=lambda j: float(rank[0, j]), reverse=True)
-                    for j in cand_c:
-                        if len(pick) < budget:
-                            pick.add(j)
-
-                    # 2. Distant island anchors
-                    while len(pick) < budget:
-                        cand_is = [
-                            j
-                            for j in range(c_sub)
-                            if j not in pick
-                            and not frozen[0, j]
-                            and margin[0, j] >= 2.5
-                            and not (j > 0 and (j - 1) in pick)
-                        ]
-                        if not cand_is:
-                            break
-                        cand_is.sort(key=lambda j: float(rank[0, j]), reverse=True)
-                        pick.add(cand_is[0])
-
-                    # 3. Frontier advance
-                    while len(pick) < budget:
-                        cand_front = [
-                            j
-                            for j in range(c_sub)
-                            if j not in pick and not frozen[0, j] and (j > 0 and (j - 1) in pick)
-                        ]
-                        if cand_front:
-                            cand_front.sort(key=lambda j: float(rank[0, j]), reverse=True)
-                            pick.add(cand_front[0])
-                            continue
-                        cand_rem = [j for j in range(c_sub) if j not in pick and not frozen[0, j]]
-                        if not cand_rem:
-                            break
-                        cand_rem.sort(key=lambda j: float(rank[0, j]), reverse=True)
-                        pick.add(cand_rem[0])
-                else:
-                    cand = (rank[0] > -float("inf")) & ~frozen[0] & ~keep
-                    cand = cand.nonzero().flatten()
-                    if cand.numel():
-                        order = rank[0, cand].topk(min(budget - len(pick), cand.numel())).indices
-                        for idx_c in cand[order].tolist():
-                            pick.add(idx_c)
-
-                row = torch.full_like(canvas[0], mask_id)
-                pick_list = sorted(list(pick))
-                if pick_list:
-                    pick_t = torch.tensor(pick_list, dtype=torch.long, device=canvas.device)
-                    row[pick_t] = sampled[0, pick_t]
-                canvas[0] = row
-                decoded[0] = row != mask_id
-
-            step_tokens = [
-                tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas[0]
-            ]
-            block_steps_trace.append(
-                {"step": s, "tokens": step_tokens, "text": "".join(step_tokens)}
-            )
-
-        block = canvas
-        generated_blocks.append(block)
-        trace.append(
-            {
-                "block_idx": block_idx,
-                "steps": block_steps_trace,
-                "final_text": tok.decode(block[0], skip_special_tokens=True),
-            }
-        )
-        block_idx += 1
-        rem -= c_sub
-
-        # Advance KV
-        if rem > 0:
-            advance_tokens = torch.cat([cur_prefix[:, -1:], block[:, :-1]], dim=1)
-            p_cached = kv.get_seq_length()
-            pos_advance = torch.arange(
-                p_cached, p_cached + c_sub, device=advance_tokens.device
-            ).unsqueeze(0)
-            model(
-                input_ids=advance_tokens,
-                past_key_values=kv,
-                position_ids=pos_advance,
-                use_cache=True,
-            )
-
-        cur_prefix = torch.cat([cur_prefix, block], dim=1)
-
-        # Check for stop tokens if in chat mode
-        decoded_so_far = tok.decode(torch.cat(generated_blocks, dim=1)[0])
-        if stop_tokens and any(st in decoded_so_far for st in stop_tokens):
-            break
+    canvas_out = sample_canvas(
+        model,
+        prefix_ids,
+        canvas_len=canvas_len,
+        sub_canvas_len=sub_canvas_len,
+        steps=sub_steps * (canvas_len // sub_canvas_len),
+        sub_steps=sub_steps,
+        temperature=temperature,
+        carrier_priority=carrier_priority,
+        block_callback=block_trace_cb,
+    )
 
     elapsed = time.perf_counter() - start_time
-    total_tokens = sum(b.shape[1] for b in generated_blocks)
-    full_output_ids = torch.cat(generated_blocks, dim=1)[0]
-    full_text = tok.decode(full_output_ids, skip_special_tokens=True)
+    total_tokens = canvas_out.shape[1]
+    full_text = tok.decode(canvas_out[0], skip_special_tokens=True)
     tps = total_tokens / max(1e-5, elapsed)
+
+    trace = []
+    for b_idx in sorted(trace_blocks.keys()):
+        steps_list = trace_blocks[b_idx]
+        final_text = steps_list[-1]["text"].replace("░", "")
+        trace.append({
+            "block_idx": b_idx,
+            "steps": steps_list,
+            "final_text": final_text,
+        })
 
     return {
         "text": full_text,

@@ -25,6 +25,7 @@ def sample_canvas_block(
     schedule="linear",
     anchor_thresh=2.5,
     kv=None,
+    step_callback=None,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -130,6 +131,19 @@ def sample_canvas_block(
             anchor = margin >= anchor_thresh
             is_priority = has_carrier | anchor
             # Priority offset (+10.0) ensures carrier-anchored slots unmask before orphan masks
+            rank = rank + torch.where(is_priority, 10.0, 0.0)
+
+            # Suppress unconditioned newline spam on orphan slots (has_carrier == False):
+            # When slot j has no left carrier, its residual stream has not seen a real token yet
+            # and tends to predict \n. Suppress \n / \n\n / \r\n unless confidence is very high.
+            nl_tokens = [198, 271, 319]  # \n, \n\n, \r\n
+            for nl in nl_tokens:
+                if nl < z.shape[-1]:
+                    suppress_nl = (~has_carrier) & (margin < 4.0)
+                    z[..., nl] = torch.where(suppress_nl, -float("inf"), z[..., nl])
+            top2 = z.topk(2, dim=-1)
+            margin = top2.values[..., 0] - top2.values[..., 1]
+            rank = margin * decay if (decay is not None and s == 1) else margin
             rank = rank + torch.where(is_priority, 10.0, 0.0)
 
         if margin_floor > 0.0 and s < steps:
@@ -266,9 +280,33 @@ def sample_canvas_block(
                 row = torch.full_like(old, mask_id)
                 row[frozen[i]] = old[frozen[i]]
                 if pick_tensor.numel():
-                    row[pick_tensor] = torch.where(keep_token[i, pick_tensor], old[pick_tensor], sampled[i, pick_tensor])
+                    sorted_pick = sorted(pick_tensor.tolist())
+                    for j in sorted_pick:
+                        if keep_token[i, j]:
+                            tok_val = int(old[j])
+                        else:
+                            tok_val = int(sampled[i, j])
+                        # Check strictly left-to-right against already placed neighbor
+                        if suppress_adjacent:
+                            prev_tok = int(row[j - 1]) if j > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
+                            if prev_tok is not None and tok_val == prev_tok:
+                                cand_z = z[i, j].clone()
+                                cand_z[prev_tok] = -float("inf")
+                                tok_val = int(cand_z.argmax())
+                            # 2-gram cycle guard (e.g. "I am I", "You What You What"):
+                            prev2_tok = int(row[j - 2]) if j > 1 else None
+                            if prev2_tok is not None and tok_val == prev2_tok:
+                                cand_z = z[i, j].clone()
+                                if prev_tok is not None:
+                                    cand_z[prev_tok] = -float("inf")
+                                cand_z[prev2_tok] = -float("inf")
+                                tok_val = int(cand_z.argmax())
+                        row[j] = tok_val
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
+
+        if step_callback is not None:
+            step_callback(s, canvas)
 
     leftover = canvas == mask_id  # only if steps/canvas_len rounding left holes
     if leftover.any():
@@ -286,6 +324,7 @@ def sample_canvas(
     sub_steps=None,
     prefix_keep=None,
     carrier_priority=True,
+    block_callback=None,
     **kwargs,
 ):
     """Generate canvas_len tokens either in one block or sliding through sub-blocks.
@@ -314,8 +353,14 @@ def sample_canvas(
     # Pre-encode prefix[: -1] into KV cache once for all sub-blocks
     kv = prefill_prefix(model, cur_prefix, cur_keep)
 
+    block_idx = 0
     while rem > 0:
         c_sub = min(sub_canvas_len, rem)
+
+        def step_cb(s, canvas_tensor):
+            if block_callback is not None:
+                block_callback(block_idx, s, canvas_tensor)
+
         block = sample_canvas_block(
             model,
             cur_prefix,
@@ -324,9 +369,11 @@ def sample_canvas(
             prefix_keep=cur_keep,
             carrier_priority=carrier_priority,
             kv=kv,
+            step_callback=step_cb,
             **kwargs,
         )
         generated_blocks.append(block)
+        block_idx += 1
         rem -= c_sub
 
         if rem > 0 and kv is not None:
