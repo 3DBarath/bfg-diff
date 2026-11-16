@@ -542,13 +542,14 @@ async function runGeneration() {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      // Handle standard and CRLF line breaks
-      const lines = buffer.split(/\r?\n\r?\n/);
-      buffer = lines.pop(); // keep last incomplete chunk
+      // Normalize CRLF to LF and split by double newline
+      const normalized = buffer.replaceAll('\r\n', '\n');
+      const parts = normalized.split('\n\n');
+      buffer = parts.pop(); // keep last incomplete chunk
 
-      for (const block of lines) {
+      for (const block of parts) {
         const trimmed = block.trim();
-        if (!trimmed.startsWith('data: ')) continue;
+        if (!trimmed.startsWith('data:')) continue;
         const jsonStr = trimmed.replace(/^data:\s*/, '').trim();
         if (!jsonStr) continue;
 
