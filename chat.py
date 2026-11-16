@@ -587,6 +587,9 @@ async function runGeneration() {
         } else if (evt.type === 'causal_done') {
           causalOutput.innerText = evt.causal.text;
           causalMetrics.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
+          // Generation stream complete: unlock button immediately without waiting for TCP close
+          btn.disabled = false;
+          btn.innerText = 'Generate & Compare';
         } else if (evt.type === 'bfg_step') {
           bfgMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
 
@@ -705,7 +708,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
