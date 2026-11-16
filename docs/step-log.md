@@ -313,3 +313,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - Single block $C=32, k=4$ (8 tok/pass): TPS **48.4** (1.8x faster than causal).
      - Generated texts logged in `docs/decoded-samples-shifted.md`.
 
+
+## 18. Persistent KV-Cache & Island Anchor Margin Gating (2026-11-16)
+
+1. **Persistent KV-Cache Across Sub-Blocks (`sampler.py`):**
+   - Eliminated prompt re-prefill across sliding blocks in `sample_canvas`.
+   - Calls `kv = prefill_prefix(model, cur_prefix, cur_keep)` once before the block loop.
+   - After each completed sub-block of length $c_{\text{sub}}$, advances `kv` by evaluating $[ \text{prefix}_{[-1]}, \text{block}_{[:-1]} ]$ with causal position IDs matching `mask_position_ids(new_keep, 0)[:, p_cached : p_cached + c_sub]`.
+   - Leaves `block[:, -1]` as `prefix_last_id` for the next sub-block.
+2. **Margin-Gated Island Anchors (`sampler.py`):**
+   - Gated `cand_island` by `margin[i, j] >= anchor_thresh` (default `2.5`).
+   - When step budget exceeds concrete carriers, island anchors are only selected if they meet high-confidence structural threshold; otherwise, blind unanchored guesses are prevented from committing on step 1.
+3. **Verification:**
+   - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 3.6238 PASS`.
+   - `python benchmark.py --smoke_test`: `Reconstruction 26.3% TPS 17.9, Generation TPS 29.1 PASS`.

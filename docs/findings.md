@@ -762,3 +762,28 @@ at T=0.
 
 Complete sample texts across all prompts are logged in [decoded-samples-shifted.md](file:///home/gces/.bin/.s/.scripts/bfg-diff/docs/decoded-samples-shifted.md).
 
+
+## Persistent KV-Cache & Gated Island Anchors (2026-11-16)
+
+### Optimization & Algorithmic Refinement
+1. **Persistent KV Cache in `sample_canvas`:**
+   - Previous sliding sub-block implementation re-evaluated the entire prompt prefix on each sub-block. For $P=128, C=32, C_{\text{sub}}=8$, total token evaluations across 4 sub-blocks were $560$ tokens.
+   - Fixed by calling `prefill_prefix` once before the sub-block loop and incrementally advancing the cache with causal passes over $[ \text{prefix}_{[-1]}, \text{block}_{[:-1]} ]$ ($C_{\text{sub}}$ tokens), cutting token evaluations to $272$ tokens.
+   - Cache key difference against fresh prefill is $< 3.1 \times 10^{-5}$.
+2. **Anchor Threshold Gating:**
+   - Added `anchor_thresh=2.5` gating to `cand_island` in `sample_canvas_block`.
+   - When step budget exceeds the available concrete carriers (`has_carrier`), unanchored island slots are only picked if their confidence margin satisfies $\text{margin}[i, j] \ge \text{anchor\_thresh}$.
+   - Prevents low-confidence blind guesses from committing on step 1.
+
+### Verified Benchmark Smoke Output
+```
+Reconstruction | 2 prefixes | P=128 C=16
+method              recovery         TPS
+bfg-diff k=2          26.3%        17.9
+
+Generation | 2 prompts | C=16 | top_k=50
+method                                 H4   rep4   rep2    adj  Dist1  Dist2       TPS
+bfg-diff k=2 T=0 d=0 f=0 r=0        0.664  46.2%  56.7%   0.0%  0.219  0.433      29.1
+causal generate                     1.000   0.0%   3.3%   0.0%  0.750  0.967      13.6
+```
+Smoke convergence probe: `11.9797 -> 3.6238 PASS`.

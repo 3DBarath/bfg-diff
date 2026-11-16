@@ -3,7 +3,7 @@ import math
 
 import torch
 
-from model import MASK_TOKEN_ID, canvas_forward, canvas_step_with_cache, prefill_prefix
+from model import MASK_TOKEN_ID, canvas_forward, canvas_step_with_cache, mask_position_ids, prefill_prefix
 
 
 @torch.no_grad()
@@ -23,7 +23,8 @@ def sample_canvas_block(
     suppress_adjacent=True,
     carrier_priority=True,
     schedule="linear",
-    anchor_thresh=4.0,
+    anchor_thresh=2.5,
+    kv=None,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -71,7 +72,8 @@ def sample_canvas_block(
     frozen = canvas != mask_id  # pre-filled input slots: never touched
     decoded = torch.zeros_like(frozen)  # slots this sampler has filled
     prefix_len = prefix_ids.shape[1]
-    kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix[:-1] encoded once
+    if kv is None:
+        kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix[:-1] encoded once
     for s in range(1, steps + 1):
         if kv is None:
             logits = canvas_forward(model, prefix_ids, canvas, prefix_keep)
@@ -207,19 +209,22 @@ def sample_canvas_block(
                     # 2. If budget still needs slots (parallel unmasking > available carriers),
                     # pick island anchors that are NOT immediately adjacent to newly picked slots
                     # (j - 1 not in pick), so that next step the island becomes a second carrier frontier!
+                    # Only pick if margin >= anchor_thresh; do not force blind unanchored guesses.
                     while len(pick) < budget:
                         cand_island = [
                             j for j in range(canvas_len)
                             if j not in pick and not keep_token[i, j] and not frozen[i, j]
                             and rank[i, j] > -float("inf")
+                            and margin[i, j] >= anchor_thresh
                             and not (j > 0 and (j - 1) in pick)
                         ]
                         if not cand_island:
-                            # Fallback if canvas is tight
+                            # Fallback if canvas is tight, still requiring margin >= anchor_thresh
                             cand_island = [
                                 j for j in range(canvas_len)
                                 if j not in pick and not keep_token[i, j] and not frozen[i, j]
                                 and rank[i, j] > -float("inf")
+                                and margin[i, j] >= anchor_thresh
                             ]
                         if not cand_island:
                             break
@@ -285,6 +290,9 @@ def sample_canvas(
     generated_blocks = []
     rem = canvas_len
 
+    # Pre-encode prefix[: -1] into KV cache once for all sub-blocks
+    kv = prefill_prefix(model, cur_prefix, cur_keep)
+
     while rem > 0:
         c_sub = min(sub_canvas_len, rem)
         block = sample_canvas_block(
@@ -294,13 +302,37 @@ def sample_canvas(
             steps=k_sub,
             prefix_keep=cur_keep,
             carrier_priority=carrier_priority,
+            kv=kv,
             **kwargs,
         )
         generated_blocks.append(block)
+        rem -= c_sub
+
+        if rem > 0 and kv is not None:
+            # Advance KV cache by appending [cur_prefix[:, -1:], block[:, :-1]] (exactly c_sub tokens).
+            # This advances the cached prefix up to the new prefix[:-1] for the next sub-block,
+            # leaving block[:, -1:] as prefix_last_id!
+            advance_tokens = torch.cat([cur_prefix[:, -1:], block[:, :-1]], dim=1)
+            p_cached = kv.get_seq_length()
+            new_prefix = torch.cat([cur_prefix, block], dim=1)
+            new_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1) if cur_keep is not None else None
+            pos_advance = (
+                torch.arange(p_cached, p_cached + c_sub, device=advance_tokens.device).unsqueeze(0).expand(cur_prefix.shape[0], c_sub)
+                if new_keep is None
+                else mask_position_ids(new_keep, 0)[:, p_cached : p_cached + c_sub]
+            )
+            attn_mask = new_keep[:, : p_cached + c_sub] if new_keep is not None else None
+            model(
+                input_ids=advance_tokens,
+                past_key_values=kv,
+                position_ids=pos_advance,
+                attention_mask=attn_mask,
+                use_cache=True,
+            )
+
         cur_prefix = torch.cat([cur_prefix, block], dim=1)
         if cur_keep is not None:
             cur_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1)
-        rem -= c_sub
 
     return torch.cat(generated_blocks, dim=1)
 
