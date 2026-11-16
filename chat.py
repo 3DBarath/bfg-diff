@@ -463,39 +463,40 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="results" id="resultsSection" style="display: none;">
+  <div class="results" id="resultsSection">
     <div class="comparison-grid">
       <div class="model-card">
         <div class="model-title">
           <span>BFG-Diff (Discrete Diffusion)</span>
-          <span class="metric-badge" id="bfgMetrics">0 TPS</span>
+          <span class="metric-badge" id="bfgMetrics">0.0 TPS</span>
         </div>
-        <div class="output-box" id="bfgOutput">Generating...</div>
+        <div class="output-box" id="bfgOutput">Ready to generate.</div>
       </div>
       <div class="model-card">
         <div class="model-title">
           <span>Causal Baseline (generate)</span>
-          <span class="metric-badge" id="causalMetrics">0 TPS</span>
+          <span class="metric-badge" id="causalMetrics">0.0 TPS</span>
         </div>
-        <div class="output-box" id="causalOutput">Generating...</div>
+        <div class="output-box" id="causalOutput">Ready to generate.</div>
       </div>
     </div>
 
     <div class="trace-card" id="traceContainer">
       <div class="trace-title">Block-by-Block Parallel Denoising Trace</div>
-      <div id="traceLogs"></div>
+      <div id="traceLogs"><span style="color:var(--muted); font-size:13px;">Click "Generate & Compare" to see real-time unmasking trace.</span></div>
     </div>
   </div>
 </div>
 
 <script>
+function escapeHtml(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 async function runGeneration() {
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
   btn.innerText = 'Streaming...';
-
-  const resultsSection = document.getElementById('resultsSection');
-  resultsSection.style.display = 'block';
 
   const bfgOutput = document.getElementById('bfgOutput');
   const causalOutput = document.getElementById('causalOutput');
@@ -504,7 +505,7 @@ async function runGeneration() {
   const traceLogs = document.getElementById('traceLogs');
 
   bfgOutput.innerText = 'Waiting for diffusion steps...';
-  causalOutput.innerText = '';
+  causalOutput.innerText = 'Starting autoregressive stream...';
   bfgMetrics.innerText = '0.0 TPS';
   causalMetrics.innerText = '0.0 TPS';
   traceLogs.innerHTML = '';
@@ -528,6 +529,10 @@ async function runGeneration() {
       body: JSON.stringify(payload)
     });
 
+    if (!response.ok) {
+      throw new Error(`Server returned HTTP ${response.status}`);
+    }
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
@@ -537,14 +542,23 @@ async function runGeneration() {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      const lines = buffer.split('\n\n');
+      // Handle standard and CRLF line breaks
+      const lines = buffer.split(/\r?\n\r?\n/);
       buffer = lines.pop(); // keep last incomplete chunk
 
       for (const block of lines) {
-        if (!block.startsWith('data: ')) continue;
-        const jsonStr = block.replace(/^data: /, '').trim();
+        const trimmed = block.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const jsonStr = trimmed.replace(/^data:\s*/, '').trim();
         if (!jsonStr) continue;
-        const evt = JSON.parse(jsonStr);
+
+        let evt;
+        try {
+          evt = JSON.parse(jsonStr);
+        } catch (e) {
+          console.error("JSON parse error:", e, jsonStr);
+          continue;
+        }
 
         if (evt.type === 'causal_token') {
           causalAccum += evt.token;
@@ -581,32 +595,28 @@ async function runGeneration() {
           let chipsHtml = '';
           evt.tokens.forEach(tok => {
             const isMask = tok === '░';
-            chipsHtml += `<span class="token-chip ${isMask ? 'mask' : ''}">${isMask ? '░' : tok}</span>`;
+            const safeTok = escapeHtml(tok);
+            chipsHtml += `<span class="token-chip ${isMask ? 'mask' : ''}">${isMask ? '░' : safeTok}</span>`;
           });
           canvasDiv.innerHTML = chipsHtml;
 
           // Live update BFG final output with unmasked tokens
           const cleanText = evt.text.replace(/░/g, '');
           if (cleanText) {
-            if (evt.block_idx === 0 && evt.step === 1) {
-              bfgOutput.innerText = cleanText;
-            } else {
-              // Collect all current completed blocks plus current step
-              let fullPreview = '';
-              for (let i = 0; i < evt.block_idx; i++) {
-                if (blockContainers[i] && blockContainers[i]._final) {
-                  fullPreview += blockContainers[i]._final;
-                }
+            let fullPreview = '';
+            for (let i = 0; i < evt.block_idx; i++) {
+              if (blockContainers[i] && blockContainers[i]._final) {
+                fullPreview += blockContainers[i]._final;
               }
-              fullPreview += cleanText;
-              bfgOutput.innerText = fullPreview.replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
             }
+            fullPreview += cleanText;
+            bfgOutput.innerText = fullPreview.replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
           }
           if (evt.step === payload.sub_steps) {
             bDiv._final = cleanText;
             const header = bDiv.querySelector('.block-header');
             if (header) {
-              header.innerText = `Sub-Block ${evt.block_idx + 1}: Final: "${cleanText}"`;
+              header.innerText = `Sub-Block ${evt.block_idx + 1}: Final: "${escapeHtml(cleanText)}"`;
             }
           }
         } else if (evt.type === 'bfg_done') {
@@ -616,6 +626,7 @@ async function runGeneration() {
       }
     }
   } catch (err) {
+    console.error("Stream error:", err);
     bfgOutput.innerText = 'Error: ' + err.message;
   } finally {
     btn.disabled = false;
