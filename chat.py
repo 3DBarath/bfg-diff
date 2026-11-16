@@ -55,6 +55,79 @@ def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B-Instruct", dev
     return model, tok, mask_id
 
 
+def generate_bfg_stream(
+    model,
+    tok,
+    mask_id,
+    prompt_text,
+    canvas_len=32,
+    sub_canvas_len=8,
+    sub_steps=4,
+    temperature=0.0,
+    carrier_priority=True,
+    stop_tokens=None,
+    step_callback=None,
+):
+    """Generate tokens using sample_canvas while streaming step-by-step updates via callback."""
+    torch.set_num_threads(10)
+    with torch.no_grad():
+        prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
+
+    start_time = time.perf_counter()
+    tokens_generated = 0
+
+    def block_trace_cb(b_idx, s, canvas_tensor):
+        nonlocal tokens_generated
+        elapsed = time.perf_counter() - start_time
+        # Convert canvas tokens
+        toks = [tok.decode([int(t)]) if int(t) != mask_id else "░" for t in canvas_tensor[0]]
+        # Number of unmasked tokens so far in this block
+        unmasked = sum(1 for t in canvas_tensor[0] if int(t) != mask_id)
+        current_total = b_idx * sub_canvas_len + unmasked
+        tps = current_total / max(1e-5, elapsed)
+        if step_callback:
+            step_callback({
+                "type": "bfg_step",
+                "block_idx": b_idx,
+                "step": s,
+                "tokens": toks,
+                "text": "".join(toks),
+                "unmasked": unmasked,
+                "tps": tps,
+                "elapsed": elapsed,
+            })
+
+    canvas_out = sample_canvas(
+        model,
+        prefix_ids,
+        canvas_len=canvas_len,
+        sub_canvas_len=sub_canvas_len,
+        steps=sub_steps * (canvas_len // sub_canvas_len),
+        sub_steps=sub_steps,
+        temperature=temperature,
+        carrier_priority=carrier_priority,
+        block_callback=block_trace_cb,
+    )
+
+    elapsed = time.perf_counter() - start_time
+    total_tokens = canvas_out.shape[1]
+    raw_text = tok.decode(canvas_out[0], skip_special_tokens=False)
+
+    if stop_tokens:
+        for st in stop_tokens:
+            if st in raw_text:
+                raw_text = raw_text.split(st)[0]
+    full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+    tps = total_tokens / max(1e-5, elapsed)
+
+    return {
+        "text": full_text,
+        "tokens": total_tokens,
+        "elapsed": elapsed,
+        "tps": tps,
+    }
+
+
 def generate_bfg_traced(
     model,
     tok,
@@ -124,6 +197,33 @@ def generate_bfg_traced(
         "tps": tps,
         "trace": trace,
     }
+
+
+def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=None):
+    """Generate baseline response using causal next-token loop with streaming callback."""
+    prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
+    start_time = time.perf_counter()
+    generated_ids = []
+    curr_ids = prefix_ids
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            out = model(curr_ids)
+            next_id = int(out.logits[0, -1].argmax())
+            if next_id == tok.eos_token_id or (tok.pad_token_id and next_id == tok.pad_token_id):
+                break
+            generated_ids.append(next_id)
+            tok_text = tok.decode([next_id], skip_special_tokens=True)
+            elapsed = time.perf_counter() - start_time
+            tps = len(generated_ids) / max(1e-5, elapsed)
+            if callback:
+                callback(tok_text, len(generated_ids), tps, elapsed)
+            curr_ids = torch.cat([curr_ids, torch.tensor([[next_id]], device=model.device)], dim=1)
+
+    elapsed = time.perf_counter() - start_time
+    full_text = tok.decode(generated_ids, skip_special_tokens=True)
+    tps = len(generated_ids) / max(1e-5, elapsed)
+    return {"text": full_text, "tokens": len(generated_ids), "elapsed": elapsed, "tps": tps}
 
 
 def generate_causal(model, tok, prompt_text, max_new_tokens=32):
@@ -392,7 +492,7 @@ HTML_PAGE = """<!DOCTYPE html>
 async function runGeneration() {
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
-  btn.innerText = 'Denoising...';
+  btn.innerText = 'Streaming...';
 
   const resultsSection = document.getElementById('resultsSection');
   resultsSection.style.display = 'block';
@@ -403,8 +503,10 @@ async function runGeneration() {
   const causalMetrics = document.getElementById('causalMetrics');
   const traceLogs = document.getElementById('traceLogs');
 
-  bfgOutput.innerText = 'Running parallel carrier-frontier unmasking...';
-  causalOutput.innerText = 'Running causal autoregression...';
+  bfgOutput.innerText = 'Waiting for diffusion steps...';
+  causalOutput.innerText = '';
+  bfgMetrics.innerText = '0.0 TPS';
+  causalMetrics.innerText = '0.0 TPS';
   traceLogs.innerHTML = '';
 
   const payload = {
@@ -416,38 +518,103 @@ async function runGeneration() {
     temp: parseFloat(document.getElementById('temp').value),
   };
 
+  const blockContainers = {};
+  let causalAccum = '';
+
   try {
-    const res = await fetch('/api/generate', {
+    const response = await fetch('/api/generate', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
-    const data = await res.json();
 
-    bfgOutput.innerText = data.bfg.text;
-    bfgMetrics.innerText = `${data.bfg.tps.toFixed(1)} TPS (${data.bfg.elapsed.toFixed(2)}s)`;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
 
-    causalOutput.innerText = data.causal.text;
-    causalMetrics.innerText = `${data.causal.tps.toFixed(1)} TPS (${data.causal.elapsed.toFixed(2)}s)`;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    // Render trace
-    let traceHtml = '';
-    data.bfg.trace.forEach((block, bIdx) => {
-      traceHtml += `<div class="block-trace">`;
-      traceHtml += `<div style="font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px;">Sub-Block ${bIdx + 1}: Final: "${block.final_text}"</div>`;
-      block.steps.forEach(step => {
-        traceHtml += `<div class="step-line">`;
-        traceHtml += `<span class="step-num">Step ${step.step}</span>`;
-        traceHtml += `<div class="tokens-canvas">`;
-        step.tokens.forEach(tok => {
-          const isMask = tok === '░';
-          traceHtml += `<span class="token-chip ${isMask ? 'mask' : ''}">${isMask ? '░' : tok}</span>`;
-        });
-        traceHtml += `</div></div>`;
-      });
-      traceHtml += `</div>`;
-    });
-    traceLogs.innerHTML = traceHtml;
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop(); // keep last incomplete chunk
+
+      for (const block of lines) {
+        if (!block.startsWith('data: ')) continue;
+        const jsonStr = block.replace(/^data: /, '').trim();
+        if (!jsonStr) continue;
+        const evt = JSON.parse(jsonStr);
+
+        if (evt.type === 'causal_token') {
+          causalAccum += evt.token;
+          causalOutput.innerText = causalAccum;
+          causalMetrics.innerText = `${evt.tps.toFixed(1)} TPS (${evt.elapsed.toFixed(2)}s)`;
+        } else if (evt.type === 'causal_done') {
+          causalOutput.innerText = evt.causal.text;
+          causalMetrics.innerText = `${evt.causal.tps.toFixed(1)} TPS (${evt.causal.elapsed.toFixed(2)}s)`;
+        } else if (evt.type === 'bfg_step') {
+          bfgMetrics.innerText = `${evt.tps.toFixed(1)} TPS (${evt.elapsed.toFixed(2)}s)`;
+
+          // Ensure block container exists
+          let bDiv = blockContainers[evt.block_idx];
+          if (!bDiv) {
+            bDiv = document.createElement('div');
+            bDiv.className = 'block-trace';
+            bDiv.innerHTML = `<div class="block-header" style="font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px;">Sub-Block ${evt.block_idx + 1}</div><div class="steps-list"></div>`;
+            traceLogs.appendChild(bDiv);
+            blockContainers[evt.block_idx] = bDiv;
+          }
+
+          // In-place step update or append without layout thrashing
+          const stepsList = bDiv.querySelector('.steps-list');
+          let stepRow = stepsList.querySelector(`[data-step="${evt.step}"]`);
+          if (!stepRow) {
+            stepRow = document.createElement('div');
+            stepRow.className = 'step-line';
+            stepRow.setAttribute('data-step', evt.step);
+            stepRow.innerHTML = `<span class="step-num">Step ${evt.step}</span><div class="tokens-canvas"></div>`;
+            stepsList.appendChild(stepRow);
+          }
+
+          const canvasDiv = stepRow.querySelector('.tokens-canvas');
+          let chipsHtml = '';
+          evt.tokens.forEach(tok => {
+            const isMask = tok === '░';
+            chipsHtml += `<span class="token-chip ${isMask ? 'mask' : ''}">${isMask ? '░' : tok}</span>`;
+          });
+          canvasDiv.innerHTML = chipsHtml;
+
+          // Live update BFG final output with unmasked tokens
+          const cleanText = evt.text.replace(/░/g, '');
+          if (cleanText) {
+            if (evt.block_idx === 0 && evt.step === 1) {
+              bfgOutput.innerText = cleanText;
+            } else {
+              // Collect all current completed blocks plus current step
+              let fullPreview = '';
+              for (let i = 0; i < evt.block_idx; i++) {
+                if (blockContainers[i] && blockContainers[i]._final) {
+                  fullPreview += blockContainers[i]._final;
+                }
+              }
+              fullPreview += cleanText;
+              bfgOutput.innerText = fullPreview.replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
+            }
+          }
+          if (evt.step === payload.sub_steps) {
+            bDiv._final = cleanText;
+            const header = bDiv.querySelector('.block-header');
+            if (header) {
+              header.innerText = `Sub-Block ${evt.block_idx + 1}: Final: "${cleanText}"`;
+            }
+          }
+        } else if (evt.type === 'bfg_done') {
+          bfgOutput.innerText = evt.bfg.text;
+          bfgMetrics.innerText = `${evt.bfg.tps.toFixed(1)} TPS (${evt.bfg.elapsed.toFixed(2)}s)`;
+        }
+      }
+    }
   } catch (err) {
     bfgOutput.innerText = 'Error: ' + err.message;
   } finally {
@@ -502,8 +669,40 @@ class VisualizerHandler(BaseHTTPRequestHandler):
 
             stop_tokens = ["<|im_end|>", "<|endoftext|>"] if mode == "chat" else None
 
-            # BFG generation
-            bfg_res = generate_bfg_traced(
+            # Streaming SSE endpoint
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            def send_sse(evt_data):
+                msg = f"data: {json.dumps(evt_data)}\n\n".encode("utf-8")
+                try:
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+            # 1. Stream Causal Baseline token by token in real-time
+            causal_res = generate_causal_stream(
+                self.model,
+                self.tok,
+                prompt,
+                max_new_tokens=canvas_len,
+                callback=lambda tok_str, total, tps, elap: send_sse({
+                    "type": "causal_token",
+                    "token": tok_str,
+                    "total": total,
+                    "tps": tps,
+                    "elapsed": elap,
+                }),
+            )
+            send_sse({"type": "causal_done", "causal": causal_res})
+
+            # 2. Stream BFG Discrete Diffusion step-by-step
+            bfg_res = generate_bfg_stream(
                 self.model,
                 self.tok,
                 self.mask_id,
@@ -513,16 +712,9 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 sub_steps=sub_steps,
                 temperature=temp,
                 stop_tokens=stop_tokens,
+                step_callback=lambda evt: send_sse(evt),
             )
-
-            # Causal generation
-            causal_res = generate_causal(self.model, self.tok, prompt, max_new_tokens=canvas_len)
-
-            resp_data = {"bfg": bfg_res, "causal": causal_res}
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(resp_data).encode("utf-8"))
+            send_sse({"type": "bfg_done", "bfg": bfg_res})
         else:
             self.send_response(404)
             self.end_headers()
