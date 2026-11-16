@@ -327,3 +327,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 3. **Verification:**
    - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 3.6238 PASS`.
    - `python benchmark.py --smoke_test`: `Reconstruction 26.3% TPS 17.9, Generation TPS 29.1 PASS`.
+
+## 19. Anti-Starvation Carrier Frontier & Verified Generations (2026-11-16)
+
+1. **Resolution of Budget Starvation in `sampler.py`:**
+   - In `sample_canvas_block`, after picking slots with `has_carrier` and high-margin non-adjacent island anchors (`margin >= anchor_thresh`), any remaining quota deficit (`len(pick) < budget`) is filled by advancing contiguous frontier slots ($j - 1 \in \text{pick}$), followed by highest-rank open slots.
+   - Prevents step-starvation where earlier passes only unmask 1 token and dump all remaining masks on the final step.
+2. **Evaluation on `runs/bfg-shifted/last.pt`:**
+   - Evaluated Prompts 0, 1, 4 for $C_{\text{sub}}=8, k_{\text{sub}}=4$ and $k_{\text{sub}}=6$.
+   - Output completely eliminated `"the a the a"` stutters, restoring rich coherent narrative, technical configs, and structured ordinal lists.
+   - Smoke tests verified: `smoke convergence: 11.9797 -> 3.6238 PASS`.

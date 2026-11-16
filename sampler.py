@@ -219,17 +219,38 @@ def sample_canvas_block(
                             and not (j > 0 and (j - 1) in pick)
                         ]
                         if not cand_island:
-                            # Fallback if canvas is tight, still requiring margin >= anchor_thresh
-                            cand_island = [
-                                j for j in range(canvas_len)
-                                if j not in pick and not keep_token[i, j] and not frozen[i, j]
-                                and rank[i, j] > -float("inf")
-                                and margin[i, j] >= anchor_thresh
-                            ]
-                        if not cand_island:
                             break
                         cand_island.sort(key=lambda j: float(rank[i, j]), reverse=True)
                         pick.add(cand_island[0])
+
+                    # 3. Prevent budget starvation: If len(pick) < budget still holds (no distant island
+                    # met anchor_thresh), fill remaining quota by advancing the contiguous carrier frontier
+                    # (slots immediately following already-picked slots) or highest-rank remaining open slots.
+                    # This guarantees every step strictly fulfills len(pick) == budget without dumping masks on the final step!
+                    while len(pick) < budget:
+                        # Prioritize open slots directly following an already-picked slot
+                        cand_frontier = [
+                            j for j in range(canvas_len)
+                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            and rank[i, j] > -float("inf")
+                            and (j > 0 and (j - 1) in pick)
+                        ]
+                        if cand_frontier:
+                            cand_frontier.sort(key=lambda j: float(rank[i, j]), reverse=True)
+                            pick.add(cand_frontier[0])
+                            continue
+
+                        # Otherwise pick any remaining open slot by rank
+                        cand_remaining = [
+                            j for j in range(canvas_len)
+                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            and rank[i, j] > -float("inf")
+                        ]
+                        if not cand_remaining:
+                            break
+                        cand_remaining.sort(key=lambda j: float(rank[i, j]), reverse=True)
+                        pick.add(cand_remaining[0])
+
                     pick_tensor = torch.tensor(sorted(list(pick)), dtype=torch.long, device=canvas.device)
                 elif need > 0:
                     cand = (rank[i] > -float("inf")) & ~frozen[i] & ~keep

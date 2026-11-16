@@ -787,3 +787,25 @@ bfg-diff k=2 T=0 d=0 f=0 r=0        0.664  46.2%  56.7%   0.0%  0.219  0.433    
 causal generate                     1.000   0.0%   3.3%   0.0%  0.750  0.967      13.6
 ```
 Smoke convergence probe: `11.9797 -> 3.6238 PASS`.
+
+## Anti-Starvation Carrier Frontier Sampling (2026-11-16)
+
+### Analysis of the Budget Starvation Failure Mode
+- **Diagnosis:** Restricting unmasked tokens to only concrete carriers plus `margin >= anchor_thresh` caused earlier steps ($s < K$) to unmask only 1 token (`slot 0` on step 1, `slot 1` on step 2, `slot 2` on step 3). On the final step $s == K$, all remaining unmasked slots ($5$ in $C_{\text{sub}}=8$, or $29$ in $C=32$) were unmasked simultaneously in an unanchored batch, collapsing the tail into stutter runner-ups (`"the a the a the a"`).
+- **Resolution in `sampler.py`:**
+  1. Pick available slots with real carriers (`has_carrier`).
+  2. Pick distant non-adjacent island anchors with `margin >= anchor_thresh`.
+  3. **Strict Quota Guarantee:** If `len(pick) < budget`, immediately expand the carrier frontier along contiguous adjacent slots ($j-1 \in \text{pick}$), followed by top-rank open slots. Every step strictly satisfies `len(pick) == budget`.
+
+### Verification on Step 1500 Checkpoint (`runs/bfg-shifted/last.pt`)
+- **Prompt [0]:**
+  - $C_{\text{sub}}=8, k_{\text{sub}}=4$ (9.3 TPS): `' the fish caught were not smaller than the ones they caught. They fishermen were that they, too the fish were smaller than the they caught. They thought that the'`
+  - $C_{\text{sub}}=8, k_{\text{sub}}=6$ (6.7 TPS): `' the fish caught were not all the. They decided to make a fishing boat. The boat was a simple one, a small boat with a single sail. a'`
+- **Prompt [1]:**
+  - $C_{\text{sub}}=8, k_{\text{sub}}=4$ (9.4 TPS): `' the proxy server to the proxy server address and the port port.\n\nTo\nconfigure the proxy server, edit the settings file and set the proxy server to the'`
+  - $C_{\text{sub}}=8, k_{\text{sub}}=6$ (6.7 TPS): `' the proxy server to the IP address of the proxy server.\nA. Correct\nB. Incorrect\nAnswer\nAnswer\nA\n\nThe isobaric line is'`
+- **Prompt [4]:**
+  - $C_{\text{sub}}=8, k_{\text{sub}}=4$ (9.4 TPS): `' plot the data\n- fourth, plot the outliers\n- fifth, plot the outliers\n- sixth, plot the outliers\n- seventh, plot the outliers\n'`
+  - $C_{\text{sub}}=8, k_{\text{sub}}=6$ (6.7 TPS): `' plot the data\n- fourth, plot the outliers\n- fifth, plot the outliers\n- sixth, plot the outliers\n- seventh, plot the outliers\n'`
+
+`python train.py --smoke_test`: `smoke convergence: 11.9797 -> 3.6238 PASS`.
