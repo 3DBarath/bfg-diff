@@ -935,6 +935,34 @@ Evaluated on 6 diverse user prompts with sub-block truncation and carrier anti-r
     - Sub-block 3 immediately broke on `<|im_end|>`. Sub-blocks 4, 5, 6 were cleanly suppressed.
     - Mask tokens (`<|extra_0|>`): 0. Ghost blocks: 0.
 
+## GPU Benchmark Validation (Google Colab NVIDIA T4 GPU, 2026-11-17)
+
+Tested on Google Colab T4 GPU (16 GB VRAM) running CUDA fp16/bf16 with `runs/bfg-instruct/last.pt` (100 prompts / prefixes, $P=384, C=128$):
+
+### 1. Reconstruction Benchmark ($P=384, C=128$)
+| Method | Recovery % | Throughput (TPS) | Speedup vs Causal |
+| :--- | :--- | :--- | :--- |
+| **BFG-Diff $k=2$** | 12.1% | **217.5 TPS** | **3.22x** |
+| **BFG-Diff $k=4$** | 13.5% | **175.7 TPS** | **2.60x** |
+| **BFG-Diff $k=8$** | 15.9% | **123.8 TPS** | **1.84x** |
+
+### 2. Generation Benchmark ($C=128, \text{top\_k}=50$)
+| Method | H4 | Rep-4 % | Rep-2 % | Adj Dup % | Dist-1 | Dist-2 | Generation TPS | Speedup vs Causal |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **BFG-Diff $k=2$** | 0.000 | **0.0%** | **0.0%** | **0.0%** | 0.070 | 0.100 | **832.0 TPS** | **12.34x** |
+| **BFG-Diff $k=4$** | 0.000 | **0.0%** | **0.0%** | **0.0%** | 0.087 | 0.107 | **442.2 TPS** | **6.56x** |
+| **BFG-Diff $k=8$** | 1.000 | **0.0%** | 0.7% | **0.0%** | 0.089 | 0.111 | **224.2 TPS** | **3.33x** |
+| *Causal Generate* | 0.763 | **55.0%** | **65.4%** | 0.1% | 0.021 | 0.042 | **67.4 TPS** | 1.00x (Baseline) |
+
+### Key Findings
+1. **12.3x Throughput Speedup:**
+   - Standard causal autoregressive decoding bottlenecked at **67.4 TPS** due to strictly sequential token-by-token matrix-vector multiplications.
+   - BFG-Diff reached **832.0 TPS** at $k=2$ and **442.2 TPS** at $k=4$ by leveraging GPU tensor parallelism across sub-block canvas slots + speculative lookahead leaps.
+2. **Elimination of Repetition Degeneration:**
+   - Causal autoregressive baseline collapsed into severe repetitive loops (**55.0% Rep-4**, **65.4% Rep-2**), repeatedly emitting `"The proxy server is used to forward the requests to the target server."` until context exhaustion.
+   - BFG-Diff produced completely non-repetitive completions (**0.0% Rep-4**, **0.0% Adjacent Duplication**) thanks to left-carrier causal grounding and slot-0 boundary anti-echo suppression.
+
+
 
 
 

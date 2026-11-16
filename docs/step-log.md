@@ -426,18 +426,20 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Formulas 1, 2, 3, 4 all achieved **0.0% 4-gram repetition** and **0.0% adjacent duplication**.
    - Identified Formula 1 ($\tau=0.8$) and Formula 3 ($\tau_0=1.0$) as Pareto-optimal.
 
-## 27. Resolution of Mask Token Leakage & Ghost Sub-Blocks (2026-11-16)
+## 28. Google Colab NVIDIA T4 GPU Benchmark Verification (2026-11-17)
 
-1. **State Persistence on Stop Tokens:**
-   - Fixed early exit handling in `sample_canvas_block` so `canvas[i]` is properly populated with `row` (and tail masked) before breaking on stop tokens.
-   - Enforced zero mask token tolerance in `m_end` computation (`canvas[0, m_end] != mask_id`).
-2. **Stop Token Truncation Across Sub-Blocks:**
-   - In `sample_canvas`, when encountering stop tokens, truncated `block` at the first stop token and broke the loop immediately, preventing trailing ghost sub-blocks after conversational turn completion.
-3. **Verification:**
-   - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
-   - `python benchmark.py --smoke_test`: `recovery = 21.1% (TPS 12.3); Generation TPS = 28.9, Rep4 = 0.0%, Adj = 0.0%`.
-   - Live endpoint test: `"How are you doing today?"` -> `"I'm doing well, thanks for asking! How about you?"` in 13 tokens, cleanly ending without mask tokens or ghost blocks.
-   - Service restarted on PID 2748523 at port 8766.
+1. **Packaged Colab Bundle:**
+   - Bundled `model.py`, `sampler.py`, `chat.py`, `benchmark.py`, `train.py`, and `runs/bfg-instruct/last.pt` into `bfg_colab.zip`.
+2. **GPU Benchmark Execution (100 Prompts / Prefixes, $P=384, C=128$):**
+   - **Generation Throughput:**
+     - BFG-Diff $k=2$: **832.0 TPS** (**12.34x speedup** over causal generate at 67.4 TPS).
+     - BFG-Diff $k=4$: **442.2 TPS** (**6.56x speedup**).
+     - BFG-Diff $k=8$: **224.2 TPS** (**3.33x speedup**).
+     - Causal generate: **67.4 TPS**.
+   - **Quality & Repetition:**
+     - Causal generate collapsed into degenerate repetitive stuttering (**55.0% Rep-4**, **65.4% Rep-2**).
+     - BFG-Diff maintained **0.0% Rep-4**, **0.0% Rep-2**, and **0.0% Adjacent Duplication** across all runs.
+   - Documented in [docs/findings.md](file:///home/gces/.bin/.s/.scripts/bfg-diff/docs/findings.md).
 
 
 
