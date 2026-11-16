@@ -71,32 +71,31 @@ def sample_canvas_block(
         )
 
     frozen = canvas != mask_id  # pre-filled input slots: never touched
-    decoded = torch.zeros_like(frozen)  # slots this sampler has filled
+    decoded = torch.zeros_like(frozen)  # slots this sampler has filled (draft or verified)
+    verified = frozen.clone()  # slots with verified carriers; permanent
     prefix_len = prefix_ids.shape[1]
     if kv is None:
         kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix[:-1] encoded once
     for s in range(1, steps + 1):
+        prev_canvas = canvas.clone()
+        prev_verified = verified.clone()
+        # Feed verified tokens to the forward pass so lookahead predictions are conditioned
+        # on real carriers without pollution from speculative unverified drafts
+        feed_canvas = torch.where(verified, canvas, mask_id)
         if kv is None:
-            logits = canvas_forward(model, prefix_ids, canvas, prefix_keep)
+            logits = canvas_forward(model, prefix_ids, feed_canvas, prefix_keep)
         else:
-            logits = canvas_step_with_cache(model, prefix_ids[:, -1:], canvas, kv, prefix_len, prefix_keep)
+            logits = canvas_step_with_cache(model, prefix_ids[:, -1:], feed_canvas, kv, prefix_len, prefix_keep)
             kv.crop(-(1 + canvas_len))  # drop active [prefix_last, canvas] tokens; keep prefix cache
         assert logits.shape[:2] == (B, canvas_len), logits.shape
         z = logits.float()  # log p(i) - log p(j) == z(i) - z(j): softmax shift cancels
         top2 = z.topk(2, dim=-1)
         margin = top2.values[..., 0] - top2.values[..., 1]  # clean confidence
 
-        # Slots whose existing token survives: frozen input plus the confident
-        # fraction of already-decoded slots. The rest of `decoded` competes again.
-        # On the last step every decoded token is an anchor.
-        keep_token = frozen.clone()
-        if s < steps:
-            for i in range(B):
-                idx = decoded[i].nonzero().flatten()
-                if idx.numel():
-                    n = math.ceil((1.0 - remask_ratio) * idx.numel())
-                    keep_token[i, idx[margin[i, idx].topk(n).indices]] = True
-        else:
+        # In Carrier-Verified Lookahead, verified tokens are permanently locked.
+        # Unverified drafts (decoded & ~verified) compete or get revised.
+        keep_token = verified.clone()
+        if s == steps:
             keep_token |= decoded
 
         # Cross-step repulsion: an open slot next to a committed token cannot
@@ -121,12 +120,12 @@ def sample_canvas_block(
 
         rank = margin * decay if (decay is not None and s == 1) else margin
         if carrier_priority and s < steps:
-            # Right-shifted geometry: slot j's logits sit on top of input token canvas[j-1].
-            # For j=0, carrier is prefix[-1] which is always concrete.
-            # For j>0, carrier is concrete if keep_token[:, j-1] is True.
+            # Right-shifted geometry: slot j's logits sit on top of input token feed_canvas[j-1].
+            # For j=0, carrier is prefix[-1] which is always concrete and verified.
+            # For j>0, carrier is concrete/verified if verified[:, j-1] is True in feed_canvas.
             has_carrier = torch.zeros_like(frozen)
             has_carrier[:, 0] = True
-            has_carrier[:, 1:] = keep_token[:, :-1] | frozen[:, :-1]
+            has_carrier[:, 1:] = verified[:, :-1]
             # Prioritize slots with real carrier, OR strong structural anchors
             anchor = margin >= anchor_thresh
             is_priority = has_carrier | anchor
@@ -161,13 +160,11 @@ def sample_canvas_block(
             rank = rank.masked_fill(keep_token, float("inf"))
 
             # Two open neighbours predicting the same token would commit a
-            # stutter. Only slots that are still masked can be held back; next
-            # step the winner is an anchor, so repulsion above forces the loser
-            # onto a distinct continuation.
+            # stutter.
             if suppress_adjacent:
                 eff = torch.where(keep_token, canvas, sampled)  # token that would stand
                 same = (eff[:, :-1] == eff[:, 1:]) & ~(frozen[:, :-1] & frozen[:, 1:])
-                open_l = ~keep_token[:, :-1]  # still masked, may commit this step
+                open_l = ~keep_token[:, :-1]  # still mutable, may commit this step
                 open_r = ~keep_token[:, 1:]
                 ml, mr = margin[:, :-1], margin[:, 1:]
                 kill = torch.zeros_like(frozen)
@@ -177,17 +174,35 @@ def sample_canvas_block(
 
         for i in range(B):
             n_frozen = int(frozen[i].sum())
-            if s == steps:  # final step: fill every remaining mask, keep the rest
+            if s == steps:  # final step: fill every remaining mask and verify all drafts left-to-right
                 row = canvas[i].clone()
-                for j in (canvas[i] == mask_id).nonzero().flatten().tolist():
-                    tok = int(sampled[i, j])
+                # On the final step, overwrite any unverified draft slots and any remaining mask slots
+                # left-to-right so that all slots are strictly conditioned on verified left tokens
+                for j in range(canvas_len):
+                    if frozen[i, j] or verified[i, j]:
+                        continue
+                    # Re-run forward step on row so slot j is conditioned on row[j-1]
+                    if kv is None:
+                        z_j = canvas_forward(model, prefix_ids[i:i+1], row.unsqueeze(0), prefix_keep).float()
+                    else:
+                        z_j = canvas_step_with_cache(model, prefix_ids[i:i+1, -1:], row.unsqueeze(0), kv, prefix_len, prefix_keep).float()
+                        kv.crop(-(1 + canvas_len))
+                    tok = int(z_j[0, j].argmax())
                     if suppress_adjacent:
                         prev = int(row[j - 1]) if j > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
                         if prev is not None and tok == prev:
-                            cand = z[i, j].clone()
+                            cand = z_j[0, j].clone()
                             cand[prev] = -float("inf")
                             tok = int(cand.argmax())
+                        prev2 = int(row[j - 2]) if j > 1 else None
+                        if prev2 is not None and tok == prev2:
+                            cand = z_j[0, j].clone()
+                            if prev is not None:
+                                cand[prev] = -float("inf")
+                            cand[prev2] = -float("inf")
+                            tok = int(cand.argmax())
                     row[j] = tok
+                    verified[i, j] = True
             else:
                 # Interpolate strictly over the slots this sampler can fill:
                 # pre-filled slots hold their own share of the canvas for free.
@@ -200,10 +215,10 @@ def sample_canvas_block(
                     budget = min(max(0, int(s / steps * n_mutable)), n_mutable)
                 if not budget:
                     continue
-                # Protected decoded slots keep their token; the rest of the budget
-                # is filled from the strongest remaining slots. Frozen slots never
-                # compete: they already hold quota and are restored below.
-                keep = keep_token[i] & ~frozen[i]
+
+                # Slots already verified stay locked.
+                # Unverified drafts from previous step can be refreshed/overwritten.
+                keep = verified[i] & ~frozen[i]
                 need = budget - int(keep.sum())
                 pick = set(keep.nonzero().flatten().tolist())
 
@@ -227,7 +242,7 @@ def sample_canvas_block(
                     while len(pick) < budget:
                         cand_island = [
                             j for j in range(canvas_len)
-                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            if j not in pick and not verified[i, j] and not frozen[i, j]
                             and rank[i, j] > -float("inf")
                             and margin[i, j] >= anchor_thresh
                             and not (j > 0 and (j - 1) in pick)
@@ -245,7 +260,7 @@ def sample_canvas_block(
                         # Prioritize open slots directly following an already-picked slot
                         cand_frontier = [
                             j for j in range(canvas_len)
-                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            if j not in pick and not verified[i, j] and not frozen[i, j]
                             and rank[i, j] > -float("inf")
                             and (j > 0 and (j - 1) in pick)
                         ]
@@ -257,7 +272,7 @@ def sample_canvas_block(
                         # Otherwise pick any remaining open slot by rank
                         cand_remaining = [
                             j for j in range(canvas_len)
-                            if j not in pick and not keep_token[i, j] and not frozen[i, j]
+                            if j not in pick and not verified[i, j] and not frozen[i, j]
                             and rank[i, j] > -float("inf")
                         ]
                         if not cand_remaining:
@@ -279,13 +294,17 @@ def sample_canvas_block(
                 old = canvas[i].clone()
                 row = torch.full_like(old, mask_id)
                 row[frozen[i]] = old[frozen[i]]
+
+                # Build row left-to-right
                 if pick_tensor.numel():
                     sorted_pick = sorted(pick_tensor.tolist())
                     for j in sorted_pick:
-                        if keep_token[i, j]:
+                        if verified[i, j]:
                             tok_val = int(old[j])
                         else:
+                            # Unverified draft slot or newly picked slot: take from sampled
                             tok_val = int(sampled[i, j])
+
                         # Check strictly left-to-right against already placed neighbor
                         if suppress_adjacent:
                             prev_tok = int(row[j - 1]) if j > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
@@ -302,6 +321,19 @@ def sample_canvas_block(
                                 cand_z[prev2_tok] = -float("inf")
                                 tok_val = int(cand_z.argmax())
                         row[j] = tok_val
+
+                # Carrier-Verification Rule:
+                # Which slots can be upgraded to verified on this step?
+                # 1. Slot 0 has prefix[-1] as carrier (always concrete and verified before step s).
+                # 2. For j > 0: feed_canvas[i, j - 1] was concrete & verified during THIS forward pass (step s).
+                for j in range(canvas_len):
+                    if row[j] == mask_id or frozen[i, j] or verified[i, j]:
+                        continue
+                    if j == 0:
+                        verified[i, 0] = True
+                    else:
+                        if feed_canvas[i, j - 1] != mask_id:
+                            verified[i, j] = True
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
 

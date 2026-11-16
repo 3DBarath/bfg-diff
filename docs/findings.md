@@ -809,3 +809,29 @@ Smoke convergence probe: `11.9797 -> 3.6238 PASS`.
   - $C_{\text{sub}}=8, k_{\text{sub}}=6$ (6.7 TPS): `' plot the data\n- fourth, plot the outliers\n- fifth, plot the outliers\n- sixth, plot the outliers\n- seventh, plot the outliers\n'`
 
 `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 3.6238 PASS`.
+
+## Carrier-Verified Lookahead Sampling (Draft & Verify in One Loop) (2026-11-16)
+
+### Root Cause Analysis of Lookahead Stutters
+In sub-block diffusion ($C_{\text{sub}}=8, k_{\text{sub}}=4$), when step 1 unmasks 2 tokens under budget constraints, slot 0 is conditioned on `prefix[-1]` (real carrier), while slot 1 is predicted while `canvas[0]` is still `[MASK]` (an unverified blind lookahead draft).
+- **Previous failure:** Slot 1 was permanently committed on step 1 into `keep_token` (`"The is"`, `"I I'm"`, `"well great"`). Even though step 2's forward pass finally had `"The"` in slot 0, slot 1 could never revise itself to `" capital"`.
+- **Carrier-Verified Lookahead Fix:**
+  1. Maintained a `verified` mask (permanent locked tokens) separate from `decoded` (all currently placed tokens).
+  2. Input to the forward pass (`feed_canvas = torch.where(verified, canvas, mask_id)`) only feeds carrier-verified tokens, preventing lookahead hallucinations from corrupting the causal context.
+  3. Slots whose input left carrier was verified during the forward pass are promoted to `verified = True`.
+  4. On final step $s == \text{steps}$, remaining unverified slots are sequentially conditioned and verified left-to-right on real carriers.
+
+### Live Multi-Prompt Benchmark Results (`runs/bfg-instruct/last.pt`)
+Evaluated via `http://127.0.0.1:8766/api/generate` with $C_{\text{sub}}=8, k_{\text{sub}}=4$:
+
+| Prompt | Mode | Before Fix | After Fix (Carrier-Verified Lookahead) | Causal Baseline |
+| :--- | :--- | :--- | :--- | :--- |
+| `"How are you doing today?"` | Chat | `"I I'm good, I'm doing well great today."` | `"I'm doing well, thank you. How can I assist you today?"` | `"I'm good, thanks for asking! How about you?"` |
+| `"What is the capital of France?"` | Chat | `"The is the Paris."` | `"The capital of France is Paris."` | `"The capital of France is Paris."` |
+| `"Tell me a short story about a fisherman."` | Chat | `"A fisherman named a day, catches a fish..."` | `"A fisherman named John was fishing in the ocean when he caught a beautiful fish"` | `"A fisherman named Jack was fishing in the ocean..."` |
+| `"The quick brown fox"` | Completion | Stutter repeats | `"jumps over the lazy dog.\nThis is a classic poem that has been around for"` | `" jumps over the lazy dog.\nThis is a classic poem..."` |
+| `"Machine learning is a subset of"` | Completion | Stutter repeats | `"artificial intelligence that enables computers to learn from data. It involves the use of algorithms"` | `" artificial intelligence that involves the use of algorithms..."` |
+| `"In a galaxy far, far away"` | Completion | Stutter repeats | `", there is a galaxy of stars. The stars are arranged in a circle,"` | `", there is a planet with the same mass as Earth..."` |
+
+- **Smoke test verification:** `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+

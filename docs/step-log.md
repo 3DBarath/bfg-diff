@@ -351,3 +351,18 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Created standalone [chat.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/chat.py).
    - Features: step-by-step unmasking visualization (`░` $\to$ tokens), side-by-side TPS and text comparison against causal baseline, live `/mode`, `/vis`, `/compare` toggling.
    - Built lightweight HTML/Web visualizer serving on port `8766`, routed via `bfg-dff.gces.net.in`.
+
+## 21. Carrier-Verified Lookahead Sampling (2026-11-16)
+
+1. **Root Cause Analysis:**
+   - Diagnosed that picking 2 tokens on step 1 ($C_{\text{sub}}=8, k_{\text{sub}}=4$) caused slot 1 to draft tokens without an unmasked carrier at slot 0 during that pass.
+   - The previous implementation permanently committed all decoded tokens into `keep_token`, locking `"The is"` and `"I I'm"` into the canvas permanently.
+2. **Carrier-Verified Lookahead Architecture (`sampler.py`):**
+   - Introduced `verified` boolean mask (permanent locked tokens) separate from `decoded` (all currently placed tokens).
+   - Forward pass inputs are masked to only verified tokens (`feed_canvas = torch.where(verified, canvas, mask_id)`), ensuring that lookahead drafts do not pollute subsequent forward passes.
+   - Slots whose carrier was verified during the forward pass are promoted to `verified = True`.
+   - On the final step ($s == \text{steps}$), any remaining unverified draft or mask slots are conditioned and verified left-to-right on real carriers.
+3. **Live Verification & Smoke Tests:**
+   - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+   - Tested against live API at `http://127.0.0.1:8766/api/generate` with 6 multi-prompt test cases (3 chat, 3 completion).
+   - Traces confirmed zero lookahead draft stutters: `"What is the capital of France?"` cleanly generated `"The capital of France is Paris."`, and `"How are you doing today?"` generated `"I'm doing well, thank you. How can I assist you today?"`.
