@@ -81,8 +81,9 @@ def sample_canvas_block(
         prev_canvas = canvas.clone()
         prev_verified = verified.clone()
 
-        # Rule 2: Keep lookahead drafts in feed_canvas without wiping them to mask_id
-        feed_canvas = canvas.clone()
+        # Only feed verified tokens to the context:
+        # Prevent unverified draft tokens from corrupting the self-attention canvas
+        feed_canvas = torch.where(verified, canvas, mask_id)
 
         if kv is None:
             logits = canvas_forward(model, prefix_ids, feed_canvas, prefix_keep)
@@ -128,6 +129,7 @@ def sample_canvas_block(
                 break
 
             # 2. Speculative Chain Acceptance: check m+1, m+2...
+            # Strict verification: only accept exact matches (draft == top_tok)
             curr = m
             while curr + 1 < canvas_len:
                 draft = int(feed_canvas[i, curr + 1])
@@ -136,8 +138,7 @@ def sample_canvas_block(
                 if draft == int(row[curr]):
                     break
                 top_tok = int(sampled[i, curr + 1])
-                diff = (z[i, curr + 1, top_tok] - z[i, curr + 1, draft]).item()
-                if draft == top_tok or diff <= 1.2:
+                if draft == top_tok:
                     row[curr + 1] = draft
                     verified[i, curr + 1] = True
                     curr += 1

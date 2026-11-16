@@ -885,5 +885,20 @@ Measured via live SSE API with $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$, greed
   - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.796`, `rep4 = 23.1%`, `rep2 = 46.7%`, `adj = 56.7%`, `TPS = 21.2`.
   - Causal generate: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.5`.
 
+## Strict Top-1 Carrier Verification & Feed Masking (2026-11-16)
+
+### Modifications (`sampler.py`)
+1. **Masked `feed_canvas`:** Restored `feed_canvas = torch.where(verified, canvas, mask_id)` to ensure speculative unverified drafts never contaminate self-attention representations of carrier tokens during forward passes.
+2. **Strict Verification Agreement:** Replaced relaxed threshold $\Delta z \le 1.2$ with strict top-1 agreement (`draft == top_tok`), rejecting lookahead drafts unless the forward pass agrees exactly with the lookahead prediction under verified left context.
+
+### Verification Smoke Tests
+- `python benchmark.py --smoke_test`:
+  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 15.8%`, `TPS = 12.3`.
+  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.789`, `rep4 = 26.9%`, `rep2 = 46.7%`, `adj = 63.3%`, `TPS = 22.0`.
+  - `causal generate`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.5`.
+- **Live Visualizer (`runs/bfg-instruct/last.pt`, $C_{\text{sub}}=8, k_{\text{sub}}=4$):**
+  - `"What is the capital of France?"`: BFG completed in **1.75s (9.15 TPS)** with clean output `"The capital of France is Paris."`.
+
+
 
 

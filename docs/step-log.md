@@ -398,3 +398,15 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python benchmark.py --smoke_test`: `Reconstruction recovery 26.3% TPS 12.1; Generation TPS 21.2`.
    - Live visualizer service verified on port 8766.
 
+## 24. Strict Top-1 Verification & Context Masking (2026-11-16)
+
+1. **Context Contamination Elimination:**
+   - Set `feed_canvas = torch.where(verified, canvas, mask_id)` in [sampler.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/sampler.py).
+2. **Strict Agreement Threshold:**
+   - Replaced `diff <= 1.2` with exact `draft == top_tok` in speculative verification.
+3. **Verification & Service Restart:**
+   - Evaluated with `python benchmark.py --smoke_test`: recovery `15.8%`, generation `22.0 TPS`.
+   - Live endpoint test: `"The capital of France is Paris."` generated in 1.75s (9.15 TPS).
+   - Restarted `chat.py` service.
+
+
