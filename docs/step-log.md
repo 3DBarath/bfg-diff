@@ -382,3 +382,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python train.py --smoke_test`: `smoke convergence: 11.9798 -> 4.0549 PASS`.
    - `python benchmark.py --smoke_test`: `Reconstruction 63.2% TPS 9.2, Generation TPS 5.0 PASS`.
    - Live endpoints verified locally (`http://127.0.0.1:8766`) and through Cloudflare tunnel (`https://bfg-dff.gces.net.in`).
+
+## 23. Speculative Lookahead Verification & UI Display Masking (2026-11-16)
+
+1. **True Speculative Lookahead Verification (`sampler.py`):**
+   - Eliminated the sequential step-4 forward-pass loop that ran up to 5 additional forward passes on unverified trailing slots.
+   - Preserved lookahead draft predictions in `feed_canvas` so the forward pass evaluates whether the speculative draft token at $m+1$ is verified in the same step.
+   - Implemented speculative chain verification: when slot $m$ is verified, if slot $m+1$'s draft matches the top sampled token or is within relaxed NCM energy tolerance ($z[m+1, \text{top}] - z[m+1, \text{draft}] \le 1.2$) and satisfies anti-stutter checks, slot $m+1$ is accepted and verified in the same forward pass.
+   - Cleans up trailing slots beyond the active frontier to avoid wild unverified drafts.
+2. **Visual Flicker Elimination in UI Trace (`sampler.py`):**
+   - Updated `step_callback` to mask distant unverified slots beyond the active lookahead frontier ($m_{\text{frontier}} + 1$).
+   - The UI display trace shows only verified tokens plus the active 1-token frontier draft, preventing visual chip fluttering and rewriting in the Web visualizer.
+3. **Verification:**
+   - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+   - `python benchmark.py --smoke_test`: `Reconstruction recovery 26.3% TPS 12.1; Generation TPS 21.2`.
+   - Live visualizer service verified on port 8766.
+

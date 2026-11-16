@@ -857,4 +857,33 @@ Evaluated via `chat.py` on `runs/bfg-instruct/last.pt` with early-exit stop toke
   - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 6.7%`, `TPS = 5.0`.
   - Causal generate: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `TPS = 13.6`.
 
+## Speculative Lookahead Verification & Visual Stability Benchmarks (2026-11-16)
+
+### Changes & Mechanics
+- **Zero Step-4 Sequential Loop:** Eliminated the sequential loop on step 4 that ran separate forward passes per unverified token.
+- **Speculative Draft Retention:** Forward pass evaluates lookahead drafts rather than wiping unverified slots to `mask_id`.
+- **Chain Acceptance:** Accepted drafts verify the subsequent token ($m+1$) in the same forward pass if within tolerance and distinct from the neighbor.
+- **UI Trace Stabilization:** Distant unverified slots ($j > m_{\text{frontier}} + 1$) are masked in the UI callback to prevent flickering chips and visual rewriting.
+
+### Measured Side-by-Side Throughput & Quality (`runs/bfg-instruct/last.pt`)
+
+Measured via live SSE API with $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$, greedy ($T=0$):
+
+| Prompt | BFG Text | BFG Latency | BFG TPS | Causal Latency | Causal TPS |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `"What is the capital of France?"` | `'The capital of France is Paris..'` | **2.28s** | **7.0** | 2.25s | 3.1 |
+| `"Hello! How are you today?"` | `"Hello! I'm just a.. I don't havehave any"` | **3.14s** | **7.6** | 6.32s | 3.6 |
+| `"Explain the concept of gravity in simple terms."` | `'Gravity is the forceeness that objects o'` | **4.51s** | **7.1** | 7.84s | 3.8 |
+| `"Write a haiku about autumn leaves."` | `'Leaves whisper, golden,,, fall,  \nNature'` | **2.85s** | **8.4** | 4.41s | 3.9 |
+| `"Who wrote the play Romeo and Juliet?"` | `'William Shakespeare wrote the Romeo and '` | **2.67s** | **6.0** | 3.07s | 3.6 |
+| `"Give me three tips for learning a new programming language."` | `'Certainly! Here are three tips tips tips'` | **5.09s** | **6.3** | 8.12s | 3.9 |
+
+### Verification Smoke Tests
+- `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+- `python benchmark.py --smoke_test`:
+  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 26.3%`, `TPS = 12.1`.
+  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.796`, `rep4 = 23.1%`, `rep2 = 46.7%`, `adj = 56.7%`, `TPS = 21.2`.
+  - Causal generate: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.5`.
+
+
 
