@@ -404,9 +404,15 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Set `feed_canvas = torch.where(verified, canvas, mask_id)` in [sampler.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/sampler.py).
 2. **Strict Agreement Threshold:**
    - Replaced `diff <= 1.2` with exact `draft == top_tok` in speculative verification.
-3. **Verification & Service Restart:**
-   - Evaluated with `python benchmark.py --smoke_test`: recovery `15.8%`, generation `22.0 TPS`.
-   - Live endpoint test: `"The capital of France is Paris."` generated in 1.75s (9.15 TPS).
-   - Restarted `chat.py` service.
+3. **Confidence-Gated Lookahead Drafting:**
+   - Evaluated `margin_c1 = (top2_c1[0] - top2_c1[1]).item() >= 1.5` before drafting at $curr+1$ and $curr+2$.
+4. **Boundary Repulsion & Tail Cleanup:**
+   - Cleanly filled unverified speculative tail tokens before sub-block return in `sample_canvas_block` so prefix advancement does not inherit speculative artifacts.
+   - Enforced left neighbor check against `prefix_ids[i, -1]` with logit masking.
+5. **Verification & Service Restart:**
+   - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+   - `python benchmark.py --smoke_test`: recovery `26.3%`, `H4 = 0.839`, `rep4 = 19.2%`, generation `17.2 TPS`.
+   - Live visualizer service restarted and verified on port 8766.
+
 
 

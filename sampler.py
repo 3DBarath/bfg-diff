@@ -155,21 +155,25 @@ def sample_canvas_block(
             for j in range(curr + 1, canvas_len):
                 row[j] = mask_id
 
+            # Only draft speculative lookahead if top-1 margin exceeds confidence threshold (>= 1.5)
             if curr + 1 < canvas_len:
-                d1 = int(sampled[i, curr + 1])
-                if suppress_adjacent and d1 == int(row[curr]):
-                    cand_z = z[i, curr + 1].clone()
-                    cand_z[int(row[curr])] = -float("inf")
-                    d1 = int(cand_z.argmax())
-                row[curr + 1] = d1
+                top2_c1 = z[i, curr + 1].topk(2).values
+                margin_c1 = (top2_c1[0] - top2_c1[1]).item()
+                if margin_c1 >= 1.5:
+                    d1 = int(sampled[i, curr + 1])
+                    if suppress_adjacent and d1 == int(row[curr]):
+                        cand_z = z[i, curr + 1].clone()
+                        cand_z[int(row[curr])] = -float("inf")
+                        d1 = int(cand_z.argmax())
+                    row[curr + 1] = d1
 
-                if curr + 2 < canvas_len:
-                    z_c2 = z[i, curr + 2]
-                    top2_c2 = z_c2.topk(2).values
-                    if (top2_c2[0] - top2_c2[1]).item() >= 1.5:
-                        d2 = int(sampled[i, curr + 2])
-                        if d2 != d1 and d2 != int(row[curr]):
-                            row[curr + 2] = d2
+                    if curr + 2 < canvas_len:
+                        z_c2 = z[i, curr + 2]
+                        top2_c2 = z_c2.topk(2).values
+                        if (top2_c2[0] - top2_c2[1]).item() >= 1.5:
+                            d2 = int(sampled[i, curr + 2])
+                            if d2 != d1 and d2 != int(row[curr]):
+                                row[curr + 2] = d2
 
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
@@ -200,6 +204,13 @@ def sample_canvas_block(
     if leftover.any():
         fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
         canvas = torch.where(leftover, fill, canvas)
+
+    # When returning completed block, ensure any unverified speculative tail is cleanly filled
+    # by real model forward predictions conditioned on verified prefix
+    unverified_tail = ~verified & ~frozen
+    if unverified_tail.any():
+        clean_fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
+        canvas = torch.where(unverified_tail, clean_fill, canvas)
     return canvas
 
 
