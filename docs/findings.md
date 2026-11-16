@@ -917,6 +917,25 @@ Evaluated on 6 diverse user prompts with sub-block truncation and carrier anti-r
   - **Zero boundary stutters** (no `"Python Python"`, no `"code code"`, no `"is is"`).
   - Clean speculative 2-token leaps on bigram continuations (e.g. `"while loop"`).
 
+## Stop Token Boundary Leakage & Mask Token Fix (2026-11-16)
+
+- **Failure Mode Identified:**
+  - `<|extra_0|>` (151665) mask tokens leaked into output text when `stop_token_ids` triggered an early `break` in `sample_canvas_block` before `row` was committed to `canvas[i]`.
+  - When conversational turns concluded (e.g. `"How about you?"`), trailing ghost sub-blocks were triggered because `sample_canvas` didn't immediately terminate and slice sub-blocks containing stop tokens (`<|im_end|>`, `<|endoftext|>`).
+- **Fix:**
+  - In `sampler.py` (`sample_canvas_block`), committed verified state to `canvas[i]` and cleared slots beyond $m$ before breaking on stop tokens.
+  - In `m_end` contiguous prefix verification, added strict predicate `int(canvas[0, m_end]) != mask_id`.
+  - In `sample_canvas`, sliced `block = block[:, :first_stop]` on encountering stop tokens and immediately terminated subsequent sub-block iterations.
+- **Verification Results:**
+  - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+  - `python benchmark.py --smoke_test`: `Reconstruction recovery = 21.1% (TPS 12.3); Generation TPS = 28.9, Rep4 = 0.0%, Adj = 0.0%`.
+  - Live API generation test on `"How are you doing today?"`:
+    - Generated tokens: `[40, 2776, 3730, 2244, 11, 9339, 369, 10161, 0, 2585, 911, 498, 30]` (13 tokens).
+    - Result: `"I'm doing great, thanks for asking! How about you?"`
+    - Sub-block 3 immediately broke on `<|im_end|>`. Sub-blocks 4, 5, 6 were cleanly suppressed.
+    - Mask tokens (`<|extra_0|>`): 0. Ghost blocks: 0.
+
+
 
 
 

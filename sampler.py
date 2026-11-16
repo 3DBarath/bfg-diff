@@ -118,6 +118,12 @@ def sample_canvas_block(
         for i in range(B):
             row = canvas[i].clone()
 
+            # Strict boundary anti-echo at slot 0 against last token of prefix before selecting slot 0
+            if prefix_len > 0 and suppress_adjacent and not verified[i, 0]:
+                last_prefix_tok = int(prefix_ids[i, -1])
+                z[i, 0, last_prefix_tok] = -float("inf")
+                sampled[i, 0] = z[i, 0].argmax()
+
             # Find first unverified slot m
             m = 0
             while m < canvas_len and verified[i, m]:
@@ -138,6 +144,10 @@ def sample_canvas_block(
 
             # Check for early exit on stop tokens
             if stop_token_ids and new_m in stop_token_ids:
+                # Clear unverified slots beyond m to mask_id
+                for j in range(m + 1, canvas_len):
+                    row[j] = mask_id
+                canvas[i] = row
                 break
 
             # 2. Speculative Leap: Verify slot m+1 via NCM Energy Bound (tau = 0.8)
@@ -157,6 +167,8 @@ def sample_canvas_block(
                         verified[i, m + 1] = True
                         m += 1
                         if stop_token_ids and draft_c1 in stop_token_ids:
+                            for j in range(m + 1, canvas_len):
+                                row[j] = mask_id
                             canvas[i] = row
                             break
 
@@ -227,8 +239,8 @@ def sample_canvas_block(
                 break
 
     # When reconstructing or infilling (pre-filled canvas with frozen tokens), return full canvas_len.
-    # When free-generating across sliding sub-blocks, truncate block to only verified tokens so
-    # unverified mask holes or hallucinated argmax guesses never leak across sub-block boundaries!
+    # When free-generating across sliding sub-blocks, truncate block strictly to the contiguous verified
+    # prefix so that unverified mask holes (mask_id) never leak across sub-block boundaries!
     if frozen.any():
         leftover = canvas == mask_id
         if leftover.any():
@@ -236,14 +248,21 @@ def sample_canvas_block(
             canvas = torch.where(leftover, fill, canvas)
         return canvas
 
+    # Find strictly contiguous verified prefix, ensuring NO mask_id can ever be included
     m_end = 0
-    while m_end < canvas_len and verified[0, m_end]:
+    while m_end < canvas_len and verified[0, m_end] and int(canvas[0, m_end]) != mask_id:
         m_end += 1
 
     if m_end == 0:
         # Fallback: at least slot 0 is verified from step 1
         m_end = 1
+        verified[0, 0] = True
+        if int(canvas[0, 0]) == mask_id:
+            # Emergency fallback: predict slot 0 directly
+            cand_tok = int(sampled[0, 0]) if int(sampled[0, 0]) != mask_id else int(prefix_ids[0, -1])
+            canvas[0, 0] = cand_tok
 
+    # Truncate cleanly at m_end: ZERO mask_id tokens allowed!
     return canvas[:, :m_end]
 
 
@@ -314,7 +333,16 @@ def sample_canvas(
         # Early exit across sub-blocks if a stop token was generated
         if stop_token_ids:
             stop_set = set(stop_token_ids)
-            if any(int(tok) in stop_set for tok in block[0]):
+            stop_indices = [idx for idx, tok in enumerate(block[0]) if int(tok) in stop_set]
+            if stop_indices:
+                first_stop = stop_indices[0]
+                # Keep up to the stop token (or before it if desired; but stop token concludes generation)
+                # Slicing block up to first_stop (excluding stop token) so stop tokens don't leak into output
+                block = block[:, :first_stop]
+                if block.shape[1] > 0:
+                    generated_blocks[-1] = block
+                else:
+                    generated_blocks.pop()
                 break
 
         if rem > 0 and kv is not None:

@@ -120,6 +120,8 @@ def generate_bfg_stream(
     elapsed = time.perf_counter() - start_time
     total_tokens = canvas_out.shape[1]
     raw_text = tok.decode(canvas_out[0], skip_special_tokens=False)
+    # Strip mask token completely if present
+    raw_text = raw_text.replace("<|extra_0|>", "")
 
     if stop_tokens:
         for st in stop_tokens:
@@ -624,7 +626,7 @@ async function runGeneration() {
           canvasDiv.innerHTML = chipsHtml;
 
           // Live update BFG final output with unmasked tokens
-          const cleanText = evt.text.replace(/░/g, '');
+          const cleanText = evt.text.replace(/░/g, '').replace(/<\|extra_0\|>/g, '');
           if (cleanText) {
             let fullPreview = '';
             for (let i = 0; i < evt.block_idx; i++) {
@@ -633,7 +635,7 @@ async function runGeneration() {
               }
             }
             fullPreview += cleanText;
-            bfgOutput.innerText = fullPreview.replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
+            bfgOutput.innerText = fullPreview.replace(/<\|extra_0\|>/g, '').replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
           }
           if (evt.step === payload.sub_steps) {
             bDiv._final = cleanText;
