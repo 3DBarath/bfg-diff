@@ -337,3 +337,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Evaluated Prompts 0, 1, 4 for $C_{\text{sub}}=8, k_{\text{sub}}=4$ and $k_{\text{sub}}=6$.
    - Output completely eliminated `"the a the a"` stutters, restoring rich coherent narrative, technical configs, and structured ordinal lists.
    - Smoke tests verified: `smoke convergence: 11.9797 -> 3.6238 PASS`.
+
+## 20. Suffix-Mask Curriculum, Fine-Tuning & Interactive Visualizer Web UI (2026-11-16)
+
+1. **Hybrid Suffix + Random Mask Curriculum (`train.py`):**
+   - 20% full mask ($t=1.0$) for initial denoising.
+   - 40% contiguous suffix mask $[m:]$ to match free-generation carrier frontier, directly training 2-step and 3-step lookahead without right-hand context leaks.
+   - 40% random scatter mask ($t \sim U(0.20, 0.95)$) to preserve infilling recovery.
+   - Added `--resume` to warm-start LoRA and mask embedding weights.
+2. **Warm-Start Training Run (`runs/bfg-polished`):**
+   - Launched 600-step polish run in `tmux bfg-polish` from `runs/bfg-shifted/last.pt`.
+3. **Interactive Visualizer & Chat CLI (`chat.py`):**
+   - Created standalone [chat.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/chat.py).
+   - Features: step-by-step unmasking visualization (`░` $\to$ tokens), side-by-side TPS and text comparison against causal baseline, live `/mode`, `/vis`, `/compare` toggling.
+   - Built lightweight HTML/Web visualizer serving on port `8766`, routed via `bfg-dff.gces.net.in`.

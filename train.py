@@ -46,6 +46,7 @@ def parse_args():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--resume", default=None, help="warm-start checkpoint (e.g. runs/bfg-shifted/last.pt)")
     p.add_argument("--smoke_test", action="store_true", help="tiny synthetic run + convergence check")
     if "--cpu" in sys.argv:  # preset only changes defaults; explicit flags still win
         p.set_defaults(
@@ -75,16 +76,28 @@ def pick_device(name):
 
 
 def make_mask(target, mask_id):
-    """20% of draws are fully masked (t=1); otherwise t ~ U(0.20, 1.0) per sample."""
+    """Hybrid Suffix + Random Mask Curriculum:
+    - 20% chance: Full Mask (t = 1.0) for step-1 initialization.
+    - 40% chance: Contiguous Suffix Mask [m:] (matches free generation carrier frontier;
+      trains 2-step and 3-step lookahead without right-hand leaks).
+    - 40% chance: Random Scatter Mask (t ~ U(0.20, 0.95)) to preserve infilling recovery.
+    """
     B, C = target.shape
-    if torch.rand(1).item() < 0.20:
-        ratios = torch.ones(B)
-    else:
-        ratios = torch.empty(B).uniform_(0.20, 1.0)
     mask = torch.zeros_like(target, dtype=torch.bool)
     for i in range(B):
-        n = max(1, int(float(ratios[i]) * C))
-        mask[i, torch.randperm(C, device=target.device)[:n]] = True
+        u = torch.rand(1).item()
+        if u < 0.20:
+            # Full mask
+            mask[i, :] = True
+        elif u < 0.60:
+            # Contiguous suffix mask: pick split point m in 1..C-1
+            m = torch.randint(1, C, (1,)).item() if C > 1 else 0
+            mask[i, m:] = True
+        else:
+            # Random scatter mask
+            ratio = 0.20 + 0.75 * torch.rand(1).item()
+            n = max(1, int(ratio * C))
+            mask[i, torch.randperm(C, device=target.device)[:n]] = True
     return target.masked_fill(mask, mask_id), mask
 
 
@@ -154,6 +167,16 @@ def main():
     if args.lora:
         targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
         model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets, mask_id=mask_id)
+        if args.resume and Path(args.resume).exists():
+            print(f"resuming LoRA and mask weights from {args.resume}...")
+            from peft import set_peft_model_state_dict
+            ck = torch.load(args.resume, map_location="cpu")
+            if "lora" in ck:
+                set_peft_model_state_dict(model, ck["lora"])
+            if "mask_emb" in ck:
+                with torch.no_grad():
+                    model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
+            print(f"resumed from {args.resume} (source step {ck.get('step', '?')})")
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         print(
