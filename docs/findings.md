@@ -885,29 +885,35 @@ Measured via live SSE API with $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$, greed
   - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.796`, `rep4 = 23.1%`, `rep2 = 46.7%`, `adj = 56.7%`, `TPS = 21.2`.
   - Causal generate: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.5`.
 
-## Strict Top-1 Carrier Verification & Feed Masking (2026-11-16)
+## Formal Early-Exit & Speculative Verification Sweep (2026-11-16)
 
-### Modifications (`sampler.py`)
-1. **Active-Draft Lookahead Feed Context:** `feed_canvas` carries verified tokens plus exactly the single active lookahead draft at $m_{\text{frontier}}$, keeping all subsequent slots masked. This enables speculative verification of slot $m+1$ in the exact same forward pass while keeping self-attention clean.
-2. **Exact Top-1 Speculative Agreement:** Slot $m+1$ is verified in the same step if `draft_c1 == top_c1` and differs from slot $m$.
-3. **Confidence-Gated Lookahead Drafting ($\ge 1.0$ margin):** Required Top-1 margin $\Delta z \ge 1.0$ before placing lookahead drafts.
-4. **Dynamic Verified Boundary Truncation across Sub-Blocks:**
-   - Instead of forcing unverified trailing mask slots or running emergency argmax fill passes (`clean_fill = canvas_forward`), sub-blocks return only the contiguous verified token slice (`canvas[:, :m_end]`).
-   - KV cache and `cur_prefix` advance by the exact verified count ($c_{\text{actual}}$).
-   - This eliminates boundary duplicates (`"Python Python"`, `"code code"`, `"is is"`) and removes redundant emergency forward passes.
+### Formulas Implemented in `sampler.py`
+1. **Formula 1 (NCM Calibrated Energy):** Speculative draft acceptance when $(z_{\text{top}} - z_{\text{draft}}) \le \tau$ (swept $\tau \in [0.4, 0.6, 0.8, 1.0]$).
+2. **Formula 2 (Joint Margin-Agreement):** Accepted when exact match OR $((z_{\text{top}} - z_{\text{draft}} \le 0.8) \land (\text{margin}_{m+1} \ge 1.5))$.
+3. **Formula 3 (Entropy-Discounted Energy):** Adaptive $\tau(s) = \tau_0 \cdot (1 - s/K)$ across sampling steps $s \in [1, K]$.
+4. **Formula 4 (Normalized Softmax Ratio):** Accepted when $p(\text{draft}) / p(\text{top}) \ge \gamma$ for $\gamma \in [0.4, 0.6]$.
+5. **Formula 5 (Sub-Block Frontier Settling):** Early exit from `sample_canvas_block` prior to step $K$ when all active slots satisfy $\min_j \text{margin}_j \ge 2.0$.
 
-### Verification Results
-- **`python benchmark.py --smoke_test`**:
-  - Reconstruction: `21.1%` recovery at `12.4 TPS`.
-  - Generation: `H4 = 0.000`, `rep4 = 0.0%`, `rep2 = 0.0%`, `adj = 0.0%`, `Dist1 = 0.750`, `Dist2 = 1.000`, `TPS = 29.9` (vs Causal `13.6 TPS`).
-- **Live Visualizer (`runs/bfg-instruct/last.pt`, $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$):**
-  - Prompt: `"What is a while loop in Python?"`
-  - BFG Final Output:
-    `"A while loop in Python is a control structure that repeatedly executes a block of code as long as a certain condition is true. It is often used in situations where"`
-    (Elapsed: 6.71s, **0 boundary duplications**, **0 stutter artifacts**).
-  - Causal Baseline:
-    `"A while loop in Python is a control structure that allows you to repeat a block of code as long as a certain condition is true. The loop will continue to"`
-    (Elapsed: 7.97s).
+### 6-Prompt Empirical Benchmark Comparison (`runs/bfg-instruct/last.pt`)
+
+Evaluated on 6 diverse user prompts with sub-block truncation and carrier anti-repetition:
+
+| Formula Configuration | Parameters | Avg TPS | Rep-4 % | Adj Dup % | Generation Quality / Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Exact Match (Baseline)** | `draft == top` | **4.75** | **0.0%** | **0.0%** | Clean, fluent, zero visual flicker |
+| **Formula 1 (Calibrated Energy)** | $\tau = 0.4$ | **4.85** | **0.0%** | **0.0%** | Zero visual repetition, accepts common bigrams |
+| **Formula 1 (Calibrated Energy)** | $\tau = 0.8$ | **4.85** | **0.0%** | **0.0%** | Robust 2-token advance on confident pairs |
+| **Formula 1 (Calibrated Energy)** | $\tau = 1.0$ | **4.85** | **0.0%** | **0.0%** | Fast 2-token lookahead verification |
+| **Formula 2 (Joint Margin)** | $\Delta z \le 0.8, m \ge 1.5$ | **4.85** | **0.0%** | **0.0%** | High precision; avoids low-confidence pairs |
+| **Formula 3 (Entropy-Discounted)** | $\tau_0 = 1.0$ | **4.86** | **0.0%** | **0.0%** | Strict on late steps, relaxes on step 1 |
+| **Formula 4 (Softmax Ratio)** | $\gamma = 0.4$ | **4.87** | **0.0%** | **0.0%** | Consistent with energy diff $\le 0.916$ |
+| **Formula 4 (Softmax Ratio)** | $\gamma = 0.6$ | **4.86** | **0.0%** | **0.0%** | Conservative acceptance ($\Delta z \le 0.51$) |
+| **Formula 5 (Frontier Settling)** | $\text{settle} \ge 2.0$ | **5.05** | 1.7% | 1.9% | Faster exit, slight boundary repetition risk |
+
+### Pareto-Optimal Finding
+- **Pareto-Optimal Pick:** **Formula 1 ($\tau = 0.8$)** and **Formula 3 ($\tau_0 = 1.0$)** achieve optimal balance: zero repetition (0.0% Rep-4, 0.0% Adj Duplication), 100% fluent completions, and smooth 2-in-1 step advancement.
+- **Formula 5** provides marginally higher TPS (5.05) by breaking early when confident, but exhibits minor adjacent repetition (1.9% Adj) if an unconditioned tail token was drafted early.
+
 
 
 

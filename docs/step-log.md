@@ -413,6 +413,20 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      Clean text generated in 6.71s with 0 stutters and 0 boundary duplicates (`"A while loop in Python is a control structure that repeatedly executes a block of code as long as a certain condition is true. It is often used in situations where"`).
    - Live service restarted on port 8766.
 
+## 26. Formal Early-Exit & Speculative Verification Sweep (2026-11-16)
+
+1. **Formulas Implemented in `sampler.py`:**
+   - Formula 1 (NCM Calibrated Energy): $(z_{\text{top}} - z_{\text{draft}}) \le \tau$.
+   - Formula 2 (Joint Margin-Agreement): exact match OR $(\Delta z \le 0.8 \land \text{margin}_{m+1} \ge 1.5)$.
+   - Formula 3 (Entropy-Discounted Energy): adaptive $\tau(s) = \tau_0 \cdot (1 - s/K)$.
+   - Formula 4 (Normalized Softmax Ratio): $p(\text{draft}) / p(\text{top}) \ge \gamma$.
+   - Formula 5 (Sub-Block Frontier Settling): early break when $\min_j \text{margin}_j \ge 2.0$.
+2. **Benchmark Sweep across 6 Prompts:**
+   - Evaluated 10 configurations on `runs/bfg-instruct/last.pt`.
+   - Formulas 1, 2, 3, 4 all achieved **0.0% 4-gram repetition** and **0.0% adjacent duplication**.
+   - Identified Formula 1 ($\tau=0.8$) and Formula 3 ($\tau_0=1.0$) as Pareto-optimal.
+
+
 
 
 

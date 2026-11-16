@@ -27,6 +27,10 @@ def sample_canvas_block(
     kv=None,
     step_callback=None,
     stop_token_ids=None,
+    formula=None,
+    tau=0.8,
+    gamma=0.5,
+    settle_margin=2.0,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -136,18 +140,43 @@ def sample_canvas_block(
                 canvas[i] = row
                 break
 
-            # 2. Speculative acceptance for slot m+1:
-            # Check if a draft was in feed_canvas[m+1] and matches sampled[m+1]
+            # 2. Speculative acceptance for slot m+1 based on chosen verification formula:
+            # - exact (default): draft_c1 == top_c1
+            # - formula1 (NCM Calibrated Energy): (z[top] - z[draft]) <= tau
+            # - formula2 (Joint Margin-Agreement): draft == top OR ((z[top] - z[draft] <= 0.8) and margin_{m+1} >= 1.5)
+            # - formula3 (Entropy-Discounted Energy): (z[top] - z[draft]) <= tau * (1.0 - s / steps)
+            # - formula4 (Normalized Softmax Ratio): exp(z[draft] - z[top]) >= gamma (i.e. z[top] - z[draft] <= -ln(gamma))
             if m + 1 < canvas_len:
                 draft_c1 = int(feed_canvas[i, m + 1])
                 top_c1 = int(sampled[i, m + 1])
-                if draft_c1 != mask_id and draft_c1 == top_c1 and draft_c1 != new_m:
-                    row[m + 1] = draft_c1
-                    verified[i, m + 1] = True
-                    m += 1
-                    if stop_token_ids and draft_c1 in stop_token_ids:
-                        canvas[i] = row
-                        break
+                if draft_c1 != mask_id and draft_c1 != new_m:
+                    accepted = False
+                    if draft_c1 == top_c1:
+                        accepted = True
+                    elif formula == "formula1":
+                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
+                        accepted = energy_diff <= tau
+                    elif formula == "formula2":
+                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
+                        m_c1 = margin[i, m + 1].item()
+                        accepted = (energy_diff <= 0.8) and (m_c1 >= 1.5)
+                    elif formula == "formula3":
+                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
+                        step_tau = tau * (1.0 - (s / steps))
+                        accepted = energy_diff <= step_tau
+                    elif formula == "formula4":
+                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
+                        # p(draft)/p(top) >= gamma <=> z[top] - z[draft] <= -log(gamma)
+                        max_diff = -math.log(max(1e-5, min(1.0, gamma)))
+                        accepted = energy_diff <= max_diff
+
+                    if accepted:
+                        row[m + 1] = draft_c1
+                        verified[i, m + 1] = True
+                        m += 1
+                        if stop_token_ids and draft_c1 in stop_token_ids:
+                            canvas[i] = row
+                            break
 
             # 3. Clean up unverified tail beyond m and draft next lookahead token at m+1 if confident
             for j in range(m + 1, canvas_len):
@@ -188,6 +217,31 @@ def sample_canvas_block(
         if stop_token_ids:
             stop_set = set(stop_token_ids)
             if any(int(canvas[i, j]) in stop_set for i in range(B) for j in range(canvas_len) if verified[i, j]):
+                break
+
+        # Early exit 3: Formula 5 (Sub-Block Frontier Settling)
+        # Early exit from sample_canvas_block prior to step K when all active unverified slots satisfy min margin >= settle_margin
+        if formula == "formula5" and s < steps:
+            settled = True
+            for i in range(B):
+                m_chk = 0
+                while m_chk < canvas_len and verified[i, m_chk]:
+                    m_chk += 1
+                if m_chk < canvas_len:
+                    # check all remaining slots up to canvas_len
+                    active_margins = margin[i, m_chk:]
+                    if (active_margins < settle_margin).any():
+                        settled = False
+                        break
+            if settled:
+                # Accept all settled positions
+                for i in range(B):
+                    m_chk = 0
+                    while m_chk < canvas_len and verified[i, m_chk]:
+                        m_chk += 1
+                    for j in range(m_chk, canvas_len):
+                        canvas[i, j] = sampled[i, j]
+                        verified[i, j] = True
                 break
 
     # When reconstructing or infilling (pre-filled canvas with frozen tokens), return full canvas_len.
