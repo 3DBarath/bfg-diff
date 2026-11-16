@@ -136,39 +136,21 @@ def sample_canvas_block(
             row[m] = new_m
             verified[i, m] = True
 
+            # Check for early exit on stop tokens
             if stop_token_ids and new_m in stop_token_ids:
-                canvas[i] = row
                 break
 
-            # 2. Speculative acceptance for slot m+1 based on chosen verification formula:
-            # - exact (default): draft_c1 == top_c1
-            # - formula1 (NCM Calibrated Energy): (z[top] - z[draft]) <= tau
-            # - formula2 (Joint Margin-Agreement): draft == top OR ((z[top] - z[draft] <= 0.8) and margin_{m+1} >= 1.5)
-            # - formula3 (Entropy-Discounted Energy): (z[top] - z[draft]) <= tau * (1.0 - s / steps)
-            # - formula4 (Normalized Softmax Ratio): exp(z[draft] - z[top]) >= gamma (i.e. z[top] - z[draft] <= -ln(gamma))
+            # 2. Speculative Leap: Verify slot m+1 via NCM Energy Bound (tau = 0.8)
             if m + 1 < canvas_len:
                 draft_c1 = int(feed_canvas[i, m + 1])
-                top_c1 = int(sampled[i, m + 1])
+                top_z, top_tok = z[i, m + 1].max(dim=-1)
                 if draft_c1 != mask_id and draft_c1 != new_m:
+                    draft_z = z[i, m + 1, draft_c1]
                     accepted = False
-                    if draft_c1 == top_c1:
+                    if draft_c1 == int(top_tok):
                         accepted = True
-                    elif formula == "formula1":
-                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
-                        accepted = energy_diff <= tau
-                    elif formula == "formula2":
-                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
-                        m_c1 = margin[i, m + 1].item()
-                        accepted = (energy_diff <= 0.8) and (m_c1 >= 1.5)
-                    elif formula == "formula3":
-                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
-                        step_tau = tau * (1.0 - (s / steps))
-                        accepted = energy_diff <= step_tau
-                    elif formula == "formula4":
-                        energy_diff = (z[i, m + 1, top_c1] - z[i, m + 1, draft_c1]).item()
-                        # p(draft)/p(top) >= gamma <=> z[top] - z[draft] <= -log(gamma)
-                        max_diff = -math.log(max(1e-5, min(1.0, gamma)))
-                        accepted = energy_diff <= max_diff
+                    elif (top_z - draft_z).item() <= (tau if formula == "formula1" else 0.8):
+                        accepted = True
 
                     if accepted:
                         row[m + 1] = draft_c1

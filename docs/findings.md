@@ -911,8 +911,12 @@ Evaluated on 6 diverse user prompts with sub-block truncation and carrier anti-r
 | **Formula 5 (Frontier Settling)** | $\text{settle} \ge 2.0$ | **5.05** | 1.7% | 1.9% | Faster exit, slight boundary repetition risk |
 
 ### Pareto-Optimal Finding
-- **Pareto-Optimal Pick:** **Formula 1 ($\tau = 0.8$)** and **Formula 3 ($\tau_0 = 1.0$)** achieve optimal balance: zero repetition (0.0% Rep-4, 0.0% Adj Duplication), 100% fluent completions, and smooth 2-in-1 step advancement.
-- **Formula 5** provides marginally higher TPS (5.05) by breaking early when confident, but exhibits minor adjacent repetition (1.9% Adj) if an unconditioned tail token was drafted early.
+- **Pareto-Optimal Pick:** **Formula 1 ($\tau = 0.8$)** achieves the ideal balance:
+  - **Rep-4: 0.0%**
+  - **Adjacent Duplication: 0.0%**
+  - **Zero boundary stutters** (no `"Python Python"`, no `"code code"`, no `"is is"`).
+  - Clean speculative 2-token leaps on bigram continuations (e.g. `"while loop"`).
+
 
 
 
