@@ -156,7 +156,7 @@ def sample_canvas_block(
             if m + 1 < canvas_len:
                 top2_c1 = z[i, m + 1].topk(2).values
                 margin_c1 = (top2_c1[0] - top2_c1[1]).item()
-                if margin_c1 >= 1.2:
+                if margin_c1 >= 1.0:
                     draft_tok = int(sampled[i, m + 1])
                     if suppress_adjacent and draft_tok == int(row[m]):
                         cand_z = z[i, m + 1].clone()
@@ -190,18 +190,25 @@ def sample_canvas_block(
             if any(int(canvas[i, j]) in stop_set for i in range(B) for j in range(canvas_len) if verified[i, j]):
                 break
 
-    leftover = canvas == mask_id  # only if steps/canvas_len rounding left holes
-    if leftover.any():
-        fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
-        canvas = torch.where(leftover, fill, canvas)
+    # When reconstructing or infilling (pre-filled canvas with frozen tokens), return full canvas_len.
+    # When free-generating across sliding sub-blocks, truncate block to only verified tokens so
+    # unverified mask holes or hallucinated argmax guesses never leak across sub-block boundaries!
+    if frozen.any():
+        leftover = canvas == mask_id
+        if leftover.any():
+            fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
+            canvas = torch.where(leftover, fill, canvas)
+        return canvas
 
-    # When returning completed block, ensure any unverified speculative tail is cleanly filled
-    # by real model forward predictions conditioned on verified prefix
-    unverified_tail = ~verified & ~frozen
-    if unverified_tail.any():
-        clean_fill = canvas_forward(model, prefix_ids, canvas, prefix_keep).argmax(-1)
-        canvas = torch.where(unverified_tail, clean_fill, canvas)
-    return canvas
+    m_end = 0
+    while m_end < canvas_len and verified[0, m_end]:
+        m_end += 1
+
+    if m_end == 0:
+        # Fallback: at least slot 0 is verified from step 1
+        m_end = 1
+
+    return canvas[:, :m_end]
 
 
 def sample_canvas(
@@ -263,9 +270,10 @@ def sample_canvas(
             stop_token_ids=stop_token_ids,
             **kwargs,
         )
+        c_actual = block.shape[1]
         generated_blocks.append(block)
         block_idx += 1
-        rem -= c_sub
+        rem -= c_actual
 
         # Early exit across sub-blocks if a stop token was generated
         if stop_token_ids:
@@ -274,7 +282,7 @@ def sample_canvas(
                 break
 
         if rem > 0 and kv is not None:
-            # Advance KV cache by appending [cur_prefix[:, -1:], block[:, :-1]] (exactly c_sub tokens).
+            # Advance KV cache by appending [cur_prefix[:, -1:], block[:, :-1]] (exactly c_actual tokens).
             # This advances the cached prefix up to the new prefix[:-1] for the next sub-block,
             # leaving block[:, -1:] as prefix_last_id!
             advance_tokens = torch.cat([cur_prefix[:, -1:], block[:, :-1]], dim=1)
@@ -282,11 +290,11 @@ def sample_canvas(
             new_prefix = torch.cat([cur_prefix, block], dim=1)
             new_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1) if cur_keep is not None else None
             pos_advance = (
-                torch.arange(p_cached, p_cached + c_sub, device=advance_tokens.device).unsqueeze(0).expand(cur_prefix.shape[0], c_sub)
+                torch.arange(p_cached, p_cached + c_actual, device=advance_tokens.device).unsqueeze(0).expand(cur_prefix.shape[0], c_actual)
                 if new_keep is None
-                else mask_position_ids(new_keep, 0)[:, p_cached : p_cached + c_sub]
+                else mask_position_ids(new_keep, 0)[:, p_cached : p_cached + c_actual]
             )
-            attn_mask = new_keep[:, : p_cached + c_sub] if new_keep is not None else None
+            attn_mask = new_keep[:, : p_cached + c_actual] if new_keep is not None else None
             model(
                 input_ids=advance_tokens,
                 past_key_values=kv,

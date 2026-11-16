@@ -890,17 +890,25 @@ Measured via live SSE API with $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$, greed
 ### Modifications (`sampler.py`)
 1. **Active-Draft Lookahead Feed Context:** `feed_canvas` carries verified tokens plus exactly the single active lookahead draft at $m_{\text{frontier}}$, keeping all subsequent slots masked. This enables speculative verification of slot $m+1$ in the exact same forward pass while keeping self-attention clean.
 2. **Exact Top-1 Speculative Agreement:** Slot $m+1$ is verified in the same step if `draft_c1 == top_c1` and differs from slot $m$.
-3. **Confidence-Gated Lookahead Drafting ($\ge 1.2$ margin):** Required Top-1 margin $\Delta z \ge 1.2$ before placing lookahead drafts.
-4. **Sub-block Boundary Cleanup & Tail Infill:** Cleanly filled unverified tails at sub-block exit to prevent draft leakage across sub-blocks.
+3. **Confidence-Gated Lookahead Drafting ($\ge 1.0$ margin):** Required Top-1 margin $\Delta z \ge 1.0$ before placing lookahead drafts.
+4. **Dynamic Verified Boundary Truncation across Sub-Blocks:**
+   - Instead of forcing unverified trailing mask slots or running emergency argmax fill passes (`clean_fill = canvas_forward`), sub-blocks return only the contiguous verified token slice (`canvas[:, :m_end]`).
+   - KV cache and `cur_prefix` advance by the exact verified count ($c_{\text{actual}}$).
+   - This eliminates boundary duplicates (`"Python Python"`, `"code code"`, `"is is"`) and removes redundant emergency forward passes.
 
-### Verification Smoke Tests
-- `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
-- `python benchmark.py --smoke_test`:
-  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 26.3%`, `TPS = 8.7`.
-  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.839`, `rep4 = 19.2%`, `rep2 = 33.3%`, `adj = 43.3%`, `Dist1 = 0.375`, `Dist2 = 0.667`, `TPS = 17.1`.
-  - `causal generate`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.3`.
-- **Live Visualizer (`runs/bfg-instruct/last.pt`, $C_{\text{sub}}=8, k_{\text{sub}}=4$):**
-  - `"What is the capital of France?"`: BFG completed in **1.40s (5.72 TPS)** with clean output `"The capital of France is Paris."` vs Causal baseline 1.76s (3.98 TPS).
+### Verification Results
+- **`python benchmark.py --smoke_test`**:
+  - Reconstruction: `21.1%` recovery at `12.4 TPS`.
+  - Generation: `H4 = 0.000`, `rep4 = 0.0%`, `rep2 = 0.0%`, `adj = 0.0%`, `Dist1 = 0.750`, `Dist2 = 1.000`, `TPS = 29.9` (vs Causal `13.6 TPS`).
+- **Live Visualizer (`runs/bfg-instruct/last.pt`, $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$):**
+  - Prompt: `"What is a while loop in Python?"`
+  - BFG Final Output:
+    `"A while loop in Python is a control structure that repeatedly executes a block of code as long as a certain condition is true. It is often used in situations where"`
+    (Elapsed: 6.71s, **0 boundary duplications**, **0 stutter artifacts**).
+  - Causal Baseline:
+    `"A while loop in Python is a control structure that allows you to repeat a block of code as long as a certain condition is true. The loop will continue to"`
+    (Elapsed: 7.97s).
+
 
 
 
