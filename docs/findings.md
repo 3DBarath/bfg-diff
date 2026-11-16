@@ -888,21 +888,20 @@ Measured via live SSE API with $C=32, C_{\text{sub}}=8, k_{\text{sub}}=4$, greed
 ## Strict Top-1 Carrier Verification & Feed Masking (2026-11-16)
 
 ### Modifications (`sampler.py`)
-1. **Masked `feed_canvas`:** Restored `feed_canvas = torch.where(verified, canvas, mask_id)` to ensure speculative unverified drafts never contaminate self-attention representations of carrier tokens during forward passes.
-2. **Strict Verification Agreement:** Replaced relaxed threshold $\Delta z \le 1.2$ with strict top-1 agreement (`draft == top_tok`), rejecting lookahead drafts unless the forward pass agrees exactly with the lookahead prediction under verified left context.
-3. **Confidence-Gated Lookahead Drafting ($\ge 1.5$ margin):** Required Top-1 margin $\Delta z \ge 1.5$ before placing drafts at $curr+1$, avoiding noisy speculative commitments when confidence is low.
-4. **Boundary Repulsion & Tail Cleanup:**
-   - Enforced boundary repulsion against `prefix_ids[i, -1]` to eliminate duplicate boundary tokens.
-   - Guaranteed that any unverified speculative tail is cleanly filled with model forward predictions before returning a sub-block to prevent draft pollution across sub-block boundaries.
+1. **Active-Draft Lookahead Feed Context:** `feed_canvas` carries verified tokens plus exactly the single active lookahead draft at $m_{\text{frontier}}$, keeping all subsequent slots masked. This enables speculative verification of slot $m+1$ in the exact same forward pass while keeping self-attention clean.
+2. **Exact Top-1 Speculative Agreement:** Slot $m+1$ is verified in the same step if `draft_c1 == top_c1` and differs from slot $m$.
+3. **Confidence-Gated Lookahead Drafting ($\ge 1.2$ margin):** Required Top-1 margin $\Delta z \ge 1.2$ before placing lookahead drafts.
+4. **Sub-block Boundary Cleanup & Tail Infill:** Cleanly filled unverified tails at sub-block exit to prevent draft leakage across sub-blocks.
 
 ### Verification Smoke Tests
 - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
 - `python benchmark.py --smoke_test`:
-  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 26.3%`, `TPS = 9.0`.
-  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.839`, `rep4 = 19.2%`, `rep2 = 33.3%`, `adj = 43.3%`, `Dist1 = 0.375`, `Dist2 = 0.667`, `TPS = 17.2`.
-  - `causal generate`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.1`.
+  - `Reconstruction | 2 prefixes | P=128 C=16`: `bfg-diff k=2`: `recovery = 26.3%`, `TPS = 8.7`.
+  - `Generation | 2 prompts | C=16 | top_k=50`: `H4 = 0.839`, `rep4 = 19.2%`, `rep2 = 33.3%`, `adj = 43.3%`, `Dist1 = 0.375`, `Dist2 = 0.667`, `TPS = 17.1`.
+  - `causal generate`: `H4 = 1.000`, `rep4 = 0.0%`, `rep2 = 3.3%`, `adj = 0.0%`, `TPS = 13.3`.
 - **Live Visualizer (`runs/bfg-instruct/last.pt`, $C_{\text{sub}}=8, k_{\text{sub}}=4$):**
-  - `"What is the capital of France?"`: BFG completed in **2.20s (7.28 TPS)** with clean output `"The capital of France is Paris."`.
+  - `"What is the capital of France?"`: BFG completed in **1.40s (5.72 TPS)** with clean output `"The capital of France is Paris."` vs Causal baseline 1.76s (3.98 TPS).
+
 
 
 

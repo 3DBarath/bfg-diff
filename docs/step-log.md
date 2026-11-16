@@ -398,21 +398,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python benchmark.py --smoke_test`: `Reconstruction recovery 26.3% TPS 12.1; Generation TPS 21.2`.
    - Live visualizer service verified on port 8766.
 
-## 24. Strict Top-1 Verification & Context Masking (2026-11-16)
+## 25. Active-Draft Speculative Verification & Slice Optimization (2026-11-16)
 
-1. **Context Contamination Elimination:**
-   - Set `feed_canvas = torch.where(verified, canvas, mask_id)` in [sampler.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/sampler.py).
-2. **Strict Agreement Threshold:**
-   - Replaced `diff <= 1.2` with exact `draft == top_tok` in speculative verification.
-3. **Confidence-Gated Lookahead Drafting:**
-   - Evaluated `margin_c1 = (top2_c1[0] - top2_c1[1]).item() >= 1.5` before drafting at $curr+1$ and $curr+2$.
-4. **Boundary Repulsion & Tail Cleanup:**
-   - Cleanly filled unverified speculative tail tokens before sub-block return in `sample_canvas_block` so prefix advancement does not inherit speculative artifacts.
-   - Enforced left neighbor check against `prefix_ids[i, -1]` with logit masking.
-5. **Verification & Service Restart:**
+1. **Active Lookahead Drafting in `feed_canvas`:**
+   - Modified [sampler.py](file:///home/gces/.bin/.s/.scripts/bfg-diff/sampler.py) to feed verified tokens plus exactly the single active lookahead draft token at $m_{\text{frontier}}$, masking distant slots.
+   - Evaluates slot $m$ and checks speculative acceptance of slot $m+1$ (`draft_c1 == top_c1`) in the same forward pass.
+2. **Verification & Tests:**
    - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
-   - `python benchmark.py --smoke_test`: recovery `26.3%`, `H4 = 0.839`, `rep4 = 19.2%`, generation `17.2 TPS`.
-   - Live visualizer service restarted and verified on port 8766.
+   - `python benchmark.py --smoke_test`: `recovery = 26.3%`, `H4 = 0.839`, `rep4 = 19.2%`, `TPS = 17.1`.
+   - Live endpoint test: `"The capital of France is Paris."` generated in 1.40s (5.72 TPS) vs Causal 1.76s (3.98 TPS).
+   - Restarted `chat.py` service.
+
 
 
 

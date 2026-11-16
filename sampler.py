@@ -81,9 +81,17 @@ def sample_canvas_block(
         prev_canvas = canvas.clone()
         prev_verified = verified.clone()
 
-        # Only feed verified tokens to the context:
-        # Prevent unverified draft tokens from corrupting the self-attention canvas
-        feed_canvas = torch.where(verified, canvas, mask_id)
+        # 1. Construct feed_canvas with verified tokens + current 1-token lookahead draft only.
+        # Distant slots beyond the active lookahead draft are kept masked to avoid polluting self-attention.
+        feed_canvas = torch.full_like(canvas, mask_id)
+        for i in range(B):
+            m_front = 0
+            while m_front < canvas_len and verified[i, m_front]:
+                m_front += 1
+            feed_canvas[i, :m_front] = canvas[i, :m_front]
+            # Retain active speculative draft at m_front if already drafted from previous step
+            if m_front < canvas_len and canvas[i, m_front] != mask_id:
+                feed_canvas[i, m_front] = canvas[i, m_front]
 
         if kv is None:
             logits = canvas_forward(model, prefix_ids, feed_canvas, prefix_keep)
@@ -113,7 +121,7 @@ def sample_canvas_block(
             if m >= canvas_len:
                 continue
 
-            # 1. Slot m is always verified with sampled[m]
+            # 1. Slot m is anchored by verified carrier m-1 and is verified
             new_m = int(sampled[i, m])
             prev_tok = int(row[m - 1]) if m > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
             if suppress_adjacent and prev_tok is not None and new_m == prev_tok:
@@ -128,52 +136,34 @@ def sample_canvas_block(
                 canvas[i] = row
                 break
 
-            # 2. Speculative Chain Acceptance: check m+1, m+2...
-            # Strict verification: only accept exact matches (draft == top_tok)
-            curr = m
-            while curr + 1 < canvas_len:
-                draft = int(feed_canvas[i, curr + 1])
-                if draft == mask_id:
-                    break
-                if draft == int(row[curr]):
-                    break
-                top_tok = int(sampled[i, curr + 1])
-                if draft == top_tok:
-                    row[curr + 1] = draft
-                    verified[i, curr + 1] = True
-                    curr += 1
-                    if stop_token_ids and draft in stop_token_ids:
+            # 2. Speculative acceptance for slot m+1:
+            # Check if a draft was in feed_canvas[m+1] and matches sampled[m+1]
+            if m + 1 < canvas_len:
+                draft_c1 = int(feed_canvas[i, m + 1])
+                top_c1 = int(sampled[i, m + 1])
+                if draft_c1 != mask_id and draft_c1 == top_c1 and draft_c1 != new_m:
+                    row[m + 1] = draft_c1
+                    verified[i, m + 1] = True
+                    m += 1
+                    if stop_token_ids and draft_c1 in stop_token_ids:
+                        canvas[i] = row
                         break
-                else:
-                    break
 
-            if stop_token_ids and int(row[curr]) in stop_token_ids:
-                canvas[i] = row
-                break
-
-            # 3. Clean up unverified tail beyond curr and draft active lookahead
-            for j in range(curr + 1, canvas_len):
+            # 3. Clean up unverified tail beyond m and draft next lookahead token at m+1 if confident
+            for j in range(m + 1, canvas_len):
                 row[j] = mask_id
 
-            # Only draft speculative lookahead if top-1 margin exceeds confidence threshold (>= 1.5)
-            if curr + 1 < canvas_len:
-                top2_c1 = z[i, curr + 1].topk(2).values
+            if m + 1 < canvas_len:
+                top2_c1 = z[i, m + 1].topk(2).values
                 margin_c1 = (top2_c1[0] - top2_c1[1]).item()
-                if margin_c1 >= 1.5:
-                    d1 = int(sampled[i, curr + 1])
-                    if suppress_adjacent and d1 == int(row[curr]):
-                        cand_z = z[i, curr + 1].clone()
-                        cand_z[int(row[curr])] = -float("inf")
-                        d1 = int(cand_z.argmax())
-                    row[curr + 1] = d1
-
-                    if curr + 2 < canvas_len:
-                        z_c2 = z[i, curr + 2]
-                        top2_c2 = z_c2.topk(2).values
-                        if (top2_c2[0] - top2_c2[1]).item() >= 1.5:
-                            d2 = int(sampled[i, curr + 2])
-                            if d2 != d1 and d2 != int(row[curr]):
-                                row[curr + 2] = d2
+                if margin_c1 >= 1.2:
+                    draft_tok = int(sampled[i, m + 1])
+                    if suppress_adjacent and draft_tok == int(row[m]):
+                        cand_z = z[i, m + 1].clone()
+                        cand_z[int(row[m])] = -float("inf")
+                        draft_tok = int(cand_z.argmax())
+                    if draft_tok != int(row[m]):
+                        row[m + 1] = draft_tok
 
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
