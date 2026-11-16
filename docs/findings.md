@@ -935,7 +935,16 @@ Evaluated on 6 diverse user prompts with sub-block truncation and carrier anti-r
     - Sub-block 3 immediately broke on `<|im_end|>`. Sub-blocks 4, 5, 6 were cleanly suppressed.
     - Mask tokens (`<|extra_0|>`): 0. Ghost blocks: 0.
 
-## GPU Benchmark Validation (Google Colab NVIDIA T4 GPU, 2026-11-17)
+## Repetition Penalty & Colab Diagnostic Analysis (2026-11-17)
+
+- **Diagnostic Confirmation:**
+  - On open-ended greedy generation ($T=0$), both `causal generate` and `bfg-diff` degenerated into repeating cyclic attractor loops (`rep4 = 55.0%` for causal, `62.9%` for bfg-diff), endlessly printing *"The proxy server is used to forward requests to the target server."*
+  - Added soft sequence-level repetition penalty in `sampler.py` across the last 64 prefix tokens and active canvas when `suppress_adjacent` is enabled, subtracting 2.5 from logits of tokens appearing more than twice.
+  - Demonstrated that increasing $C_{\text{sub}}$ to 32 on GPU amortizes kernel launch overhead from $128/8 \times 4 = 64$ passes down to $128/32 \times 4 = 16$ passes.
+- **Verification:**
+  - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+  - `python benchmark.py --smoke_test`: `Reconstruction recovery = 21.1% (TPS 11.7); Generation rep4 = 0.0%, rep2 = 0.0%, adj = 0.0%`.
+
 
 Tested on Google Colab T4 GPU (16 GB VRAM) running CUDA fp16/bf16 with `runs/bfg-instruct/last.pt` (100 prompts / prefixes, $P=384, C=128$):
 

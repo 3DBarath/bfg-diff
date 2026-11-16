@@ -131,6 +131,21 @@ def sample_canvas_block(
             if m >= canvas_len:
                 continue
 
+            # Soft repetition penalty over recent history (prevents cyclic attractor loops)
+            if suppress_adjacent:
+                hist_tokens = []
+                if prefix_len > 0:
+                    hist_tokens.append(prefix_ids[i, max(0, prefix_len - 64):])
+                if m > 0:
+                    hist_tokens.append(row[:m])
+                if hist_tokens:
+                    recent = torch.cat(hist_tokens)
+                    counts = torch.bincount(recent[recent != mask_id], minlength=z.shape[-1])
+                    over_rep = counts > 2
+                    if over_rep.any():
+                        z[i, m, over_rep] -= 2.5
+                        sampled[i, m] = z[i, m].argmax()
+
             # 1. Slot m is anchored by verified carrier m-1 and is verified
             new_m = int(sampled[i, m])
             prev_tok = int(row[m - 1]) if m > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)

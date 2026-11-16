@@ -426,19 +426,21 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Formulas 1, 2, 3, 4 all achieved **0.0% 4-gram repetition** and **0.0% adjacent duplication**.
    - Identified Formula 1 ($\tau=0.8$) and Formula 3 ($\tau_0=1.0$) as Pareto-optimal.
 
-## 28. Google Colab NVIDIA T4 GPU Benchmark Verification (2026-11-17)
+## 28. Google Colab NVIDIA T4 GPU Benchmark Verification & Repetition Penalty (2026-11-17)
 
 1. **Packaged Colab Bundle:**
    - Bundled `model.py`, `sampler.py`, `chat.py`, `benchmark.py`, `train.py`, and `runs/bfg-instruct/last.pt` into `bfg_colab.zip`.
 2. **GPU Benchmark Execution (100 Prompts / Prefixes, $P=384, C=128$):**
    - **Generation Throughput:**
-     - BFG-Diff $k=2$: **832.0 TPS** (**12.34x speedup** over causal generate at 67.4 TPS).
-     - BFG-Diff $k=4$: **442.2 TPS** (**6.56x speedup**).
-     - BFG-Diff $k=8$: **224.2 TPS** (**3.33x speedup**).
-     - Causal generate: **67.4 TPS**.
+     - BFG-Diff $k=2$: **832.0 TPS** (raw frontier unmasking).
+     - BFG-Diff $k=4$: **172.9 TPS** in full parallel reconstruction (vs 64.8 causal).
+     - Causal generate: **64.8 - 67.4 TPS**.
    - **Quality & Repetition:**
-     - Causal generate collapsed into degenerate repetitive stuttering (**55.0% Rep-4**, **65.4% Rep-2**).
-     - BFG-Diff maintained **0.0% Rep-4**, **0.0% Rep-2**, and **0.0% Adjacent Duplication** across all runs.
+     - Greedy $T=0$ open-ended generation exhibited repetitive attractor loops on both models (`rep4 = 55.0%` causal vs `62.9%` bfg-diff).
+     - Implemented soft sequence-level frequency penalty in `sampler.py` across the last 64 prefix tokens and active canvas when `suppress_adjacent` is enabled.
+   - **Verification:**
+     - `python train.py --smoke_test`: `smoke convergence: 11.9797 -> 4.0549 PASS`.
+     - `python benchmark.py --smoke_test`: `recovery = 21.1% (TPS 11.7); Generation rep4 = 0.0%, rep2 = 0.0%, adj = 0.0%`.
    - Documented in [docs/findings.md](file:///home/gces/.bin/.s/.scripts/bfg-diff/docs/findings.md).
 
 
