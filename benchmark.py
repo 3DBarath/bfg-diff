@@ -241,7 +241,8 @@ def run_sampler_generation(
     sync(device)
     elapsed = time.perf_counter() - start
     texts = [tok.decode(t, skip_special_tokens=True) for t in token_ids]
-    return token_ids, texts, len(token_ids) * args.canvas_len / elapsed
+    total_generated = sum(len(s) for s in token_ids)
+    return token_ids, texts, total_generated / max(1e-5, elapsed)
 
 
 @torch.inference_mode()

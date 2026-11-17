@@ -118,12 +118,6 @@ def sample_canvas_block(
         for i in range(B):
             row = canvas[i].clone()
 
-            # Strict boundary anti-echo at slot 0 against last token of prefix before selecting slot 0
-            if prefix_len > 0 and suppress_adjacent and not verified[i, 0]:
-                last_prefix_tok = int(prefix_ids[i, -1])
-                z[i, 0, last_prefix_tok] = -float("inf")
-                sampled[i, 0] = z[i, 0].argmax()
-
             # Find first unverified slot m
             m = 0
             while m < canvas_len and verified[i, m]:
@@ -131,23 +125,37 @@ def sample_canvas_block(
             if m >= canvas_len:
                 continue
 
-            # Soft repetition penalty over recent history (prevents cyclic attractor loops)
-            if suppress_adjacent:
+            # Strict boundary anti-echo at slot 0 against last token of prefix before selecting slot 0
+            if m == 0 and prefix_len > 0 and suppress_adjacent:
+                last_prefix_tok = int(prefix_ids[i, -1])
+                z[i, 0, last_prefix_tok] = -float("inf")
+
+            # Soft frequency/presence penalty over prefix history + current canvas (applied before sampling)
+            if suppress_adjacent and (prefix_len > 0 or m > 0):
                 hist_tokens = []
                 if prefix_len > 0:
-                    hist_tokens.append(prefix_ids[i, max(0, prefix_len - 64):])
+                    hist_tokens.append(prefix_ids[i, max(0, prefix_len - 128):])
                 if m > 0:
                     hist_tokens.append(row[:m])
                 if hist_tokens:
                     recent = torch.cat(hist_tokens)
-                    counts = torch.bincount(recent[recent != mask_id], minlength=z.shape[-1])
-                    over_rep = counts > 2
-                    if over_rep.any():
-                        z[i, m, over_rep] -= 2.5
-                        sampled[i, m] = z[i, m].argmax()
+                    valid_recent = recent[recent != mask_id]
+                    counts = torch.bincount(valid_recent, minlength=z.shape[-1])
+                    repeated = counts > 0
+                    if repeated.any():
+                        z[i, m, repeated] -= (counts[repeated].float() * 0.35)
+
+            # Sample slot m with temperature/top_k or greedy argmax after penalty
+            if temperature > 0.0:
+                k_eval = min(top_k or z.shape[-1], z.shape[-1])
+                vals, idx = z[i, m].topk(k_eval)
+                u = torch.rand_like(vals).clamp(1e-9, 1.0 - 1e-9)
+                pick = (vals / temperature - torch.log(-torch.log(u))).argmax()
+                new_m = int(idx[pick])
+            else:
+                new_m = int(z[i, m].argmax())
 
             # 1. Slot m is anchored by verified carrier m-1 and is verified
-            new_m = int(sampled[i, m])
             prev_tok = int(row[m - 1]) if m > 0 else (int(prefix_ids[i, -1]) if prefix_len else None)
             if suppress_adjacent and prev_tok is not None and new_m == prev_tok:
                 cand_z = z[i, m].clone()
