@@ -296,7 +296,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>BFG-Diff v2 - Visualizer & Multi-Turn Chat</title>
 <style>
   :root {
@@ -314,104 +314,133 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --bot-msg: #0f1f38;
     --success: #10b981;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body {
     background-color: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    padding: 16px;
+    padding: 10px;
     display: flex;
     justify-content: center;
     -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  @media (min-width: 600px) {
+    body { padding: 16px; }
   }
   .container {
     max-width: 960px;
     width: 100%;
     margin: 0 auto;
+    display: flex;
+    flex-direction: column;
   }
   header {
     display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
     gap: 12px;
-    margin-bottom: 20px;
+    margin-bottom: 14px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 16px;
+    padding-bottom: 12px;
+  }
+  @media (min-width: 640px) {
+    header {
+      flex-direction: row;
+      justify-content: space-between;
+      align-items: center;
+    }
   }
   .header-left h1 {
-    font-size: 22px;
+    font-size: 18px;
     color: var(--primary);
     display: flex;
     align-items: center;
     gap: 8px;
+    letter-spacing: -0.3px;
+  }
+  @media (min-width: 600px) {
+    .header-left h1 { font-size: 22px; }
   }
   .header-left h1 span.badge {
-    font-size: 11px;
+    font-size: 10px;
     background: var(--primary-glow);
     color: var(--primary);
     border: 1px solid var(--primary);
     padding: 2px 6px;
     border-radius: 4px;
     text-transform: uppercase;
+    font-weight: 700;
   }
-  p.subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
+  p.subtitle { margin-top: 3px; color: var(--muted); font-size: 12px; }
 
   /* Navigation Tabs */
   .tabs-nav {
     display: flex;
-    gap: 6px;
+    gap: 4px;
     background: var(--card);
-    padding: 4px;
+    padding: 3px;
     border-radius: 8px;
     border: 1px solid var(--border);
+    width: 100%;
+  }
+  @media (min-width: 640px) {
+    .tabs-nav { width: auto; }
   }
   .tab-btn {
+    flex: 1;
     background: transparent;
     border: none;
     color: var(--muted);
     font-weight: 600;
-    font-size: 13px;
-    padding: 8px 16px;
+    font-size: 12px;
+    padding: 8px 12px;
     border-radius: 6px;
     cursor: pointer;
     transition: all 0.2s;
-    width: auto;
+    text-align: center;
+    white-space: nowrap;
+  }
+  @media (min-width: 600px) {
+    .tab-btn { font-size: 13px; padding: 8px 16px; flex: initial; }
   }
   .tab-btn.active {
     background: var(--primary);
     color: #090d16;
     box-shadow: 0 2px 8px var(--primary-glow);
-  }
-  .tab-btn:hover:not(.active) {
-    color: var(--text);
-    background: rgba(255, 255, 255, 0.05);
+    font-weight: 700;
   }
 
   /* Preset Pills */
   .preset-bar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 14px;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 6px;
+    margin-bottom: 12px;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
   }
+  .preset-bar::-webkit-scrollbar { display: none; }
   .preset-label {
     font-size: 11px;
     color: var(--muted);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    white-space: nowrap;
   }
   .preset-pill {
     background: var(--card);
     border: 1px solid var(--border);
     color: var(--text);
-    padding: 5px 12px;
-    border-radius: 20px;
+    padding: 5px 11px;
+    border-radius: 16px;
     font-size: 12px;
     cursor: pointer;
     transition: all 0.2s;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .preset-pill:hover, .preset-pill.active {
     border-color: var(--primary);
@@ -422,13 +451,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* Parameter Controls */
   .controls {
     background: var(--card);
-    padding: 14px;
+    padding: 12px;
     border-radius: 8px;
     border: 1px solid var(--border);
-    margin-bottom: 16px;
+    margin-bottom: 14px;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+  @media (min-width: 640px) {
+    .controls {
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 12px;
+      padding: 14px;
+    }
   }
   .control-group {
     display: flex;
@@ -444,6 +480,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 6px;
     font-size: 14px;
     box-sizing: border-box;
+    width: 100%;
   }
   input:focus, select:focus, textarea:focus {
     outline: none;
@@ -459,19 +496,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 6px;
     font-size: 14px;
     transition: all 0.2s;
+    width: 100%;
   }
-  button.action-btn:hover { opacity: 0.9; transform: translateY(-1px); }
-  button.action-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  @media (min-width: 600px) {
+    button.action-btn { width: auto; }
+  }
+  button.action-btn:hover { opacity: 0.9; }
+  button.action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   button.secondary-btn {
     background: transparent;
     color: var(--muted);
     border: 1px solid var(--border);
     font-weight: 600;
     cursor: pointer;
-    padding: 8px 14px;
+    padding: 6px 12px;
     border-radius: 6px;
-    font-size: 13px;
+    font-size: 12px;
     transition: all 0.2s;
+    width: auto;
   }
   button.secondary-btn:hover {
     color: var(--text);
@@ -481,16 +523,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* Visualizer Cards */
   .prompt-card {
     background: var(--card);
-    padding: 14px;
+    padding: 12px;
     border-radius: 8px;
     border: 1px solid var(--border);
-    margin-bottom: 16px;
+    margin-bottom: 14px;
   }
-  .results { display: flex; flex-direction: column; gap: 16px; }
+  .results { display: flex; flex-direction: column; gap: 14px; }
   .comparison-grid {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 14px;
+    gap: 12px;
   }
   @media (min-width: 768px) {
     .comparison-grid { grid-template-columns: 1fr 1fr; }
@@ -503,7 +545,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .model-title {
     background: rgba(0,0,0,0.25);
-    padding: 10px 14px;
+    padding: 10px 12px;
     font-size: 13px;
     font-weight: 700;
     border-bottom: 1px solid var(--border);
@@ -513,18 +555,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .metric-badge {
     font-family: monospace;
-    font-size: 12px;
+    font-size: 11px;
     background: rgba(56, 189, 248, 0.15);
     color: var(--primary);
-    padding: 3px 8px;
+    padding: 2px 6px;
     border-radius: 4px;
     border: 1px solid rgba(56, 189, 248, 0.3);
   }
   .output-box {
-    padding: 14px;
-    min-height: 110px;
+    padding: 12px;
+    min-height: 90px;
     line-height: 1.5;
-    font-size: 14px;
+    font-size: 13px;
     white-space: pre-wrap;
     word-break: break-word;
     color: #e2e8f0;
@@ -533,13 +575,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 14px;
+    padding: 12px;
   }
   .trace-title {
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 700;
     color: var(--muted);
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
@@ -547,15 +589,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #090d16;
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 10px;
-    margin-bottom: 10px;
+    padding: 8px;
+    margin-bottom: 8px;
   }
   .trace-step {
     font-family: monospace;
-    font-size: 12px;
+    font-size: 11px;
     margin-bottom: 4px;
     display: flex;
-    gap: 8px;
+    gap: 6px;
     align-items: baseline;
     flex-wrap: wrap;
   }
@@ -567,41 +609,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: #cbd5e1;
     font-size: 11px;
   }
-  .token-chip.mask {
-    background: #334155;
-    color: #64748b;
-  }
 
   /* Multi-Turn Chat UI */
   .chat-pane {
     display: flex;
     flex-direction: column;
-    height: 600px;
+    height: calc(100vh - 220px);
+    min-height: 420px;
+    max-height: 680px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
   }
   .chat-header {
-    padding: 12px 16px;
+    padding: 10px 14px;
     background: rgba(0, 0, 0, 0.2);
     border-bottom: 1px solid var(--border);
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
   }
   .chat-messages {
     flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    padding: 12px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 12px;
   }
   .msg-row {
     display: flex;
     flex-direction: column;
-    max-width: 82%;
+    max-width: 90%;
+  }
+  @media (min-width: 600px) {
+    .msg-row { max-width: 82%; }
   }
   .msg-row.user {
     align-self: flex-end;
@@ -610,18 +654,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     align-self: flex-start;
   }
   .msg-sender {
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 700;
     color: var(--muted);
-    margin-bottom: 4px;
+    margin-bottom: 3px;
     text-transform: uppercase;
   }
   .msg-row.user .msg-sender { text-align: right; color: var(--primary); }
   .msg-bubble {
-    padding: 10px 14px;
+    padding: 9px 13px;
     border-radius: 8px;
-    font-size: 14px;
-    line-height: 1.5;
+    font-size: 13.5px;
+    line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
   }
@@ -638,31 +682,40 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-top-left-radius: 2px;
   }
   .msg-stats {
-    font-size: 11px;
+    font-size: 10.5px;
     font-family: monospace;
     color: var(--muted);
-    margin-top: 4px;
+    margin-top: 3px;
   }
   .chat-input-bar {
-    padding: 12px 16px;
+    padding: 10px 12px;
     border-top: 1px solid var(--border);
     background: rgba(0, 0, 0, 0.25);
     display: flex;
-    gap: 10px;
+    gap: 8px;
     align-items: flex-end;
   }
   .chat-input-bar textarea {
     flex: 1;
-    min-height: 44px;
-    max-height: 120px;
+    min-height: 42px;
+    max-height: 100px;
     resize: none;
     line-height: 1.4;
+    padding: 8px 10px;
+    font-size: 13.5px;
+  }
+  .chat-input-bar button {
+    width: auto;
+    padding: 10px 16px;
+    flex-shrink: 0;
   }
   .empty-state {
     text-align: center;
     color: var(--muted);
     margin: auto;
-    font-size: 14px;
+    font-size: 13px;
+    padding: 20px;
+    line-height: 1.5;
   }
 </style>
 </head>
@@ -671,25 +724,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="container">
   <header>
     <div class="header-left">
-      <h1>BFG-Diff v2 <span class="badge">Live Playground</span></h1>
-      <p class="subtitle">Staircase Verify-and-Diffuse Engine with Progressive Slicing</p>
+      <h1>BFG-Diff v2 <span class="badge">Live</span></h1>
+      <p class="subtitle">Staircase Verify-and-Diffuse Engine</p>
     </div>
     <div class="tabs-nav">
-      <button class="tab-btn active" id="tabVisualizer" onclick="switchTab('visualizer')">🔍 Diffusion Visualizer</button>
-      <button class="tab-btn" id="tabChat" onclick="switchTab('chat')">💬 Conversational Chat</button>
+      <button class="tab-btn active" id="tabVisualizer" onclick="switchTab('visualizer')">Visualizer</button>
+      <button class="tab-btn" id="tabChat" onclick="switchTab('chat')">Chat Session</button>
     </div>
   </header>
 
   <!-- Presets Bar -->
   <div class="preset-bar">
     <span class="preset-label">Presets:</span>
-    <button class="preset-pill active" onclick="applyPreset('balanced')">⚡ Balanced (Recommended)</button>
-    <button class="preset-pill" onclick="applyPreset('creative')">🎨 Creative (T=0.7)</button>
-    <button class="preset-pill" onclick="applyPreset('fast')">🚀 Ultra-Fast Lookahead</button>
-    <button class="preset-pill" onclick="applyPreset('greedy')">🎯 Exact Greedy (T=0.0)</button>
+    <button class="preset-pill active" onclick="applyPreset('balanced')">Balanced</button>
+    <button class="preset-pill" onclick="applyPreset('creative')">Creative (T=0.7)</button>
+    <button class="preset-pill" onclick="applyPreset('fast')">Fast Lookahead</button>
+    <button class="preset-pill" onclick="applyPreset('greedy')">Greedy (T=0.0)</button>
   </div>
 
-  <!-- Manual Controls (Expandable / Configurable) -->
+  <!-- Manual Controls -->
   <div class="controls" id="controlsPanel">
     <div class="control-group">
       <label>Mode</label>
@@ -699,7 +752,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </select>
     </div>
     <div class="control-group">
-      <label>Total Canvas (Tokens)</label>
+      <label>Canvas (Tokens)</label>
       <input type="number" id="canvas_len" value="32" min="8" max="256" step="8">
     </div>
     <div class="control-group">
@@ -707,10 +760,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <input type="number" id="sub_canvas_len" value="8" min="4" max="32" step="4">
     </div>
     <div class="control-group">
-      <label>Sub-Steps / Block</label>
+      <label>Sub-Steps</label>
       <input type="number" id="sub_steps" value="4" min="1" max="16" step="1">
     </div>
-    <div class="control-group">
+    <div class="control-group" style="grid-column: span 2;">
       <label>Temperature</label>
       <input type="number" id="temp" value="0.3" min="0.0" max="1.5" step="0.1">
     </div>
@@ -720,8 +773,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="visualizerView">
     <div class="prompt-card">
       <label style="display:block; margin-bottom:8px;">Input Prompt</label>
-      <textarea id="prompt">Explain the difference between a process and a thread in one short paragraph.</textarea>
-      <div style="margin-top: 12px; display: flex; justify-content: flex-end;">
+      <textarea id="prompt" rows="3">Explain the difference between a process and a thread in one short paragraph.</textarea>
+      <div style="margin-top: 10px; display: flex; justify-content: flex-end;">
         <button class="action-btn" id="runBtn" onclick="runGeneration()">Generate & Compare</button>
       </div>
     </div>
@@ -737,7 +790,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="model-card">
           <div class="model-title">
-            <span>Causal Baseline (generate)</span>
+            <span>Causal Baseline</span>
             <span class="metric-badge" id="causalMetrics">0.0 TPS</span>
           </div>
           <div class="output-box" id="causalOutput">Ready to generate.</div>
@@ -745,8 +798,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div class="trace-card" id="traceContainer">
-        <div class="trace-title">Block-by-Block Parallel Denoising Trace</div>
-        <div id="traceLogs"><span style="color:var(--muted); font-size:13px;">Click "Generate & Compare" to see real-time unmasking trace.</span></div>
+        <div class="trace-title">Block Denoising Trace</div>
+        <div id="traceLogs"><span style="color:var(--muted); font-size:12px;">Click "Generate & Compare" to view unmasking trace.</span></div>
       </div>
     </div>
   </div>
@@ -756,18 +809,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="chat-pane">
       <div class="chat-header">
         <div>
-          <strong style="font-size:14px; color:var(--primary);">BFG-Diff Multi-Turn Session</strong>
-          <span style="font-size:11px; color:var(--muted); margin-left:8px;">Retains conversation knowledge across messages</span>
+          <strong style="font-size:13px; color:var(--primary);">Session</strong>
+          <span style="font-size:11px; color:var(--muted); margin-left:6px;">Context retained</span>
         </div>
-        <button class="secondary-btn" onclick="clearChat()">🗑️ Clear History</button>
+        <button class="secondary-btn" onclick="clearChat()">Clear History</button>
       </div>
       <div class="chat-messages" id="chatMessages">
         <div class="empty-state" id="emptyChatNotice">
-          👋 Start a conversation! Ask a question or share a fact and the assistant will remember it in subsequent turns.
+          Start a conversation. The model remembers past turns in this session.
         </div>
       </div>
       <div class="chat-input-bar">
-        <textarea id="chatInput" placeholder="Type your message here... (Press Enter to send, Shift+Enter for new line)"></textarea>
+        <textarea id="chatInput" placeholder="Message assistant..."></textarea>
         <button class="action-btn" id="chatSendBtn" onclick="sendChatMessage()">Send</button>
       </div>
     </div>
@@ -777,7 +830,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 let currentTab = 'visualizer';
 let chatHistory = [
-  { role: "system", content: "You are a friendly, intelligent assistant powered by BFG-Diff v2 discrete diffusion." }
+  { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
 ];
 
 function escapeHtml(str) {
@@ -836,7 +889,7 @@ async function runGeneration() {
   const causalMetrics = document.getElementById('causalMetrics');
   const traceLogs = document.getElementById('traceLogs');
 
-  bfgOutput.innerText = 'Starting parallel unmasking...';
+  bfgOutput.innerText = 'Parallel unmasking...';
   causalOutput.innerText = 'Waiting for causal stream...';
   bfgMetrics.innerText = '0.0 TPS';
   causalMetrics.innerText = '0.0 TPS';
@@ -911,7 +964,7 @@ async function runGeneration() {
           const sRow = document.createElement('div');
           sRow.className = 'trace-step';
           const chips = evt.tokens.map(t => '<span class="token-chip">' + escapeHtml(t) + '</span>').join(' ');
-          sRow.innerHTML = '<span style="color:var(--muted); min-width:48px;">Step ' + evt.step + ':</span>' + chips;
+          sRow.innerHTML = '<span style="color:var(--muted); min-width:44px;">Step ' + evt.step + ':</span>' + chips;
           bDiv.appendChild(sRow);
         } else if (evt.type === 'bfg_done') {
           bfgOutput.innerText = evt.bfg.text;
@@ -931,11 +984,11 @@ async function runGeneration() {
 // Conversational Chat Functions
 function clearChat() {
   chatHistory = [
-    { role: "system", content: "You are a friendly, intelligent assistant powered by BFG-Diff v2 discrete diffusion." }
+    { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
   ];
   document.getElementById('chatMessages').innerHTML = `
     <div class="empty-state" id="emptyChatNotice">
-      👋 Start a conversation! Ask a question or share a fact and the assistant will remember it in subsequent turns.
+      Start a conversation. The model remembers past turns in this session.
     </div>
   `;
 }
@@ -952,7 +1005,6 @@ async function sendChatMessage() {
   const notice = document.getElementById('emptyChatNotice');
   if (notice) notice.remove();
 
-  // 1. Add User Message to History and UI
   chatHistory.push({ role: "user", content: userText });
   inputEl.value = '';
 
@@ -966,14 +1018,13 @@ async function sendChatMessage() {
   `;
   messagesContainer.appendChild(userRow);
 
-  // 2. Add Assistant Placeholder
   const botRow = document.createElement('div');
   botRow.className = 'msg-row assistant';
   const botBubbleId = 'botMsg_' + Date.now();
   const botStatsId = 'botStats_' + Date.now();
   botRow.innerHTML = `
     <div class="msg-sender">BFG-Diff Assistant</div>
-    <div class="msg-bubble" id="${botBubbleId}">Thinking & diffusing...</div>
+    <div class="msg-bubble" id="${botBubbleId}">Diffusing...</div>
     <div class="msg-stats" id="${botStatsId}"></div>
   `;
   messagesContainer.appendChild(botRow);
@@ -1031,7 +1082,7 @@ async function sendChatMessage() {
         } else if (evt.type === 'chat_done') {
           finalAssistantText = evt.text;
           botBubble.innerText = evt.text;
-          botStats.innerText = `⚡ ${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
+          botStats.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
           chatHistory.push({ role: "assistant", content: finalAssistantText });
           messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
@@ -1039,7 +1090,7 @@ async function sendChatMessage() {
     }
   } catch (err) {
     console.error("Chat error:", err);
-    botBubble.innerText = "Error generating reply: " + err.message;
+    botBubble.innerText = "Error: " + err.message;
   } finally {
     sendBtn.disabled = false;
     inputEl.disabled = false;
@@ -1047,7 +1098,6 @@ async function sendChatMessage() {
   }
 }
 
-// Enter key submit in chat
 document.getElementById('chatInput').addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
