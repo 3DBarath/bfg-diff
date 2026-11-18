@@ -297,50 +297,138 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BFG-Diff Diffusion Visualizer & Chat</title>
+<title>BFG-Diff v2 - Visualizer & Multi-Turn Chat</title>
 <style>
   :root {
-    --bg: #0f172a;
-    --card: #1e293b;
-    --border: #334155;
+    --bg: #090d16;
+    --card: #131c2e;
+    --card-hover: #1a263d;
+    --border: #23324d;
     --primary: #38bdf8;
+    --primary-glow: rgba(56, 189, 248, 0.2);
     --text: #f1f5f9;
     --muted: #94a3b8;
-    --mask: #475569;
+    --mask: #334155;
     --accent: #a855f7;
+    --user-msg: #1e293b;
+    --bot-msg: #0f1f38;
+    --success: #10b981;
   }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background-color: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    margin: 0;
-    padding: 12px;
+    padding: 16px;
     display: flex;
     justify-content: center;
-    box-sizing: border-box;
     -webkit-font-smoothing: antialiased;
   }
   .container {
-    max-width: 900px;
+    max-width: 960px;
     width: 100%;
     margin: 0 auto;
   }
   header {
-    margin-bottom: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 12px;
+    padding-bottom: 16px;
   }
-  h1 { margin: 0 0 6px 0; font-size: 20px; color: var(--primary); }
-  p.subtitle { margin: 0; color: var(--muted); font-size: 13px; }
+  .header-left h1 {
+    font-size: 22px;
+    color: var(--primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .header-left h1 span.badge {
+    font-size: 11px;
+    background: var(--primary-glow);
+    color: var(--primary);
+    border: 1px solid var(--primary);
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+  p.subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
+
+  /* Navigation Tabs */
+  .tabs-nav {
+    display: flex;
+    gap: 6px;
+    background: var(--card);
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 13px;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+    width: auto;
+  }
+  .tab-btn.active {
+    background: var(--primary);
+    color: #090d16;
+    box-shadow: 0 2px 8px var(--primary-glow);
+  }
+  .tab-btn:hover:not(.active) {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  /* Preset Pills */
+  .preset-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .preset-label {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .preset-pill {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .preset-pill:hover, .preset-pill.active {
+    border-color: var(--primary);
+    color: var(--primary);
+    background: var(--primary-glow);
+  }
+
+  /* Parameter Controls */
   .controls {
     background: var(--card);
-    padding: 12px;
+    padding: 14px;
     border-radius: 8px;
     border: 1px solid var(--border);
     margin-bottom: 16px;
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 10px;
+    gap: 12px;
   }
   .control-group {
     display: flex;
@@ -356,31 +444,44 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 6px;
     font-size: 14px;
     box-sizing: border-box;
-    max-width: 100%;
   }
-  textarea { resize: vertical; min-height: 80px; width: 100%; font-family: inherit; line-height: 1.4; }
-  button {
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--primary);
+  }
+  button.action-btn {
     background: var(--primary);
     color: #090d16;
-    font-weight: bold;
+    font-weight: 700;
     cursor: pointer;
     border: none;
-    transition: all 0.2s;
-    padding: 10px 16px;
+    padding: 10px 18px;
     border-radius: 6px;
     font-size: 14px;
-    width: 100%;
+    transition: all 0.2s;
   }
-  @media (min-width: 600px) {
-    body { padding: 20px; }
-    h1 { font-size: 24px; }
-    button { width: auto; }
+  button.action-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+  button.action-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  button.secondary-btn {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    font-weight: 600;
+    cursor: pointer;
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    transition: all 0.2s;
   }
-  button:hover { opacity: 0.9; transform: translateY(-1px); }
-  button:active { transform: translateY(0); }
+  button.secondary-btn:hover {
+    color: var(--text);
+    border-color: var(--muted);
+  }
+
+  /* Visualizer Cards */
   .prompt-card {
     background: var(--card);
-    padding: 12px;
+    padding: 14px;
     border-radius: 8px;
     border: 1px solid var(--border);
     margin-bottom: 16px;
@@ -389,158 +490,341 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .comparison-grid {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 12px;
+    gap: 14px;
   }
   @media (min-width: 768px) {
-    .comparison-grid { grid-template-columns: 1fr 1fr; gap: 16px; }
+    .comparison-grid { grid-template-columns: 1fr 1fr; }
   }
   .model-card {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+    overflow: hidden;
   }
   .model-title {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--primary);
+    background: rgba(0,0,0,0.25);
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    border-bottom: 1px solid var(--border);
     display: flex;
     justify-content: space-between;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 6px;
   }
   .metric-badge {
+    font-family: monospace;
+    font-size: 12px;
     background: rgba(56, 189, 248, 0.15);
     color: var(--primary);
-    padding: 2px 8px;
+    padding: 3px 8px;
     border-radius: 4px;
-    font-size: 11px;
-    font-weight: 600;
+    border: 1px solid rgba(56, 189, 248, 0.3);
   }
   .output-box {
-    background: #090d16;
-    padding: 10px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    font-family: monospace;
-    font-size: 13px;
+    padding: 14px;
+    min-height: 110px;
+    line-height: 1.5;
+    font-size: 14px;
     white-space: pre-wrap;
     word-break: break-word;
-    line-height: 1.5;
-    min-height: 60px;
+    color: #e2e8f0;
   }
   .trace-card {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 14px;
-    margin-top: 4px;
-    overflow-x: auto;
   }
-  .trace-title { font-size: 15px; font-weight: 600; color: var(--accent); margin-bottom: 10px; }
-  .block-trace { margin-bottom: 14px; border-left: 3px solid var(--accent); padding-left: 10px; }
-  .step-line {
+  .trace-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--muted);
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .trace-block {
+    background: #090d16;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 10px;
+  }
+  .trace-step {
     font-family: monospace;
     font-size: 12px;
-    padding: 3px 0;
+    margin-bottom: 4px;
     display: flex;
-    align-items: flex-start;
-    gap: 6px;
+    gap: 8px;
+    align-items: baseline;
     flex-wrap: wrap;
   }
-  .step-num { color: var(--muted); min-width: 50px; font-weight: bold; flex-shrink: 0; }
-  .tokens-canvas { display: flex; gap: 4px; flex-wrap: wrap; }
   .token-chip {
+    padding: 1px 4px;
+    border-radius: 3px;
     background: #1e293b;
-    border: 1px solid var(--border);
-    padding: 2px 5px;
-    border-radius: 4px;
+    border: 1px solid #334155;
+    color: #cbd5e1;
     font-size: 11px;
-    white-space: pre;
-    word-break: break-all;
   }
   .token-chip.mask {
-    background: rgba(71, 85, 105, 0.4);
+    background: #334155;
     color: #64748b;
-    border: 1px dashed var(--mask);
+  }
+
+  /* Multi-Turn Chat UI */
+  .chat-pane {
+    display: flex;
+    flex-direction: column;
+    height: 600px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .chat-header {
+    padding: 12px 16px;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .msg-row {
+    display: flex;
+    flex-direction: column;
+    max-width: 82%;
+  }
+  .msg-row.user {
+    align-self: flex-end;
+  }
+  .msg-row.assistant {
+    align-self: flex-start;
+  }
+  .msg-sender {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--muted);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+  }
+  .msg-row.user .msg-sender { text-align: right; color: var(--primary); }
+  .msg-bubble {
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg-row.user .msg-bubble {
+    background: var(--user-msg);
+    border: 1px solid var(--border);
+    color: #fff;
+    border-top-right-radius: 2px;
+  }
+  .msg-row.assistant .msg-bubble {
+    background: var(--bot-msg);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    color: #e2e8f0;
+    border-top-left-radius: 2px;
+  }
+  .msg-stats {
+    font-size: 11px;
+    font-family: monospace;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .chat-input-bar {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.25);
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  .chat-input-bar textarea {
+    flex: 1;
+    min-height: 44px;
+    max-height: 120px;
+    resize: none;
+    line-height: 1.4;
+  }
+  .empty-state {
+    text-align: center;
+    color: var(--muted);
+    margin: auto;
+    font-size: 14px;
   }
 </style>
 </head>
 <body>
+
 <div class="container">
   <header>
-    <h1>BFG-Diff Interactive Visualizer</h1>
-    <p class="subtitle">Right-Shifted Discrete Diffusion vs Causal Autoregression (Qwen2.5-0.5B)</p>
+    <div class="header-left">
+      <h1>BFG-Diff v2 <span class="badge">Live Playground</span></h1>
+      <p class="subtitle">Staircase Verify-and-Diffuse Engine with Progressive Slicing</p>
+    </div>
+    <div class="tabs-nav">
+      <button class="tab-btn active" id="tabVisualizer" onclick="switchTab('visualizer')">🔍 Diffusion Visualizer</button>
+      <button class="tab-btn" id="tabChat" onclick="switchTab('chat')">💬 Conversational Chat</button>
+    </div>
   </header>
 
-  <div class="controls">
+  <!-- Presets Bar -->
+  <div class="preset-bar">
+    <span class="preset-label">Presets:</span>
+    <button class="preset-pill active" onclick="applyPreset('balanced')">⚡ Balanced (Recommended)</button>
+    <button class="preset-pill" onclick="applyPreset('creative')">🎨 Creative (T=0.7)</button>
+    <button class="preset-pill" onclick="applyPreset('fast')">🚀 Ultra-Fast Lookahead</button>
+    <button class="preset-pill" onclick="applyPreset('greedy')">🎯 Exact Greedy (T=0.0)</button>
+  </div>
+
+  <!-- Manual Controls (Expandable / Configurable) -->
+  <div class="controls" id="controlsPanel">
     <div class="control-group">
       <label>Mode</label>
       <select id="mode">
-        <option value="chat" selected>Chat (&lt;|im_start|&gt;)</option>
-        <option value="completion">Completion</option>
+        <option value="chat" selected>Chat (ChatML)</option>
+        <option value="completion">Raw Completion</option>
       </select>
     </div>
     <div class="control-group">
-      <label>Total Canvas (C)</label>
-      <input type="number" id="canvas_len" value="32" min="8" max="128" step="8">
+      <label>Total Canvas (Tokens)</label>
+      <input type="number" id="canvas_len" value="32" min="8" max="256" step="8">
     </div>
     <div class="control-group">
-      <label>Sub-Block (C_sub)</label>
+      <label>Sub-Block Size</label>
       <input type="number" id="sub_canvas_len" value="8" min="4" max="32" step="4">
     </div>
     <div class="control-group">
-      <label>Steps / Block (k_sub)</label>
-      <input type="number" id="sub_steps" value="4" min="1" max="16">
+      <label>Sub-Steps / Block</label>
+      <input type="number" id="sub_steps" value="4" min="1" max="16" step="1">
     </div>
     <div class="control-group">
       <label>Temperature</label>
-      <input type="number" id="temp" value="0.0" min="0.0" max="1.0" step="0.1">
+      <input type="number" id="temp" value="0.3" min="0.0" max="1.5" step="0.1">
     </div>
   </div>
 
-  <div class="prompt-card">
-    <label style="display:block; margin-bottom:8px;">Input Prompt</label>
-    <textarea id="prompt">How are you doing today?</textarea>
-    <div style="margin-top: 12px; display: flex; justify-content: flex-end;">
-      <button id="runBtn" onclick="runGeneration()">Generate & Compare</button>
+  <!-- VIEW 1: DIFFUSION VISUALIZER -->
+  <div id="visualizerView">
+    <div class="prompt-card">
+      <label style="display:block; margin-bottom:8px;">Input Prompt</label>
+      <textarea id="prompt">Explain the difference between a process and a thread in one short paragraph.</textarea>
+      <div style="margin-top: 12px; display: flex; justify-content: flex-end;">
+        <button class="action-btn" id="runBtn" onclick="runGeneration()">Generate & Compare</button>
+      </div>
+    </div>
+
+    <div class="results" id="resultsSection">
+      <div class="comparison-grid">
+        <div class="model-card">
+          <div class="model-title">
+            <span>BFG-Diff (Verify & Diffuse)</span>
+            <span class="metric-badge" id="bfgMetrics">0.0 TPS</span>
+          </div>
+          <div class="output-box" id="bfgOutput">Ready to generate.</div>
+        </div>
+        <div class="model-card">
+          <div class="model-title">
+            <span>Causal Baseline (generate)</span>
+            <span class="metric-badge" id="causalMetrics">0.0 TPS</span>
+          </div>
+          <div class="output-box" id="causalOutput">Ready to generate.</div>
+        </div>
+      </div>
+
+      <div class="trace-card" id="traceContainer">
+        <div class="trace-title">Block-by-Block Parallel Denoising Trace</div>
+        <div id="traceLogs"><span style="color:var(--muted); font-size:13px;">Click "Generate & Compare" to see real-time unmasking trace.</span></div>
+      </div>
     </div>
   </div>
 
-  <div class="results" id="resultsSection">
-    <div class="comparison-grid">
-      <div class="model-card">
-        <div class="model-title">
-          <span>BFG-Diff (Discrete Diffusion)</span>
-          <span class="metric-badge" id="bfgMetrics">0.0 TPS</span>
+  <!-- VIEW 2: MULTI-TURN CONVERSATIONAL CHAT -->
+  <div id="chatView" style="display:none;">
+    <div class="chat-pane">
+      <div class="chat-header">
+        <div>
+          <strong style="font-size:14px; color:var(--primary);">BFG-Diff Multi-Turn Session</strong>
+          <span style="font-size:11px; color:var(--muted); margin-left:8px;">Retains conversation knowledge across messages</span>
         </div>
-        <div class="output-box" id="bfgOutput">Ready to generate.</div>
+        <button class="secondary-btn" onclick="clearChat()">🗑️ Clear History</button>
       </div>
-      <div class="model-card">
-        <div class="model-title">
-          <span>Causal Baseline (generate)</span>
-          <span class="metric-badge" id="causalMetrics">0.0 TPS</span>
+      <div class="chat-messages" id="chatMessages">
+        <div class="empty-state" id="emptyChatNotice">
+          👋 Start a conversation! Ask a question or share a fact and the assistant will remember it in subsequent turns.
         </div>
-        <div class="output-box" id="causalOutput">Ready to generate.</div>
       </div>
-    </div>
-
-    <div class="trace-card" id="traceContainer">
-      <div class="trace-title">Block-by-Block Parallel Denoising Trace</div>
-      <div id="traceLogs"><span style="color:var(--muted); font-size:13px;">Click "Generate & Compare" to see real-time unmasking trace.</span></div>
+      <div class="chat-input-bar">
+        <textarea id="chatInput" placeholder="Type your message here... (Press Enter to send, Shift+Enter for new line)"></textarea>
+        <button class="action-btn" id="chatSendBtn" onclick="sendChatMessage()">Send</button>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
+let currentTab = 'visualizer';
+let chatHistory = [
+  { role: "system", content: "You are a friendly, intelligent assistant powered by BFG-Diff v2 discrete diffusion." }
+];
+
 function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabVisualizer').className = 'tab-btn' + (tab === 'visualizer' ? ' active' : '');
+  document.getElementById('tabChat').className = 'tab-btn' + (tab === 'chat' ? ' active' : '');
+  document.getElementById('visualizerView').style.display = tab === 'visualizer' ? 'block' : 'none';
+  document.getElementById('chatView').style.display = tab === 'chat' ? 'block' : 'none';
+}
+
+function applyPreset(name) {
+  document.querySelectorAll('.preset-pill').forEach(el => el.classList.remove('active'));
+  if (event && event.target) event.target.classList.add('active');
+
+  const canvasLen = document.getElementById('canvas_len');
+  const subCanvas = document.getElementById('sub_canvas_len');
+  const subSteps = document.getElementById('sub_steps');
+  const temp = document.getElementById('temp');
+
+  if (name === 'balanced') {
+    canvasLen.value = 32;
+    subCanvas.value = 8;
+    subSteps.value = 4;
+    temp.value = 0.3;
+  } else if (name === 'creative') {
+    canvasLen.value = 48;
+    subCanvas.value = 8;
+    subSteps.value = 4;
+    temp.value = 0.7;
+  } else if (name === 'fast') {
+    canvasLen.value = 32;
+    subCanvas.value = 16;
+    subSteps.value = 2;
+    temp.value = 0.1;
+  } else if (name === 'greedy') {
+    canvasLen.value = 32;
+    subCanvas.value = 8;
+    subSteps.value = 4;
+    temp.value = 0.0;
+  }
+}
+
+// Visualizer Generator
 async function runGeneration() {
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
@@ -577,9 +861,7 @@ async function runGeneration() {
       body: JSON.stringify(payload)
     });
 
-    if (!response.ok) {
-      throw new Error("Server returned HTTP " + response.status);
-    }
+    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
@@ -594,23 +876,17 @@ async function runGeneration() {
       if (chunk.done) break;
       buffer += decoder.decode(chunk.value, { stream: true });
 
-      // Cleanly normalize CRLF to LF using char codes
       const normalized = buffer.split(CR + NL).join(NL);
       const parts = normalized.split(DBL_NL);
-      buffer = parts.pop(); // keep last incomplete chunk
+      buffer = parts.pop();
 
-      for (const rawBlock of parts) {
-        const trimmed = rawBlock.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const jsonStr = trimmed.replace(/^data:\s*/, '').trim();
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        const jsonStr = line.substring(5).trim();
         if (!jsonStr) continue;
 
-        let evt;
-        try {
-          evt = JSON.parse(jsonStr);
-        } catch (e) {
-          continue;
-        }
+        const evt = JSON.parse(jsonStr);
 
         if (evt.type === 'causal_token') {
           causalAccum += evt.token;
@@ -619,61 +895,24 @@ async function runGeneration() {
         } else if (evt.type === 'causal_done') {
           causalOutput.innerText = evt.causal.text;
           causalMetrics.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
-          // Generation stream complete: unlock button immediately without waiting for TCP close
-          btn.disabled = false;
-          btn.innerText = 'Generate & Compare';
         } else if (evt.type === 'bfg_step') {
+          bfgOutput.innerText = evt.text;
           bfgMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
 
-          // Ensure block container exists
-          let bDiv = blockContainers[evt.block_idx];
-          if (!bDiv) {
-            bDiv = document.createElement('div');
-            bDiv.className = 'block-trace';
-            bDiv.innerHTML = '<div class="block-header" style="font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px;">Sub-Block ' + (evt.block_idx + 1) + '</div><div class="steps-list"></div>';
+          if (!blockContainers[evt.block_idx]) {
+            const bDiv = document.createElement('div');
+            bDiv.className = 'trace-block';
+            bDiv.innerHTML = '<div class="trace-step" style="font-weight:700; color:var(--primary); margin-bottom:6px;">Sub-Block ' + (evt.block_idx + 1) + '</div>';
             traceLogs.appendChild(bDiv);
             blockContainers[evt.block_idx] = bDiv;
           }
 
-          // In-place step update or append without layout thrashing
-          const stepsList = bDiv.querySelector('.steps-list');
-          let stepRow = stepsList.querySelector('[data-step="' + evt.step + '"]');
-          if (!stepRow) {
-            stepRow = document.createElement('div');
-            stepRow.className = 'step-line';
-            stepRow.setAttribute('data-step', evt.step);
-            stepRow.innerHTML = '<span class="step-num">Step ' + evt.step + '</span><div class="tokens-canvas"></div>';
-            stepsList.appendChild(stepRow);
-          }
-
-          const canvasDiv = stepRow.querySelector('.tokens-canvas');
-          let chipsHtml = '';
-          evt.tokens.forEach(tok => {
-            const isMask = tok === '░';
-            const safeTok = escapeHtml(tok);
-            chipsHtml += '<span class="token-chip ' + (isMask ? 'mask' : '') + '">' + (isMask ? '░' : safeTok) + '</span>';
-          });
-          canvasDiv.innerHTML = chipsHtml;
-
-          // Live update BFG final output with unmasked tokens
-          const cleanText = evt.text.replace(/░/g, '').replace(/<\|extra_0\|>/g, '');
-          if (cleanText) {
-            let fullPreview = '';
-            for (let i = 0; i < evt.block_idx; i++) {
-              if (blockContainers[i] && blockContainers[i]._final) {
-                fullPreview += blockContainers[i]._final;
-              }
-            }
-            fullPreview += cleanText;
-            bfgOutput.innerText = fullPreview.replace(/<\|extra_0\|>/g, '').replace(/<\|im_end\|>/g, '').replace(/<\|im_start\|>/g, '').trim();
-          }
-          if (evt.step === payload.sub_steps) {
-            bDiv._final = cleanText;
-            const header = bDiv.querySelector('.block-header');
-            if (header) {
-              header.innerText = 'Sub-Block ' + (evt.block_idx + 1) + ': Final: "' + escapeHtml(cleanText) + '"';
-            }
-          }
+          const bDiv = blockContainers[evt.block_idx];
+          const sRow = document.createElement('div');
+          sRow.className = 'trace-step';
+          const chips = evt.tokens.map(t => '<span class="token-chip">' + escapeHtml(t) + '</span>').join(' ');
+          sRow.innerHTML = '<span style="color:var(--muted); min-width:48px;">Step ' + evt.step + ':</span>' + chips;
+          bDiv.appendChild(sRow);
         } else if (evt.type === 'bfg_done') {
           bfgOutput.innerText = evt.bfg.text;
           bfgMetrics.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
@@ -688,6 +927,133 @@ async function runGeneration() {
     btn.innerText = 'Generate & Compare';
   }
 }
+
+// Conversational Chat Functions
+function clearChat() {
+  chatHistory = [
+    { role: "system", content: "You are a friendly, intelligent assistant powered by BFG-Diff v2 discrete diffusion." }
+  ];
+  document.getElementById('chatMessages').innerHTML = `
+    <div class="empty-state" id="emptyChatNotice">
+      👋 Start a conversation! Ask a question or share a fact and the assistant will remember it in subsequent turns.
+    </div>
+  `;
+}
+
+async function sendChatMessage() {
+  const inputEl = document.getElementById('chatInput');
+  const userText = inputEl.value.trim();
+  if (!userText) return;
+
+  const sendBtn = document.getElementById('chatSendBtn');
+  sendBtn.disabled = true;
+  inputEl.disabled = true;
+
+  const notice = document.getElementById('emptyChatNotice');
+  if (notice) notice.remove();
+
+  // 1. Add User Message to History and UI
+  chatHistory.push({ role: "user", content: userText });
+  inputEl.value = '';
+
+  const messagesContainer = document.getElementById('chatMessages');
+
+  const userRow = document.createElement('div');
+  userRow.className = 'msg-row user';
+  userRow.innerHTML = `
+    <div class="msg-sender">You</div>
+    <div class="msg-bubble">${escapeHtml(userText)}</div>
+  `;
+  messagesContainer.appendChild(userRow);
+
+  // 2. Add Assistant Placeholder
+  const botRow = document.createElement('div');
+  botRow.className = 'msg-row assistant';
+  const botBubbleId = 'botMsg_' + Date.now();
+  const botStatsId = 'botStats_' + Date.now();
+  botRow.innerHTML = `
+    <div class="msg-sender">BFG-Diff Assistant</div>
+    <div class="msg-bubble" id="${botBubbleId}">Thinking & diffusing...</div>
+    <div class="msg-stats" id="${botStatsId}"></div>
+  `;
+  messagesContainer.appendChild(botRow);
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+  const botBubble = document.getElementById(botBubbleId);
+  const botStats = document.getElementById(botStatsId);
+
+  const payload = {
+    messages: chatHistory,
+    canvas_len: parseInt(document.getElementById('canvas_len').value) || 32,
+    sub_canvas_len: parseInt(document.getElementById('sub_canvas_len').value) || 8,
+    sub_steps: parseInt(document.getElementById('sub_steps').value) || 4,
+    temp: parseFloat(document.getElementById('temp').value) || 0.3,
+  };
+
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) throw new Error("HTTP error " + response.status);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let finalAssistantText = '';
+
+    const NL = String.fromCharCode(10);
+    const CR = String.fromCharCode(13);
+    const DBL_NL = NL + NL;
+
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+
+      const normalized = buffer.split(CR + NL).join(NL);
+      const parts = normalized.split(DBL_NL);
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        const jsonStr = line.substring(5).trim();
+        if (!jsonStr) continue;
+
+        const evt = JSON.parse(jsonStr);
+        if (evt.type === 'chat_step') {
+          botBubble.innerText = evt.text;
+          botStats.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        } else if (evt.type === 'chat_done') {
+          finalAssistantText = evt.text;
+          botBubble.innerText = evt.text;
+          botStats.innerText = `⚡ ${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
+          chatHistory.push({ role: "assistant", content: finalAssistantText });
+          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Chat error:", err);
+    botBubble.innerText = "Error generating reply: " + err.message;
+  } finally {
+    sendBtn.disabled = false;
+    inputEl.disabled = false;
+    inputEl.focus();
+  }
+}
+
+// Enter key submit in chat
+document.getElementById('chatInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChatMessage();
+  }
+});
 </script>
 </body>
 </html>
@@ -715,6 +1081,78 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/chat":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len)
+            req = json.loads(body.decode("utf-8"))
+
+            messages = req.get("messages", [])
+            canvas_len = req.get("canvas_len", 32)
+            sub_canvas_len = req.get("sub_canvas_len", 8)
+            sub_steps = req.get("sub_steps", 4)
+            temp = req.get("temp", 0.3)
+
+            # Apply Jinja2/ChatML template if available, else format cleanly
+            try:
+                formatted_prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                formatted_prompt = ""
+                for m in messages:
+                    role = m.get("role", "user")
+                    content = m.get("content", "")
+                    formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+                formatted_prompt += "<|im_start|>assistant\n"
+
+            stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            pad = ": " + (" " * 2048) + "\n\n"
+            def send_chat_sse(evt_data):
+                msg = (f"data: {json.dumps(evt_data)}\n\n" + pad).encode("utf-8")
+                try:
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+            # Stream response using BFG discrete diffusion with stop tokens
+            bfg_res = generate_bfg_stream(
+                self.model,
+                self.tok,
+                self.mask_id,
+                formatted_prompt,
+                canvas_len=canvas_len,
+                sub_canvas_len=sub_canvas_len,
+                sub_steps=sub_steps,
+                temperature=temp,
+                stop_tokens=stop_tokens,
+                step_callback=lambda evt: send_chat_sse({
+                    "type": "chat_step",
+                    "text": evt.get("text", ""),
+                    "tps": evt.get("tps", 0.0),
+                    "elapsed": evt.get("elapsed", 0.0),
+                }),
+            )
+            clean_reply = bfg_res.get("text", "")
+            for st in stop_tokens:
+                clean_reply = clean_reply.replace(st, "")
+            clean_reply = clean_reply.strip()
+
+            send_chat_sse({
+                "type": "chat_done",
+                "text": clean_reply,
+                "tokens": bfg_res.get("tokens", 0),
+                "tps": bfg_res.get("tps", 0.0),
+                "elapsed": bfg_res.get("elapsed", 0.0),
+            })
+            return
         if self.path == "/api/generate":
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
