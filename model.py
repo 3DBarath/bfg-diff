@@ -112,8 +112,9 @@ def prefill_prefix(model, prefix_ids, prefix_keep=None):
     """Run prefix_ids[:, :-1] once with a KV cache; canvas steps then reuse it."""
     B, P = prefix_ids.shape
     if P <= 1:
-        # If prefix is only 1 token, there is no past to prefill
-        return None
+        # If prefix is only 1 token, initialize an empty DynamicCache
+        from transformers import DynamicCache
+        return DynamicCache()
     pos = (
         torch.arange(P - 1, device=prefix_ids.device).unsqueeze(0).expand(B, P - 1)
         if prefix_keep is None
