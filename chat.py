@@ -746,6 +746,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex-direction: column;
     gap: 14px;
     margin: 0 auto;
+    align-items: stretch;
+    height: fit-content;
   }
   @media (min-width: 640px) {
     .vis-container { gap: 16px; }
@@ -757,6 +759,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 8px;
     overflow: hidden;
     width: 100%;
+    flex-shrink: 0;
   }
   .vis-header {
     padding: 10px 14px;
@@ -802,10 +805,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     line-height: 1.5;
     padding: 10px 12px;
     resize: vertical;
-    min-height: 72px;
+    min-height: 84px;
     max-height: 240px;
     outline: none;
     width: 100%;
+    flex-shrink: 0;
     box-sizing: border-box;
     transition: border-color 0.15s;
   }
@@ -888,9 +892,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: var(--sans-font);
     font-size: 13px;
     font-weight: 500;
-    padding: 8px 16px;
+    padding: 10px 18px;
+    min-height: 38px;
     border-radius: 5px;
     cursor: pointer;
+    flex-shrink: 0;
     align-self: stretch;
     transition: opacity 0.15s ease;
   }
@@ -1038,7 +1044,7 @@ function navigateTab(tab) {
   document.getElementById('btnTabChat').className = 'seg-btn' + (tab === 'chat' ? ' active' : '');
   document.getElementById('btnTabVisualizer').className = 'seg-btn' + (tab === 'visualizer' ? ' active' : '');
   document.getElementById('tabChatView').style.display = tab === 'chat' ? 'flex' : 'none';
-  document.getElementById('tabVisualizerView').style.display = tab === 'visualizer' ? 'flex' : 'none';
+  document.getElementById('tabVisualizerView').style.display = tab === 'visualizer' ? 'block' : 'none';
 }
 
 function toggleSettingsTray() {
