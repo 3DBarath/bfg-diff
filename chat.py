@@ -1005,17 +1005,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="brand-title">BFG-Diff</span>
         <span class="brand-tag">v2</span>
       </div>
-
-      <!-- Preset Dropdown -->
-      <div class="preset-select-wrapper">
-        <select class="preset-dropdown" id="presetDropdown" onchange="onSelectPreset(this.value)">
-          <option value="balanced" selected>Preset: Balanced</option>
-          <option value="creative">Preset: Creative</option>
-          <option value="fast">Preset: Fast Lookahead</option>
-          <option value="greedy">Preset: Deterministic</option>
-        </select>
-        <span class="preset-caret">▼</span>
-      </div>
     </div>
 
     <div class="header-actions">
@@ -1025,7 +1014,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </nav>
       <button class="icon-btn" onclick="openSettingsModal()">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-        <span style="display:none;" class="settings-text">Settings</span>
+        <span class="settings-text">Settings</span>
       </button>
     </div>
   </header>
@@ -1038,6 +1027,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="modal-close-btn" onclick="closeSettingsModal()">✕</button>
       </div>
       <div class="modal-body">
+        <div class="modal-field">
+          <label>Engine Preset</label>
+          <select id="presetDropdown" onchange="onSelectPreset(this.value)" style="background:var(--bg); border:1px solid var(--border); color:var(--text-primary); font-family:var(--sans-font); font-size:12.5px; padding:7px 10px; border-radius:5px; outline:none; width:100%;">
+            <option value="balanced" selected>Balanced (Standard Lookahead)</option>
+            <option value="creative">Creative (T=0.7, Diverse Output)</option>
+            <option value="fast">Fast Lookahead (Large Blocks, Sub-steps=2)</option>
+            <option value="greedy">Deterministic (T=0.0, Exact Argmax)</option>
+          </select>
+        </div>
         <div class="modal-grid">
           <div class="modal-field">
             <label>Mode</label>
