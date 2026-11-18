@@ -304,17 +304,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   :root {
     --bg: #09090b;
-    --sidebar-bg: #040405;
-    --surface: #121215;
-    --surface-elevated: #1a1a1f;
-    --border: #222226;
-    --border-hover: #333339;
+    --surface: #111114;
+    --surface-elevated: #18181c;
+    --surface-hover: #1f1f24;
+    --border: #242429;
+    --border-hover: #36363e;
     --border-subtle: #19191d;
     --text-primary: #f4f4f5;
     --text-secondary: #a1a1aa;
     --text-tertiary: #52525b;
     --accent: #ffffff;
     --accent-contrast: #000000;
+    --token-bg: #141418;
+    --token-border: #27272f;
+    --token-highlight: #38bdf8;
     --mono-font: "Geist Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     --sans-font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
@@ -339,7 +342,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     -webkit-font-smoothing: antialiased;
   }
 
-  /* Main Viewport Layout */
   .app-frame {
     display: flex;
     flex-direction: column;
@@ -348,7 +350,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative;
   }
 
-  /* Fixed Clean Header */
+  /* Fixed Header */
   .top-header {
     height: 52px;
     min-height: 52px;
@@ -364,11 +366,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .top-header { padding: 0 24px; }
   }
 
-  .header-brand {
+  .header-left {
     display: flex;
     align-items: center;
-    gap: 8px;
-    cursor: default;
+    gap: 12px;
   }
   .brand-title {
     font-size: 14.5px;
@@ -386,13 +387,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 4px;
   }
 
+  /* Preset Dropdown in Header */
+  .preset-select-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .preset-dropdown {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-family: var(--sans-font);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 5px 24px 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    transition: all 0.15s ease;
+  }
+  .preset-dropdown:hover, .preset-dropdown:focus {
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+  }
+  .preset-caret {
+    position: absolute;
+    right: 8px;
+    pointer-events: none;
+    font-size: 9px;
+    color: var(--text-tertiary);
+  }
+
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
+  }
+  @media (min-width: 640px) {
+    .header-actions { gap: 10px; }
   }
 
-  /* Segmented Nav */
+  /* Segmented Navigation */
   .segmented-control {
     display: inline-flex;
     background: var(--surface);
@@ -420,7 +457,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .icon-btn {
-    background: transparent;
+    background: var(--surface);
     border: 1px solid var(--border);
     color: var(--text-secondary);
     font-size: 12px;
@@ -436,90 +473,116 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .icon-btn:hover {
     border-color: var(--border-hover);
     color: var(--text-primary);
-    background: var(--surface);
+    background: var(--surface-hover);
   }
 
-  /* Sliding Drawer / Settings Bar */
-  .settings-tray {
+  /* Modal Popup (Clean Dialog) */
+  .modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(4px);
+    z-index: 100;
     display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .modal-overlay.open {
+    display: flex;
+    animation: modalFadeIn 0.15s ease-out;
+  }
+  @keyframes modalFadeIn {
+    from { opacity: 0; transform: scale(0.98); }
+    to { opacity: 1; transform: scale(1); }
+  }
+
+  .modal-card {
     background: var(--surface);
+    border: 1px solid var(--border-hover);
+    border-radius: 10px;
+    width: 100%;
+    max-width: 440px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+  }
+  .modal-header {
+    padding: 14px 16px;
+    background: var(--surface-elevated);
     border-bottom: 1px solid var(--border);
-    padding: 12px 16px;
-    animation: traySlide 0.15s ease-out;
-    z-index: 15;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
   }
-  @media (min-width: 768px) {
-    .settings-tray { padding: 12px 24px; }
+  .modal-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-primary);
   }
-  @keyframes traySlide {
-    from { opacity: 0; transform: translateY(-6px); }
-    to { opacity: 1; transform: translateY(0); }
+  .modal-close-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-tertiary);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    line-height: 1;
   }
-  .settings-tray.open {
+  .modal-close-btn:hover { color: var(--text-primary); }
+
+  .modal-body {
+    padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
   }
-  .tray-presets {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .tray-presets::-webkit-scrollbar { display: none; }
-  .preset-pill {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-    font-size: 11.5px;
-    font-family: var(--sans-font);
-    padding: 3px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.15s;
-  }
-  .preset-pill:hover { border-color: var(--border-hover); color: var(--text-primary); }
-  .preset-pill.active {
-    background: var(--accent);
-    color: var(--accent-contrast);
-    border-color: var(--accent);
-    font-weight: 500;
-  }
-  .tray-grid {
+  .modal-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
-    gap: 10px;
+    gap: 12px;
   }
-  @media (min-width: 640px) {
-    .tray-grid { grid-template-columns: repeat(5, 1fr); }
-  }
-  .tray-field {
+  .modal-field {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 4px;
   }
-  .tray-field label {
+  .modal-field label {
     font-family: var(--mono-font);
-    font-size: 10px;
+    font-size: 10.5px;
     color: var(--text-tertiary);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .tray-field input, .tray-field select {
+  .modal-field input, .modal-field select {
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text-primary);
     font-family: var(--mono-font);
-    font-size: 12px;
-    padding: 5px 8px;
-    border-radius: 4px;
+    font-size: 12.5px;
+    padding: 7px 10px;
+    border-radius: 5px;
     outline: none;
+    transition: border-color 0.15s;
+    width: 100%;
+  }
+  .modal-field input:focus, .modal-field select:focus {
+    border-color: var(--border-hover);
+  }
+  .modal-footer {
+    padding: 12px 16px;
+    background: var(--surface-elevated);
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
   }
 
   /* -------------------------------------------------------------
-     FULLSCREEN CHAT INTERFACE (ChatGPT/Claude Style)
+     FULLSCREEN CHAT INTERFACE (ChatGPT Style)
      ------------------------------------------------------------- */
   #tabChatView {
     flex: 1;
@@ -563,12 +626,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
   }
-  .message-block.user {
-    justify-content: flex-end;
-  }
-  .message-block.assistant {
-    justify-content: flex-start;
-  }
+  .message-block.user { justify-content: flex-end; }
+  .message-block.assistant { justify-content: flex-start; }
 
   .message-content {
     display: flex;
@@ -630,12 +689,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     font-family: var(--mono-font);
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 600;
     color: var(--text-primary);
   }
   .welcome-title {
-    font-size: 18px;
+    font-size: 17px;
     font-weight: 600;
     letter-spacing: -0.02em;
     color: var(--text-primary);
@@ -646,7 +705,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     line-height: 1.5;
   }
 
-  /* Floating Bottom Input Deck */
+  /* Floating Bottom Composer Deck */
   .chat-composer-floating {
     position: absolute;
     bottom: 0;
@@ -673,13 +732,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex;
     align-items: flex-end;
     gap: 10px;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
     pointer-events: auto;
     transition: border-color 0.15s ease;
   }
-  .composer-capsule:focus-within {
-    border-color: var(--border-hover);
-  }
+  .composer-capsule:focus-within { border-color: var(--border-hover); }
 
   .chat-prompt-field {
     flex: 1;
@@ -687,7 +744,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: none;
     color: var(--text-primary);
     font-family: var(--sans-font);
-    font-size: 14.5px;
+    font-size: 14px;
     line-height: 1.45;
     padding: 6px 0;
     resize: none;
@@ -695,9 +752,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     max-height: 160px;
     outline: none;
   }
-  .chat-prompt-field::placeholder {
-    color: var(--text-tertiary);
-  }
+  .chat-prompt-field::placeholder { color: var(--text-tertiary); }
 
   .submit-circle-btn {
     width: 34px;
@@ -716,27 +771,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .submit-circle-btn:hover { opacity: 0.9; }
   .submit-circle-btn:active { transform: scale(0.96); }
   .submit-circle-btn:disabled { opacity: 0.2; cursor: not-allowed; }
-  .submit-circle-btn svg { width: 15px; height: 15px; fill: currentColor; }
+  .submit-circle-btn svg { width: 14px; height: 14px; fill: currentColor; }
 
   /* -------------------------------------------------------------
-     VISUALIZER TAB INTERFACE (Responsive & Auto-Sized)
+     VISUALIZER TAB INTERFACE (With Enhanced Block Trace)
      ------------------------------------------------------------- */
   #tabVisualizerView {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 14px 12px 60px 12px;
-    display: flex;
-    justify-content: center;
+    padding: 16px 14px 60px 14px;
+    display: none;
     -webkit-overflow-scrolling: touch;
     height: calc(100% - 52px);
     width: 100%;
   }
   @media (min-width: 640px) {
-    #tabVisualizerView { padding: 20px 20px 60px 20px; }
-  }
-  @media (min-width: 1024px) {
-    #tabVisualizerView { padding: 24px 32px 80px 32px; }
+    #tabVisualizerView { padding: 24px 20px 60px 20px; }
   }
 
   .vis-container {
@@ -744,13 +795,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     width: 100%;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     margin: 0 auto;
     align-items: stretch;
     height: fit-content;
-  }
-  @media (min-width: 640px) {
-    .vis-container { gap: 16px; }
   }
 
   .vis-card {
@@ -774,9 +822,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 12.5px;
     font-weight: 500;
     color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .vis-meta {
     font-family: var(--mono-font);
@@ -786,15 +831,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .vis-prompt-deck {
-    padding: 12px 14px;
+    padding: 14px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 12px;
   }
-  @media (min-width: 640px) {
-    .vis-prompt-deck { padding: 14px 16px; gap: 12px; }
-  }
-
   .vis-textarea {
     background: var(--bg);
     border: 1px solid var(--border);
@@ -818,8 +859,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .vis-split {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 12px;
+    gap: 14px;
     width: 100%;
+    flex-shrink: 0;
   }
   @media (min-width: 768px) {
     .vis-split {
@@ -829,62 +871,108 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .vis-output {
-    padding: 12px 14px;
+    padding: 14px;
     font-size: 13.5px;
     line-height: 1.55;
     color: var(--text-primary);
-    min-height: 90px;
+    min-height: 110px;
     max-height: 380px;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-word;
     box-sizing: border-box;
   }
-  @media (min-width: 640px) {
-    .vis-output { padding: 14px 16px; min-height: 120px; }
-  }
 
+  /* Enhanced Block-by-Block Visualization Trace */
   .trace-feed {
-    padding: 12px 14px;
+    padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    max-height: 480px;
+    gap: 16px;
+    max-height: 540px;
     overflow-y: auto;
   }
   .trace-block {
     background: var(--bg);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-    word-break: break-word;
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    animation: fadeIn 0.2s ease-out;
   }
-  .trace-sub-title {
+  .trace-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .trace-block-tag {
     font-family: var(--mono-font);
-    font-size: 10px;
-    text-transform: uppercase;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.02em;
+  }
+  .trace-block-stats {
+    font-family: var(--mono-font);
+    font-size: 11px;
     color: var(--text-tertiary);
-    margin-bottom: 6px;
-    letter-spacing: 0.04em;
+  }
+
+  .trace-steps-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
   .trace-step-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 4px 0;
+  }
+  .trace-step-label {
     font-family: var(--mono-font);
     font-size: 11px;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    min-width: 48px;
+    padding-top: 3px;
+    flex-shrink: 0;
+  }
+  .token-cluster {
     display: flex;
-    gap: 6px;
-    align-items: baseline;
     flex-wrap: wrap;
-    line-height: 1.8;
+    gap: 6px;
+    align-items: center;
   }
-  .token-tag {
-    padding: 1px 5px;
-    background: var(--surface-elevated);
-    border: 1px solid var(--border);
-    border-radius: 3px;
+  .token-pill {
+    padding: 3px 8px;
+    background: var(--token-bg);
+    border: 1px solid var(--token-border);
+    border-radius: 4px;
+    font-family: var(--mono-font);
+    font-size: 12px;
     color: var(--text-secondary);
-    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    white-space: pre-wrap;
     word-break: break-all;
+    transition: all 0.15s ease;
   }
+  .token-pill.verified {
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.2);
+    background: var(--surface-elevated);
+  }
+  .token-pill.active-frontier {
+    border-color: rgba(56, 189, 248, 0.5);
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.08);
+  }
+
   .btn-execute {
     background: var(--accent);
     color: var(--accent-contrast);
@@ -910,57 +998,75 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div class="app-frame">
-  <!-- Minimal Header -->
+  <!-- Top Navigation Header -->
   <header class="top-header">
-    <div class="header-brand">
-      <span class="brand-title">BFG-Diff</span>
-      <span class="brand-tag">v2</span>
+    <div class="header-left">
+      <div class="header-brand" style="display:flex; align-items:center; gap:8px;">
+        <span class="brand-title">BFG-Diff</span>
+        <span class="brand-tag">v2</span>
+      </div>
+
+      <!-- Preset Dropdown -->
+      <div class="preset-select-wrapper">
+        <select class="preset-dropdown" id="presetDropdown" onchange="onSelectPreset(this.value)">
+          <option value="balanced" selected>Preset: Balanced</option>
+          <option value="creative">Preset: Creative</option>
+          <option value="fast">Preset: Fast Lookahead</option>
+          <option value="greedy">Preset: Deterministic</option>
+        </select>
+        <span class="preset-caret">▼</span>
+      </div>
     </div>
+
     <div class="header-actions">
       <nav class="segmented-control">
         <button class="seg-btn active" id="btnTabChat" onclick="navigateTab('chat')">Chat</button>
         <button class="seg-btn" id="btnTabVisualizer" onclick="navigateTab('visualizer')">Visualizer</button>
       </nav>
-      <button class="icon-btn" onclick="toggleSettingsTray()">
+      <button class="icon-btn" onclick="openSettingsModal()">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-        <span>Settings</span>
+        <span style="display:none;" class="settings-text">Settings</span>
       </button>
     </div>
   </header>
 
-  <!-- Sliding Config Tray -->
-  <div class="settings-tray" id="settingsTray">
-    <div class="tray-presets">
-      <span style="font-family:var(--mono-font); font-size:10.5px; color:var(--text-tertiary); text-transform:uppercase;">Preset:</span>
-      <button class="preset-pill active" onclick="activatePreset('balanced')">Balanced</button>
-      <button class="preset-pill" onclick="activatePreset('creative')">Creative (T=0.7)</button>
-      <button class="preset-pill" onclick="activatePreset('fast')">Fast Lookahead</button>
-      <button class="preset-pill" onclick="activatePreset('greedy')">Deterministic</button>
-      <button class="preset-pill" onclick="clearConversation()" style="margin-left:auto; color:#ef4444; border-color:#3f1414;">Reset History</button>
-    </div>
-    <div class="tray-grid">
-      <div class="tray-field">
-        <label>Mode</label>
-        <select id="cfgMode">
-          <option value="chat" selected>ChatML</option>
-          <option value="completion">Raw</option>
-        </select>
+  <!-- Clean Modal Settings Popup -->
+  <div class="modal-overlay" id="settingsModal" onclick="onModalOverlayClick(event)">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span class="modal-title">Engine Parameters</span>
+        <button class="modal-close-btn" onclick="closeSettingsModal()">✕</button>
       </div>
-      <div class="tray-field">
-        <label>Canvas Tokens</label>
-        <input type="number" id="cfgCanvas" value="32" min="8" max="256" step="8">
+      <div class="modal-body">
+        <div class="modal-grid">
+          <div class="modal-field">
+            <label>Mode</label>
+            <select id="cfgMode">
+              <option value="chat" selected>ChatML</option>
+              <option value="completion">Raw</option>
+            </select>
+          </div>
+          <div class="modal-field">
+            <label>Temperature</label>
+            <input type="number" id="cfgTemp" value="0.3" min="0.0" max="1.5" step="0.1">
+          </div>
+          <div class="modal-field">
+            <label>Canvas Tokens</label>
+            <input type="number" id="cfgCanvas" value="32" min="8" max="256" step="8">
+          </div>
+          <div class="modal-field">
+            <label>Sub-Block Size</label>
+            <input type="number" id="cfgSubCanvas" value="8" min="4" max="32" step="4">
+          </div>
+          <div class="modal-field" style="grid-column: span 2;">
+            <label>Diffusion Sub-Steps</label>
+            <input type="number" id="cfgSubSteps" value="4" min="1" max="16" step="1">
+          </div>
+        </div>
       </div>
-      <div class="tray-field">
-        <label>Sub-Block Size</label>
-        <input type="number" id="cfgSubCanvas" value="8" min="4" max="32" step="4">
-      </div>
-      <div class="tray-field">
-        <label>Sub-Steps</label>
-        <input type="number" id="cfgSubSteps" value="4" min="1" max="16" step="1">
-      </div>
-      <div class="tray-field">
-        <label>Temperature</label>
-        <input type="number" id="cfgTemp" value="0.3" min="0.0" max="1.5" step="0.1">
+      <div class="modal-footer">
+        <button class="icon-btn" onclick="clearConversation()" style="color:#ef4444; border-color:#3f1414;">Reset Chat History</button>
+        <button class="btn-execute" onclick="closeSettingsModal()" style="align-self:center; min-height:32px; padding:6px 14px;">Done</button>
       </div>
     </div>
   </div>
@@ -972,12 +1078,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="chat-welcome" id="chatWelcome">
           <div class="welcome-logo">BD</div>
           <div class="welcome-title">BFG-Diff Discrete Diffusion</div>
-          <div class="welcome-sub">Ask a question, brainstorm ideas, or write code. Past messages are preserved across turns.</div>
+          <div class="welcome-sub">Ask a question or brainstorm ideas. Previous turns are remembered across messages.</div>
         </div>
       </div>
     </div>
 
-    <!-- Floating Bottom Composer Deck -->
+    <!-- Floating Bottom Composer -->
     <div class="chat-composer-floating">
       <div class="composer-capsule">
         <textarea class="chat-prompt-field" id="chatInputText" placeholder="Message BFG-Diff..." rows="1"></textarea>
@@ -988,8 +1094,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- TAB 2: VISUALIZER -->
-  <section id="tabVisualizerView" style="display: none;">
+  <!-- TAB 2: VISUALIZER (Clean Block Unmasking) -->
+  <section id="tabVisualizerView">
     <div class="vis-container">
       <div class="vis-card">
         <div class="vis-prompt-deck">
@@ -1047,15 +1153,21 @@ function navigateTab(tab) {
   document.getElementById('tabVisualizerView').style.display = tab === 'visualizer' ? 'block' : 'none';
 }
 
-function toggleSettingsTray() {
-  const tray = document.getElementById('settingsTray');
-  tray.classList.toggle('open');
+function openSettingsModal() {
+  document.getElementById('settingsModal').classList.add('open');
 }
 
-function activatePreset(preset) {
-  document.querySelectorAll('.preset-pill').forEach(p => p.classList.remove('active'));
-  if (event && event.target) event.target.classList.add('active');
+function closeSettingsModal() {
+  document.getElementById('settingsModal').classList.remove('open');
+}
 
+function onModalOverlayClick(e) {
+  if (e.target.id === 'settingsModal') {
+    closeSettingsModal();
+  }
+}
+
+function onSelectPreset(preset) {
   const cLen = document.getElementById('cfgCanvas');
   const scLen = document.getElementById('cfgSubCanvas');
   const scSteps = document.getElementById('cfgSubSteps');
@@ -1080,13 +1192,13 @@ function clearConversation() {
     <div class="chat-welcome" id="chatWelcome">
       <div class="welcome-logo">BD</div>
       <div class="welcome-title">BFG-Diff Discrete Diffusion</div>
-      <div class="welcome-sub">Ask a question, brainstorm ideas, or write code. Past messages are preserved across turns.</div>
+      <div class="welcome-sub">Ask a question or brainstorm ideas. Previous turns are remembered across messages.</div>
     </div>
   `;
-  document.getElementById('settingsTray').classList.remove('open');
+  closeSettingsModal();
 }
 
-// Auto-grow textarea like ChatGPT
+// Auto-grow textarea
 const chatInputArea = document.getElementById('chatInputText');
 chatInputArea.addEventListener('input', function() {
   this.style.height = 'auto';
@@ -1119,7 +1231,6 @@ async function transmitChatMessage() {
   const flow = document.getElementById('conversationFlow');
   const viewport = document.getElementById('chatViewport');
 
-  // User message block
   const userBlock = document.createElement('div');
   userBlock.className = 'message-block user';
   userBlock.innerHTML = `
@@ -1129,7 +1240,6 @@ async function transmitChatMessage() {
   `;
   flow.appendChild(userBlock);
 
-  // Assistant stream block
   const botBlock = document.createElement('div');
   botBlock.className = 'message-block assistant';
   const replySpanId = 'replySpan_' + Date.now();
@@ -1288,17 +1398,37 @@ async function runVisualizerComparison() {
           if (!blockMap[evt.block_idx]) {
             const bDiv = document.createElement('div');
             bDiv.className = 'trace-block';
-            bDiv.innerHTML = '<div class="trace-sub-title">Sub-Block ' + (evt.block_idx + 1) + '</div>';
+            bDiv.innerHTML = `
+              <div class="trace-block-header">
+                <span class="trace-block-tag">Sub-Block ${evt.block_idx + 1}</span>
+                <span class="trace-block-stats" id="blockStats_${evt.block_idx}"></span>
+              </div>
+              <div class="trace-steps-container" id="stepsContainer_${evt.block_idx}"></div>
+            `;
             traceFeed.appendChild(bDiv);
             blockMap[evt.block_idx] = bDiv;
           }
 
-          const bDiv = blockMap[evt.block_idx];
+          const stepsBox = document.getElementById('stepsContainer_' + evt.block_idx);
+          const statsBox = document.getElementById('blockStats_' + evt.block_idx);
+          if (statsBox) {
+            statsBox.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.elapsed.toFixed(2)}s`;
+          }
+
           const row = document.createElement('div');
           row.className = 'trace-step-row';
-          const chips = evt.tokens.map(t => '<span class="token-tag">' + escapeHtml(t) + '</span>').join(' ');
-          row.innerHTML = '<span style="color:var(--text-tertiary); min-width:40px;">P' + evt.step + '</span>' + chips;
-          bDiv.appendChild(row);
+
+          const chipsHtml = evt.tokens.map((tok, idx) => {
+            const isFrontier = (idx === evt.tokens.length - 1);
+            const cls = isFrontier ? 'token-pill active-frontier' : 'token-pill verified';
+            return `<span class="${cls}">${escapeHtml(tok)}</span>`;
+          }).join('');
+
+          row.innerHTML = `
+            <span class="trace-step-label">Pass ${evt.step}</span>
+            <div class="token-cluster">${chipsHtml}</div>
+          `;
+          stepsBox.appendChild(row);
         } else if (evt.type === 'bfg_done') {
           bfgOut.innerText = evt.bfg.text;
           bfgMeta.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
