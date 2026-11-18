@@ -514,11 +514,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--surface-elevated);
     border: 1px solid var(--border-hover);
     border-radius: 6px;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-    z-index: 150;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.7);
+    z-index: 200;
     display: none;
     flex-direction: column;
-    overflow: hidden;
+    max-height: 240px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
   }
   .custom-menu-options.open {
     display: flex;
@@ -585,7 +590,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     width: 100%;
     max-width: 440px;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
-    overflow: hidden;
+    overflow: visible;
+    position: relative;
   }
   .modal-header {
     padding: 14px 16px;
@@ -1113,43 +1119,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
             </div>
             <div class="custom-menu-options" id="customPresetOptions">
-              <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', '⚡ Balanced (Standard)')">
+              <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', 'Balanced Standard', this)">
                 <div>
                   <div style="font-weight:500;">Balanced Standard</div>
                   <div class="item-sub">T=0.3 · 4 passes · calibrated lookahead</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('snappy', '⚡ Snappy Chat (<1s)')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('snappy', 'Snappy Low-Latency', this)">
                 <div>
                   <div style="font-weight:500;">Snappy Low-Latency</div>
                   <div class="item-sub">T=0.2 · 2 passes · immediate stop termination</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('branching', '🌿 Multi-Branch Speculative (Pillar 4)')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('branching', 'Multi-Branch Speculative', this)">
                 <div>
                   <div style="font-weight:500;">Multi-Branch Speculative</div>
                   <div class="item-sub">2-branch micro-tree · parallel runner-up exploration</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('code', '💻 Code & Precision JSON')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('code', 'Code & Strict Syntax', this)">
                 <div>
                   <div style="font-weight:500;">Code & Strict Syntax</div>
                   <div class="item-sub">T=0.0 · strict tau=0.4 · zero hallucinations</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('infill', '🧩 Maximum Infilling (200+ TPS)')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('infill', 'High-Throughput Infilling', this)">
                 <div>
                   <div style="font-weight:500;">High-Throughput Infilling</div>
                   <div class="item-sub">C=32 · sub-blocks=32 · parallel span completion</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('creative', '🎨 Creative Writing')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative Narrative', this)">
                 <div>
                   <div style="font-weight:500;">Creative Narrative</div>
                   <div class="item-sub">T=0.7 · anti-loop frequency suppression</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', '🎯 Pure Deterministic')">
+              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Pure Deterministic', this)">
                 <div>
                   <div style="font-weight:500;">Pure Argmax</div>
                   <div class="item-sub">T=0.0 · exact greedy decoding for benchmarks</div>
@@ -1303,10 +1309,10 @@ function toggleCustomPresetMenu() {
   trigger.classList.toggle('active');
 }
 
-function pickCustomPreset(val, label) {
+function pickCustomPreset(val, label, el) {
   document.getElementById('customPresetSelectedLabel').innerText = label;
-  document.querySelectorAll('.custom-menu-item').forEach(el => el.classList.remove('selected'));
-  if (event && event.currentTarget) event.currentTarget.classList.add('selected');
+  document.querySelectorAll('.custom-menu-item').forEach(item => item.classList.remove('selected'));
+  if (el) el.classList.add('selected');
   document.getElementById('customPresetOptions').classList.remove('open');
   document.getElementById('customPresetTrigger').classList.remove('active');
   onSelectPreset(val);
