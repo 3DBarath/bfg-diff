@@ -1095,6 +1095,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <nav class="segmented-control">
         <button class="seg-btn active" id="btnTabChat" onclick="navigateTab('chat')">Chat</button>
         <button class="seg-btn" id="btnTabVisualizer" onclick="navigateTab('visualizer')">Visualizer</button>
+        <button class="seg-btn" id="btnTabManual" onclick="navigateTab('manual')">Manual</button>
       </nav>
       <button class="icon-btn" onclick="openSettingsModal()">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -1267,6 +1268,167 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
   </section>
+
+  <!-- TAB 3: SYSTEM MANUAL & ARCHITECTURE REFERENCE -->
+  <section id="tabManualView" style="display: none; flex: 1; overflow-y: auto; padding: 20px 16px 80px 16px; justify-content: center;">
+    <div style="max-width: 860px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 20px;">
+
+      <div class="vis-card">
+        <div class="vis-header">
+          <span class="vis-title">Architecture Overview</span>
+          <span class="vis-meta">BFG-Diff v2 · Fused Staircase Engine</span>
+        </div>
+        <div style="padding: 18px 20px; font-size: 13.5px; line-height: 1.65; color: var(--text-primary); display: flex; flex-direction: column; gap: 12px;">
+          <p>
+            Standard language models generate text strictly sequentially (one forward pass per token). 
+            <strong>BFG-Diff</strong> transforms a pretrained causal transformer into a discrete block-diffusion engine, evaluating and verifying multiple tokens in parallel blocks across 2 to 4 forward steps.
+          </p>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 6px;">
+            <div style="background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px;">
+              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #38bdf8; margin-bottom: 4px;">Zone A: Causal Verification</div>
+              <p style="font-size: 12.5px; color: var(--text-secondary);">
+                Evaluates prior draft tokens under a strictly causal attention mask. Completely isolated from trailing mask tokens (zero attention leakage).
+              </p>
+            </div>
+            <div style="background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px;">
+              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #a855f7; margin-bottom: 4px;">Zone B: Lookahead Diffusion</div>
+              <p style="font-size: 12.5px; color: var(--text-secondary);">
+                Simultaneously diffuses future tokens on lookahead positions using bidirectional attention in the exact same forward pass.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="vis-card">
+        <div class="vis-header">
+          <span class="vis-title">Engine Parameters & Controls Guide</span>
+          <span class="vis-meta">Fine-Tuning Decoding Mechanics</span>
+        </div>
+        <div style="padding: 16px 20px; font-size: 13px; line-height: 1.6; color: var(--text-secondary); display: flex; flex-direction: column; gap: 16px;">
+          <div>
+            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              1. Canvas Tokens (<code style="color:#38bdf8;">canvas_len</code>)
+            </div>
+            <p>
+              The maximum total length of output text to generate (e.g., 24, 32, 48 tokens). When stop tokens like <code>&lt;|im_end|&gt;</code> are carrier-verified in chat mode, generation terminates early to save latency.
+            </p>
+          </div>
+
+          <div>
+            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              2. Sub-Block Size (<code style="color:#38bdf8;">sub_canvas_len</code>)
+            </div>
+            <p>
+              The size of the sliding parallel attention window. A size of <strong>8</strong> offers tight left-carrier grounding and lowest repetition. Larger windows (<strong>16</strong> or <strong>32</strong>) increase throughput for span infilling by batching more positions into GPU matrix multiplications.
+            </p>
+          </div>
+
+          <div>
+            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              3. Diffusion Sub-Steps (<code style="color:#38bdf8;">sub_steps</code>)
+            </div>
+            <p>
+              The number of iterative forward passes allowed per sub-block. 
+              <strong>4 steps</strong> provides maximum token precision and grammar stability. 
+              <strong>2 steps</strong> cuts latency in half for snappy, sub-second responses.
+            </p>
+          </div>
+
+          <div>
+            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              4. Lookahead Tau (<code style="color:#38bdf8;">tau</code>)
+            </div>
+            <p>
+              Calibrated energy difference tolerance: <code>(z_top - z_draft) &le; &tau;</code>. 
+              Controls how confident the model must be to accept speculative lookahead tokens. Lower values (<strong>0.4</strong>) enforce strict conservative acceptance (ideal for code). Higher values (<strong>0.8 &ndash; 1.0</strong>) accept more tokens in parallel.
+            </p>
+          </div>
+
+          <div>
+            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              5. 2-Branch Micro-Tree Verification (<code style="color:#38bdf8;">enable_branching</code> &middot; Pillar 4)
+            </div>
+            <p>
+              When the primary draft token has a narrow margin over runner-up candidates, the engine forks Zone A into two parallel hypothesis branches evaluated under a 2D tree mask. If branch 2 wins, its KV states are copied in-place, preventing draft rejections.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="vis-card">
+        <div class="vis-header">
+          <span class="vis-title">Specialized Presets Reference</span>
+          <span class="vis-meta">Pre-Calibrated Profiles</span>
+        </div>
+        <div style="padding: 16px 20px; font-size: 13px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 14px;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border); color: var(--text-primary); font-family: var(--mono-font);">
+                <th style="padding: 8px 6px;">Preset</th>
+                <th style="padding: 8px 6px;">Temp</th>
+                <th style="padding: 8px 6px;">Steps</th>
+                <th style="padding: 8px 6px;">&tau;</th>
+                <th style="padding: 8px 6px;">Best Use Case</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Balanced Standard</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.3</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
+                <td style="padding: 8px 6px;">General dialogue, high fluency, low repetition.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Snappy Low-Latency</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.2</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">2</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
+                <td style="padding: 8px 6px;">Sub-second answers with aggressive stop termination.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Multi-Branch (Pillar 4)</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.2</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.9</td>
+                <td style="padding: 8px 6px;">Speculative 2-branch micro-tree exploration.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Code & Strict Syntax</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.4</td>
+                <td style="padding: 8px 6px;">JSON, Python, brackets, and deterministic code logic.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">High-Throughput Infilling</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.1</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
+                <td style="padding: 8px 6px;">Parallel span completion (200+ TPS on GPU).</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Creative Narrative</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.7</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
+                <td style="padding: 8px 6px;">Maximum lexical variety and open-ended writing.</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Pure Argmax</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
+                <td style="padding: 8px 6px;">Exact greedy decoding for formal benchmarks.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </section>
 </div>
 
 <script>
@@ -1283,8 +1445,10 @@ function navigateTab(tab) {
   currentActiveTab = tab;
   document.getElementById('btnTabChat').className = 'seg-btn' + (tab === 'chat' ? ' active' : '');
   document.getElementById('btnTabVisualizer').className = 'seg-btn' + (tab === 'visualizer' ? ' active' : '');
+  document.getElementById('btnTabManual').className = 'seg-btn' + (tab === 'manual' ? ' active' : '');
   document.getElementById('tabChatView').style.display = tab === 'chat' ? 'flex' : 'none';
   document.getElementById('tabVisualizerView').style.display = tab === 'visualizer' ? 'block' : 'none';
+  document.getElementById('tabManualView').style.display = tab === 'manual' ? 'flex' : 'none';
 }
 
 function openSettingsModal() {
