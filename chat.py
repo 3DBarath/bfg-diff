@@ -297,539 +297,570 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>BFG-Diff v2 - Visualizer & Multi-Turn Chat</title>
+<title>BFG-Diff Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #090d16;
-    --card: #131c2e;
-    --card-hover: #1a263d;
-    --border: #23324d;
-    --primary: #38bdf8;
-    --primary-glow: rgba(56, 189, 248, 0.2);
-    --text: #f1f5f9;
-    --muted: #94a3b8;
-    --mask: #334155;
-    --accent: #a855f7;
-    --user-msg: #1e293b;
-    --bot-msg: #0f1f38;
-    --success: #10b981;
+    --bg: #000000;
+    --surface: #0a0a0a;
+    --surface-elevated: #111111;
+    --border: #222222;
+    --border-hover: #333333;
+    --text-primary: #ededed;
+    --text-secondary: #888888;
+    --text-tertiary: #555555;
+    --accent: #ffffff;
+    --accent-dim: #262626;
+    --mono-font: "Geist Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans-font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+
   body {
     background-color: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    padding: 10px;
+    color: var(--text-primary);
+    font-family: var(--sans-font);
+    font-size: 14px;
+    line-height: 1.5;
+    letter-spacing: -0.01em;
+    padding: 20px 16px;
     display: flex;
     justify-content: center;
-    -webkit-font-smoothing: antialiased;
     min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
   }
-  @media (min-width: 600px) {
-    body { padding: 16px; }
-  }
-  .container {
-    max-width: 960px;
+
+  .shell {
+    max-width: 880px;
     width: 100%;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
+    gap: 20px;
   }
-  header {
+
+  /* Top Navigation Bar */
+  .top-bar {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    margin-bottom: 14px;
+    gap: 16px;
+    padding-bottom: 16px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 12px;
   }
   @media (min-width: 640px) {
-    header {
+    .top-bar {
       flex-direction: row;
       justify-content: space-between;
       align-items: center;
     }
   }
-  .header-left h1 {
-    font-size: 18px;
-    color: var(--primary);
+
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .brand-name {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+  }
+  .brand-version {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+
+  .segmented-nav {
+    display: inline-flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px;
+  }
+  .nav-item {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-family: var(--sans-font);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.15s, background-color 0.15s;
+    white-space: nowrap;
+  }
+  .nav-item:hover {
+    color: var(--text-primary);
+  }
+  .nav-item.active {
+    background: var(--surface-elevated);
+    color: var(--text-primary);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+  }
+
+  /* Parameter Strip */
+  .config-strip {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .preset-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    letter-spacing: -0.3px;
-  }
-  @media (min-width: 600px) {
-    .header-left h1 { font-size: 22px; }
-  }
-  .header-left h1 span.badge {
-    font-size: 10px;
-    background: var(--primary-glow);
-    color: var(--primary);
-    border: 1px solid var(--primary);
-    padding: 2px 6px;
-    border-radius: 4px;
-    text-transform: uppercase;
-    font-weight: 700;
-  }
-  p.subtitle { margin-top: 3px; color: var(--muted); font-size: 12px; }
-
-  /* Navigation Tabs */
-  .tabs-nav {
-    display: flex;
-    gap: 4px;
-    background: var(--card);
-    padding: 3px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    width: 100%;
-  }
-  @media (min-width: 640px) {
-    .tabs-nav { width: auto; }
-  }
-  .tab-btn {
-    flex: 1;
-    background: transparent;
-    border: none;
-    color: var(--muted);
-    font-weight: 600;
-    font-size: 12px;
-    padding: 8px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.2s;
-    text-align: center;
-    white-space: nowrap;
-  }
-  @media (min-width: 600px) {
-    .tab-btn { font-size: 13px; padding: 8px 16px; flex: initial; }
-  }
-  .tab-btn.active {
-    background: var(--primary);
-    color: #090d16;
-    box-shadow: 0 2px 8px var(--primary-glow);
-    font-weight: 700;
-  }
-
-  /* Preset Pills */
-  .preset-bar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
     overflow-x: auto;
-    padding-bottom: 6px;
-    margin-bottom: 12px;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    padding-bottom: 2px;
   }
-  .preset-bar::-webkit-scrollbar { display: none; }
+  .preset-row::-webkit-scrollbar { display: none; }
   .preset-label {
     font-size: 11px;
-    color: var(--muted);
-    font-weight: 700;
+    font-family: var(--mono-font);
+    color: var(--text-tertiary);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
     white-space: nowrap;
+    letter-spacing: 0.04em;
   }
-  .preset-pill {
-    background: var(--card);
+  .preset-btn {
+    background: transparent;
     border: 1px solid var(--border);
-    color: var(--text);
-    padding: 5px 11px;
-    border-radius: 16px;
+    color: var(--text-secondary);
+    font-family: var(--sans-font);
     font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 4px;
     cursor: pointer;
-    transition: all 0.2s;
     white-space: nowrap;
-    flex-shrink: 0;
+    transition: all 0.15s;
   }
-  .preset-pill:hover, .preset-pill.active {
-    border-color: var(--primary);
-    color: var(--primary);
-    background: var(--primary-glow);
+  .preset-btn:hover {
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+  }
+  .preset-btn.active {
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
+    font-weight: 500;
   }
 
-  /* Parameter Controls */
-  .controls {
-    background: var(--card);
-    padding: 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    margin-bottom: 14px;
+  .params-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     gap: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
   }
   @media (min-width: 640px) {
-    .controls {
-      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    .params-grid {
+      grid-template-columns: repeat(5, 1fr);
       gap: 12px;
-      padding: 14px;
     }
   }
-  .control-group {
+
+  .field-group {
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
-  label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-  input, select, textarea, button {
-    background: #090d16;
+  .field-label {
+    font-family: var(--mono-font);
+    font-size: 10px;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .field-input, .field-select {
+    background: var(--surface-elevated);
     border: 1px solid var(--border);
-    color: var(--text);
-    padding: 8px 10px;
-    border-radius: 6px;
-    font-size: 14px;
-    box-sizing: border-box;
-    width: 100%;
-  }
-  input:focus, select:focus, textarea:focus {
-    outline: none;
-    border-color: var(--primary);
-  }
-  button.action-btn {
-    background: var(--primary);
-    color: #090d16;
-    font-weight: 700;
-    cursor: pointer;
-    border: none;
-    padding: 10px 18px;
-    border-radius: 6px;
-    font-size: 14px;
-    transition: all 0.2s;
-    width: 100%;
-  }
-  @media (min-width: 600px) {
-    button.action-btn { width: auto; }
-  }
-  button.action-btn:hover { opacity: 0.9; }
-  button.action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  button.secondary-btn {
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid var(--border);
-    font-weight: 600;
-    cursor: pointer;
-    padding: 6px 12px;
-    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: var(--mono-font);
     font-size: 12px;
-    transition: all 0.2s;
-    width: auto;
+    padding: 6px 8px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.15s;
+    width: 100%;
   }
-  button.secondary-btn:hover {
-    color: var(--text);
-    border-color: var(--muted);
+  .field-input:focus, .field-select:focus {
+    border-color: var(--border-hover);
   }
 
-  /* Visualizer Cards */
-  .prompt-card {
-    background: var(--card);
-    padding: 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    margin-bottom: 14px;
+  /* Buttons */
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    font-family: var(--sans-font);
+    font-size: 13px;
+    font-weight: 500;
+    padding: 8px 16px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    width: 100%;
   }
-  .results { display: flex; flex-direction: column; gap: 14px; }
-  .comparison-grid {
+  @media (min-width: 640px) {
+    .btn-primary { width: auto; }
+  }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-family: var(--sans-font);
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-ghost:hover {
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+  }
+
+  /* Workspace Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .card-header {
+    padding: 10px 14px;
+    background: var(--surface-elevated);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .card-title {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    letter-spacing: -0.01em;
+  }
+  .telemetry-chip {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+
+  .prompt-box {
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .prompt-textarea {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: var(--sans-font);
+    font-size: 13.5px;
+    line-height: 1.5;
+    padding: 10px 12px;
+    resize: vertical;
+    min-height: 80px;
+    outline: none;
+    transition: border-color 0.15s;
+    width: 100%;
+  }
+  .prompt-textarea:focus { border-color: var(--border-hover); }
+
+  /* Output Comparison */
+  .comparison-split {
     display: grid;
     grid-template-columns: 1fr;
     gap: 12px;
   }
   @media (min-width: 768px) {
-    .comparison-grid { grid-template-columns: 1fr 1fr; }
+    .comparison-split { grid-template-columns: 1fr 1fr; }
   }
-  .model-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .model-title {
-    background: rgba(0,0,0,0.25);
-    padding: 10px 12px;
-    font-size: 13px;
-    font-weight: 700;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .metric-badge {
-    font-family: monospace;
-    font-size: 11px;
-    background: rgba(56, 189, 248, 0.15);
-    color: var(--primary);
-    padding: 2px 6px;
-    border-radius: 4px;
-    border: 1px solid rgba(56, 189, 248, 0.3);
-  }
-  .output-box {
-    padding: 12px;
-    min-height: 90px;
-    line-height: 1.5;
-    font-size: 13px;
+  .output-view {
+    padding: 14px;
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text-primary);
+    min-height: 120px;
     white-space: pre-wrap;
     word-break: break-word;
-    color: #e2e8f0;
   }
-  .trace-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-  }
-  .trace-title {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--muted);
-    margin-bottom: 8px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  .trace-block {
-    background: #090d16;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px;
-    margin-bottom: 8px;
-  }
-  .trace-step {
-    font-family: monospace;
-    font-size: 11px;
-    margin-bottom: 4px;
+
+  /* Execution Trace */
+  .trace-container {
+    padding: 12px 14px;
     display: flex;
-    gap: 6px;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .trace-sub-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 8px 10px;
+  }
+  .trace-header {
+    font-family: var(--mono-font);
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    margin-bottom: 6px;
+    letter-spacing: 0.04em;
+  }
+  .trace-row {
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+    display: flex;
+    gap: 8px;
     align-items: baseline;
     flex-wrap: wrap;
+    line-height: 1.8;
   }
-  .token-chip {
-    padding: 1px 4px;
+  .chip {
+    padding: 1px 5px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border);
     border-radius: 3px;
-    background: #1e293b;
-    border: 1px solid #334155;
-    color: #cbd5e1;
+    color: var(--text-secondary);
     font-size: 11px;
   }
 
-  /* Multi-Turn Chat UI */
-  .chat-pane {
+  /* Multi-Turn Chat View */
+  .chat-wrapper {
+    height: calc(100vh - 200px);
+    min-height: 480px;
+    max-height: 720px;
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 220px);
-    min-height: 420px;
-    max-height: 680px;
-    background: var(--card);
+    background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
   }
-  .chat-header {
-    padding: 10px 14px;
-    background: rgba(0, 0, 0, 0.2);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-  }
-  .chat-messages {
+  .chat-feed {
     flex: 1;
     overflow-y: auto;
-    padding: 12px;
+    padding: 16px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
   }
-  .msg-row {
+  .message-unit {
     display: flex;
     flex-direction: column;
-    max-width: 90%;
+    max-width: 86%;
   }
-  @media (min-width: 600px) {
-    .msg-row { max-width: 82%; }
-  }
-  .msg-row.user {
+  .message-unit.user {
     align-self: flex-end;
   }
-  .msg-row.assistant {
+  .message-unit.assistant {
     align-self: flex-start;
   }
-  .msg-sender {
+  .message-meta {
+    font-family: var(--mono-font);
     font-size: 10px;
-    font-weight: 700;
-    color: var(--muted);
-    margin-bottom: 3px;
+    color: var(--text-tertiary);
     text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
   }
-  .msg-row.user .msg-sender { text-align: right; color: var(--primary); }
-  .msg-bubble {
-    padding: 9px 13px;
-    border-radius: 8px;
+  .message-unit.user .message-meta {
+    text-align: right;
+  }
+  .message-body {
+    padding: 10px 14px;
+    border-radius: 6px;
     font-size: 13.5px;
-    line-height: 1.45;
+    line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .msg-row.user .msg-bubble {
-    background: var(--user-msg);
+  .message-unit.user .message-body {
+    background: var(--surface-elevated);
     border: 1px solid var(--border);
-    color: #fff;
-    border-top-right-radius: 2px;
+    color: var(--text-primary);
   }
-  .msg-row.assistant .msg-bubble {
-    background: var(--bot-msg);
-    border: 1px solid rgba(56, 189, 248, 0.25);
-    color: #e2e8f0;
-    border-top-left-radius: 2px;
+  .message-unit.assistant .message-body {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
   }
-  .msg-stats {
+  .message-telemetry {
+    font-family: var(--mono-font);
     font-size: 10.5px;
-    font-family: monospace;
-    color: var(--muted);
-    margin-top: 3px;
+    color: var(--text-tertiary);
+    margin-top: 4px;
   }
-  .chat-input-bar {
-    padding: 10px 12px;
+
+  .chat-input-deck {
+    padding: 12px 14px;
     border-top: 1px solid var(--border);
-    background: rgba(0, 0, 0, 0.25);
+    background: var(--surface-elevated);
     display: flex;
-    gap: 8px;
+    gap: 10px;
     align-items: flex-end;
   }
-  .chat-input-bar textarea {
+  .chat-textarea {
     flex: 1;
-    min-height: 42px;
-    max-height: 100px;
-    resize: none;
-    line-height: 1.4;
-    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-primary);
+    font-family: var(--sans-font);
     font-size: 13.5px;
+    line-height: 1.45;
+    padding: 8px 12px;
+    resize: none;
+    min-height: 40px;
+    max-height: 110px;
+    outline: none;
   }
-  .chat-input-bar button {
-    width: auto;
-    padding: 10px 16px;
-    flex-shrink: 0;
-  }
-  .empty-state {
-    text-align: center;
-    color: var(--muted);
+  .chat-textarea:focus { border-color: var(--border-hover); }
+
+  .chat-placeholder {
     margin: auto;
-    font-size: 13px;
+    text-align: center;
+    color: var(--text-tertiary);
+    font-size: 12.5px;
+    font-family: var(--mono-font);
     padding: 20px;
-    line-height: 1.5;
   }
 </style>
 </head>
 <body>
 
-<div class="container">
-  <header>
-    <div class="header-left">
-      <h1>BFG-Diff v2 <span class="badge">Live</span></h1>
-      <p class="subtitle">Staircase Verify-and-Diffuse Engine</p>
+<div class="shell">
+  <!-- Minimal Top Header -->
+  <header class="top-bar">
+    <div class="brand">
+      <span class="brand-name">BFG-Diff</span>
+      <span class="brand-version">v2 · Staircase Diffusion</span>
     </div>
-    <div class="tabs-nav">
-      <button class="tab-btn active" id="tabVisualizer" onclick="switchTab('visualizer')">Visualizer</button>
-      <button class="tab-btn" id="tabChat" onclick="switchTab('chat')">Chat Session</button>
-    </div>
+    <nav class="segmented-nav">
+      <button class="nav-item active" id="navVisualizer" onclick="selectTab('visualizer')">Visualizer</button>
+      <button class="nav-item" id="navChat" onclick="selectTab('chat')">Chat</button>
+    </nav>
   </header>
 
-  <!-- Presets Bar -->
-  <div class="preset-bar">
-    <span class="preset-label">Presets:</span>
-    <button class="preset-pill active" onclick="applyPreset('balanced')">Balanced</button>
-    <button class="preset-pill" onclick="applyPreset('creative')">Creative (T=0.7)</button>
-    <button class="preset-pill" onclick="applyPreset('fast')">Fast Lookahead</button>
-    <button class="preset-pill" onclick="applyPreset('greedy')">Greedy (T=0.0)</button>
-  </div>
-
-  <!-- Manual Controls -->
-  <div class="controls" id="controlsPanel">
-    <div class="control-group">
-      <label>Mode</label>
-      <select id="mode">
-        <option value="chat" selected>Chat (ChatML)</option>
-        <option value="completion">Raw Completion</option>
-      </select>
+  <!-- Clean Config Strip -->
+  <section class="config-strip">
+    <div class="preset-row">
+      <span class="preset-label">Preset:</span>
+      <button class="preset-btn active" onclick="loadPreset('balanced')">Balanced</button>
+      <button class="preset-btn" onclick="loadPreset('creative')">Creative</button>
+      <button class="preset-btn" onclick="loadPreset('fast')">Fast Lookahead</button>
+      <button class="preset-btn" onclick="loadPreset('greedy')">Deterministic</button>
     </div>
-    <div class="control-group">
-      <label>Canvas (Tokens)</label>
-      <input type="number" id="canvas_len" value="32" min="8" max="256" step="8">
-    </div>
-    <div class="control-group">
-      <label>Sub-Block Size</label>
-      <input type="number" id="sub_canvas_len" value="8" min="4" max="32" step="4">
-    </div>
-    <div class="control-group">
-      <label>Sub-Steps</label>
-      <input type="number" id="sub_steps" value="4" min="1" max="16" step="1">
-    </div>
-    <div class="control-group" style="grid-column: span 2;">
-      <label>Temperature</label>
-      <input type="number" id="temp" value="0.3" min="0.0" max="1.5" step="0.1">
-    </div>
-  </div>
-
-  <!-- VIEW 1: DIFFUSION VISUALIZER -->
-  <div id="visualizerView">
-    <div class="prompt-card">
-      <label style="display:block; margin-bottom:8px;">Input Prompt</label>
-      <textarea id="prompt" rows="3">Explain the difference between a process and a thread in one short paragraph.</textarea>
-      <div style="margin-top: 10px; display: flex; justify-content: flex-end;">
-        <button class="action-btn" id="runBtn" onclick="runGeneration()">Generate & Compare</button>
+    <div class="params-grid">
+      <div class="field-group">
+        <label class="field-label">Mode</label>
+        <select class="field-select" id="mode">
+          <option value="chat" selected>ChatML</option>
+          <option value="completion">Raw</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label class="field-label">Tokens</label>
+        <input class="field-input" type="number" id="canvas_len" value="32" min="8" max="256" step="8">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Block Size</label>
+        <input class="field-input" type="number" id="sub_canvas_len" value="8" min="4" max="32" step="4">
+      </div>
+      <div class="field-group">
+        <label class="field-label">Steps / Block</label>
+        <input class="field-input" type="number" id="sub_steps" value="4" min="1" max="16" step="1">
+      </div>
+      <div class="field-group" style="grid-column: span 1;">
+        <label class="field-label">Temperature</label>
+        <input class="field-input" type="number" id="temp" value="0.3" min="0.0" max="1.5" step="0.1">
       </div>
     </div>
+  </section>
 
-    <div class="results" id="resultsSection">
-      <div class="comparison-grid">
-        <div class="model-card">
-          <div class="model-title">
-            <span>BFG-Diff (Verify & Diffuse)</span>
-            <span class="metric-badge" id="bfgMetrics">0.0 TPS</span>
-          </div>
-          <div class="output-box" id="bfgOutput">Ready to generate.</div>
-        </div>
-        <div class="model-card">
-          <div class="model-title">
-            <span>Causal Baseline</span>
-            <span class="metric-badge" id="causalMetrics">0.0 TPS</span>
-          </div>
-          <div class="output-box" id="causalOutput">Ready to generate.</div>
+  <!-- VIEW 1: VISUALIZER -->
+  <main id="paneVisualizer">
+    <div class="card" style="margin-bottom: 16px;">
+      <div class="prompt-box">
+        <textarea class="prompt-textarea" id="prompt" rows="3">Explain the difference between a process and a thread in one short paragraph.</textarea>
+        <div style="display: flex; justify-content: flex-end;">
+          <button class="btn-primary" id="runBtn" onclick="executeGeneration()">Execute & Compare</button>
         </div>
       </div>
+    </div>
 
-      <div class="trace-card" id="traceContainer">
-        <div class="trace-title">Block Denoising Trace</div>
-        <div id="traceLogs"><span style="color:var(--muted); font-size:12px;">Click "Generate & Compare" to view unmasking trace.</span></div>
+    <div class="comparison-split" style="margin-bottom: 16px;">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">BFG-Diff (Discrete Diffusion)</span>
+          <span class="telemetry-chip" id="bfgTelemetry">0.0 TPS</span>
+        </div>
+        <div class="output-view" id="bfgOutput">Awaiting execution...</div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Causal Baseline (generate)</span>
+          <span class="telemetry-chip" id="causalTelemetry">0.0 TPS</span>
+        </div>
+        <div class="output-view" id="causalOutput">Awaiting execution...</div>
       </div>
     </div>
-  </div>
 
-  <!-- VIEW 2: MULTI-TURN CONVERSATIONAL CHAT -->
-  <div id="chatView" style="display:none;">
-    <div class="chat-pane">
-      <div class="chat-header">
-        <div>
-          <strong style="font-size:13px; color:var(--primary);">Session</strong>
-          <span style="font-size:11px; color:var(--muted); margin-left:6px;">Context retained</span>
-        </div>
-        <button class="secondary-btn" onclick="clearChat()">Clear History</button>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Block Unmasking Trace</span>
       </div>
-      <div class="chat-messages" id="chatMessages">
-        <div class="empty-state" id="emptyChatNotice">
-          Start a conversation. The model remembers past turns in this session.
-        </div>
-      </div>
-      <div class="chat-input-bar">
-        <textarea id="chatInput" placeholder="Message assistant..."></textarea>
-        <button class="action-btn" id="chatSendBtn" onclick="sendChatMessage()">Send</button>
+      <div class="trace-container" id="traceContainer">
+        <div class="chat-placeholder">Execute a prompt to inspect speculative lookahead stages.</div>
       </div>
     </div>
-  </div>
+  </main>
+
+  <!-- VIEW 2: MULTI-TURN CHAT -->
+  <main id="paneChat" style="display: none;">
+    <div class="chat-wrapper">
+      <div class="card-header">
+        <span class="card-title">Session Memory</span>
+        <button class="btn-ghost" onclick="resetChat()">Reset Context</button>
+      </div>
+      <div class="chat-feed" id="chatFeed">
+        <div class="chat-placeholder" id="chatPlaceholder">
+          Context retained across turns. Send a message to begin.
+        </div>
+      </div>
+      <div class="chat-input-deck">
+        <textarea class="chat-textarea" id="chatInput" placeholder="Write a message..."></textarea>
+        <button class="btn-primary" id="chatSubmitBtn" onclick="submitMessage()" style="width:auto; padding:8px 14px;">Send</button>
+      </div>
+    </div>
+  </main>
 </div>
 
 <script>
-let currentTab = 'visualizer';
-let chatHistory = [
+let activeTab = 'visualizer';
+let sessionContext = [
   { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
 ];
 
@@ -837,16 +868,16 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function switchTab(tab) {
-  currentTab = tab;
-  document.getElementById('tabVisualizer').className = 'tab-btn' + (tab === 'visualizer' ? ' active' : '');
-  document.getElementById('tabChat').className = 'tab-btn' + (tab === 'chat' ? ' active' : '');
-  document.getElementById('visualizerView').style.display = tab === 'visualizer' ? 'block' : 'none';
-  document.getElementById('chatView').style.display = tab === 'chat' ? 'block' : 'none';
+function selectTab(tab) {
+  activeTab = tab;
+  document.getElementById('navVisualizer').className = 'nav-item' + (tab === 'visualizer' ? ' active' : '');
+  document.getElementById('navChat').className = 'nav-item' + (tab === 'chat' ? ' active' : '');
+  document.getElementById('paneVisualizer').style.display = tab === 'visualizer' ? 'block' : 'none';
+  document.getElementById('paneChat').style.display = tab === 'chat' ? 'block' : 'none';
 }
 
-function applyPreset(name) {
-  document.querySelectorAll('.preset-pill').forEach(el => el.classList.remove('active'));
+function loadPreset(name) {
+  document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
   if (event && event.target) event.target.classList.add('active');
 
   const canvasLen = document.getElementById('canvas_len');
@@ -877,23 +908,22 @@ function applyPreset(name) {
   }
 }
 
-// Visualizer Generator
-async function runGeneration() {
+async function executeGeneration() {
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
-  btn.innerText = 'Streaming...';
+  btn.innerText = 'Processing...';
 
   const bfgOutput = document.getElementById('bfgOutput');
   const causalOutput = document.getElementById('causalOutput');
-  const bfgMetrics = document.getElementById('bfgMetrics');
-  const causalMetrics = document.getElementById('causalMetrics');
-  const traceLogs = document.getElementById('traceLogs');
+  const bfgTelemetry = document.getElementById('bfgTelemetry');
+  const causalTelemetry = document.getElementById('causalTelemetry');
+  const traceContainer = document.getElementById('traceContainer');
 
-  bfgOutput.innerText = 'Parallel unmasking...';
-  causalOutput.innerText = 'Waiting for causal stream...';
-  bfgMetrics.innerText = '0.0 TPS';
-  causalMetrics.innerText = '0.0 TPS';
-  traceLogs.innerHTML = '';
+  bfgOutput.innerText = 'Unmasking active blocks...';
+  causalOutput.innerText = 'Generating token stream...';
+  bfgTelemetry.innerText = '0.0 TPS';
+  causalTelemetry.innerText = '0.0 TPS';
+  traceContainer.innerHTML = '';
 
   const payload = {
     prompt: document.getElementById('prompt').value,
@@ -904,21 +934,21 @@ async function runGeneration() {
     temp: parseFloat(document.getElementById('temp').value),
   };
 
-  const blockContainers = {};
-  let causalAccum = '';
+  const blockMap = {};
+  let causalBuffer = '';
 
   try {
-    const response = await fetch('/api/generate', {
+    const res = await fetch('/api/generate', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
 
-    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
+    if (!res.ok) throw new Error("Server returned HTTP " + res.status);
 
-    const reader = response.body.getReader();
+    const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
-    let buffer = '';
+    let raw = '';
 
     const NL = String.fromCharCode(10);
     const CR = String.fromCharCode(13);
@@ -927,114 +957,113 @@ async function runGeneration() {
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
+      raw += decoder.decode(chunk.value, { stream: true });
 
-      const normalized = buffer.split(CR + NL).join(NL);
-      const parts = normalized.split(DBL_NL);
-      buffer = parts.pop();
+      const normalized = raw.split(CR + NL).join(NL);
+      const items = normalized.split(DBL_NL);
+      raw = items.pop();
 
-      for (const part of parts) {
-        const line = part.trim();
+      for (const item of items) {
+        const line = item.trim();
         if (!line.startsWith('data:')) continue;
-        const jsonStr = line.substring(5).trim();
-        if (!jsonStr) continue;
+        const body = line.substring(5).trim();
+        if (!body) continue;
 
-        const evt = JSON.parse(jsonStr);
+        const evt = JSON.parse(body);
 
         if (evt.type === 'causal_token') {
-          causalAccum += evt.token;
-          causalOutput.innerText = causalAccum;
-          causalMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+          causalBuffer += evt.token;
+          causalOutput.innerText = causalBuffer;
+          causalTelemetry.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
         } else if (evt.type === 'causal_done') {
           causalOutput.innerText = evt.causal.text;
-          causalMetrics.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
+          causalTelemetry.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
         } else if (evt.type === 'bfg_step') {
           bfgOutput.innerText = evt.text;
-          bfgMetrics.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+          bfgTelemetry.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
 
-          if (!blockContainers[evt.block_idx]) {
-            const bDiv = document.createElement('div');
-            bDiv.className = 'trace-block';
-            bDiv.innerHTML = '<div class="trace-step" style="font-weight:700; color:var(--primary); margin-bottom:6px;">Sub-Block ' + (evt.block_idx + 1) + '</div>';
-            traceLogs.appendChild(bDiv);
-            blockContainers[evt.block_idx] = bDiv;
+          if (!blockMap[evt.block_idx]) {
+            const blockEl = document.createElement('div');
+            blockEl.className = 'trace-sub-block';
+            blockEl.innerHTML = '<div class="trace-header">Sub-Block ' + (evt.block_idx + 1) + '</div>';
+            traceContainer.appendChild(blockEl);
+            blockMap[evt.block_idx] = blockEl;
           }
 
-          const bDiv = blockContainers[evt.block_idx];
-          const sRow = document.createElement('div');
-          sRow.className = 'trace-step';
-          const chips = evt.tokens.map(t => '<span class="token-chip">' + escapeHtml(t) + '</span>').join(' ');
-          sRow.innerHTML = '<span style="color:var(--muted); min-width:44px;">Step ' + evt.step + ':</span>' + chips;
-          bDiv.appendChild(sRow);
+          const blockEl = blockMap[evt.block_idx];
+          const row = document.createElement('div');
+          row.className = 'trace-row';
+          const chips = evt.tokens.map(t => '<span class="chip">' + escapeHtml(t) + '</span>').join(' ');
+          row.innerHTML = '<span style="color:var(--text-tertiary); min-width:44px;">P' + evt.step + '</span>' + chips;
+          blockEl.appendChild(row);
         } else if (evt.type === 'bfg_done') {
           bfgOutput.innerText = evt.bfg.text;
-          bfgMetrics.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
+          bfgTelemetry.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
         }
       }
     }
   } catch (err) {
-    console.error("Stream error:", err);
-    bfgOutput.innerText = 'Error: ' + err.message;
+    console.error("Execution error:", err);
+    bfgOutput.innerText = "Error: " + err.message;
   } finally {
     btn.disabled = false;
-    btn.innerText = 'Generate & Compare';
+    btn.innerText = 'Execute & Compare';
   }
 }
 
-// Conversational Chat Functions
-function clearChat() {
-  chatHistory = [
+function resetChat() {
+  sessionContext = [
     { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
   ];
-  document.getElementById('chatMessages').innerHTML = `
-    <div class="empty-state" id="emptyChatNotice">
-      Start a conversation. The model remembers past turns in this session.
+  document.getElementById('chatFeed').innerHTML = `
+    <div class="chat-placeholder" id="chatPlaceholder">
+      Context retained across turns. Send a message to begin.
     </div>
   `;
 }
 
-async function sendChatMessage() {
-  const inputEl = document.getElementById('chatInput');
-  const userText = inputEl.value.trim();
-  if (!userText) return;
+async function submitMessage() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text) return;
 
-  const sendBtn = document.getElementById('chatSendBtn');
-  sendBtn.disabled = true;
-  inputEl.disabled = true;
+  const btn = document.getElementById('chatSubmitBtn');
+  btn.disabled = true;
+  input.disabled = true;
 
-  const notice = document.getElementById('emptyChatNotice');
-  if (notice) notice.remove();
+  const placeholder = document.getElementById('chatPlaceholder');
+  if (placeholder) placeholder.remove();
 
-  chatHistory.push({ role: "user", content: userText });
-  inputEl.value = '';
+  sessionContext.push({ role: "user", content: text });
+  input.value = '';
 
-  const messagesContainer = document.getElementById('chatMessages');
+  const feed = document.getElementById('chatFeed');
 
-  const userRow = document.createElement('div');
-  userRow.className = 'msg-row user';
-  userRow.innerHTML = `
-    <div class="msg-sender">You</div>
-    <div class="msg-bubble">${escapeHtml(userText)}</div>
+  const userUnit = document.createElement('div');
+  userUnit.className = 'message-unit user';
+  userUnit.innerHTML = `
+    <div class="message-meta">You</div>
+    <div class="message-body">${escapeHtml(text)}</div>
   `;
-  messagesContainer.appendChild(userRow);
+  feed.appendChild(userUnit);
 
-  const botRow = document.createElement('div');
-  botRow.className = 'msg-row assistant';
-  const botBubbleId = 'botMsg_' + Date.now();
-  const botStatsId = 'botStats_' + Date.now();
-  botRow.innerHTML = `
-    <div class="msg-sender">BFG-Diff Assistant</div>
-    <div class="msg-bubble" id="${botBubbleId}">Diffusing...</div>
-    <div class="msg-stats" id="${botStatsId}"></div>
+  const assistantUnit = document.createElement('div');
+  assistantUnit.className = 'message-unit assistant';
+  const bodyId = 'replyBody_' + Date.now();
+  const telemetryId = 'replyTelem_' + Date.now();
+  assistantUnit.innerHTML = `
+    <div class="message-meta">BFG-Diff</div>
+    <div class="message-body" id="${bodyId}">Diffusing...</div>
+    <div class="message-telemetry" id="${telemetryId}"></div>
   `;
-  messagesContainer.appendChild(botRow);
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  feed.appendChild(assistantUnit);
+  feed.scrollTop = feed.scrollHeight;
 
-  const botBubble = document.getElementById(botBubbleId);
-  const botStats = document.getElementById(botStatsId);
+  const bodyEl = document.getElementById(bodyId);
+  const telemEl = document.getElementById(telemetryId);
 
   const payload = {
-    messages: chatHistory,
+    messages: sessionContext,
     canvas_len: parseInt(document.getElementById('canvas_len').value) || 32,
     sub_canvas_len: parseInt(document.getElementById('sub_canvas_len').value) || 8,
     sub_steps: parseInt(document.getElementById('sub_steps').value) || 4,
@@ -1042,18 +1071,18 @@ async function sendChatMessage() {
   };
 
   try {
-    const response = await fetch('/api/chat', {
+    const res = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
 
-    if (!response.ok) throw new Error("HTTP error " + response.status);
+    if (!res.ok) throw new Error("HTTP " + res.status);
 
-    const reader = response.body.getReader();
+    const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    let finalAssistantText = '';
+    let raw = '';
+    let finalAnswer = '';
 
     const NL = String.fromCharCode(10);
     const CR = String.fromCharCode(13);
@@ -1062,46 +1091,46 @@ async function sendChatMessage() {
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
+      raw += decoder.decode(chunk.value, { stream: true });
 
-      const normalized = buffer.split(CR + NL).join(NL);
-      const parts = normalized.split(DBL_NL);
-      buffer = parts.pop();
+      const normalized = raw.split(CR + NL).join(NL);
+      const items = normalized.split(DBL_NL);
+      raw = items.pop();
 
-      for (const part of parts) {
-        const line = part.trim();
+      for (const item of items) {
+        const line = item.trim();
         if (!line.startsWith('data:')) continue;
-        const jsonStr = line.substring(5).trim();
-        if (!jsonStr) continue;
+        const body = line.substring(5).trim();
+        if (!body) continue;
 
-        const evt = JSON.parse(jsonStr);
+        const evt = JSON.parse(body);
         if (evt.type === 'chat_step') {
-          botBubble.innerText = evt.text;
-          botStats.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
-          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+          bodyEl.innerText = evt.text;
+          telemEl.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+          feed.scrollTop = feed.scrollHeight;
         } else if (evt.type === 'chat_done') {
-          finalAssistantText = evt.text;
-          botBubble.innerText = evt.text;
-          botStats.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
-          chatHistory.push({ role: "assistant", content: finalAssistantText });
-          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+          finalAnswer = evt.text;
+          bodyEl.innerText = evt.text;
+          telemEl.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
+          sessionContext.push({ role: "assistant", content: finalAnswer });
+          feed.scrollTop = feed.scrollHeight;
         }
       }
     }
   } catch (err) {
-    console.error("Chat error:", err);
-    botBubble.innerText = "Error: " + err.message;
+    console.error("Chat failure:", err);
+    bodyEl.innerText = "Error: " + err.message;
   } finally {
-    sendBtn.disabled = false;
-    inputEl.disabled = false;
-    inputEl.focus();
+    btn.disabled = false;
+    input.disabled = false;
+    input.focus();
   }
 }
 
 document.getElementById('chatInput').addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    sendChatMessage();
+    submitMessage();
   }
 });
 </script>
