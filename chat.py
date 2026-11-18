@@ -476,6 +476,78 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--surface-hover);
   }
 
+  
+  /* Custom Styled Menu (Replaces Native Android/iOS Picker) */
+  .custom-menu-wrapper {
+    position: relative;
+    width: 100%;
+  }
+  .custom-menu-trigger {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-family: var(--sans-font);
+    font-size: 13px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.15s ease;
+  }
+  .custom-menu-trigger:hover, .custom-menu-trigger.active {
+    border-color: var(--border-hover);
+  }
+  .custom-menu-options {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    width: 100%;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-hover);
+    border-radius: 6px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    z-index: 150;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .custom-menu-options.open {
+    display: flex;
+    animation: menuFadeIn 0.12s ease-out;
+  }
+  @keyframes menuFadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .custom-menu-item {
+    padding: 9px 12px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: background 0.15s, color 0.15s;
+    user-select: none;
+  }
+  .custom-menu-item:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+  }
+  .custom-menu-item.selected {
+    color: var(--text-primary);
+    font-weight: 500;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .custom-menu-item .item-sub {
+    font-family: var(--mono-font);
+    font-size: 10.5px;
+    color: var(--text-tertiary);
+  }
+
   /* Modal Popup (Clean Dialog) */
   .modal-overlay {
     position: fixed;
@@ -1029,12 +1101,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="modal-body">
         <div class="modal-field">
           <label>Engine Preset</label>
-          <select id="presetDropdown" onchange="onSelectPreset(this.value)" style="background:var(--bg); border:1px solid var(--border); color:var(--text-primary); font-family:var(--sans-font); font-size:12.5px; padding:7px 10px; border-radius:5px; outline:none; width:100%;">
-            <option value="balanced" selected>Balanced (Standard Lookahead)</option>
-            <option value="creative">Creative (T=0.7, Diverse Output)</option>
-            <option value="fast">Fast Lookahead (Large Blocks, Sub-steps=2)</option>
-            <option value="greedy">Deterministic (T=0.0, Exact Argmax)</option>
-          </select>
+          <div class="custom-menu-wrapper" id="customPresetWrapper">
+            <div class="custom-menu-trigger" id="customPresetTrigger" onclick="toggleCustomPresetMenu()">
+              <span id="customPresetSelectedLabel">Balanced</span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            </div>
+            <div class="custom-menu-options" id="customPresetOptions">
+              <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', 'Balanced')">
+                <span>Balanced</span>
+                <span class="item-sub">T=0.3 · 4 steps</span>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative')">
+                <span>Creative</span>
+                <span class="item-sub">T=0.7 · diverse</span>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('fast', 'Fast Lookahead')">
+                <span>Fast Lookahead</span>
+                <span class="item-sub">C=16 · 2 steps</span>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Deterministic')">
+                <span>Deterministic</span>
+                <span class="item-sub">T=0.0 · argmax</span>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="modal-grid">
           <div class="modal-field">
@@ -1164,6 +1254,34 @@ function onModalOverlayClick(e) {
     closeSettingsModal();
   }
 }
+
+
+function toggleCustomPresetMenu() {
+  const opts = document.getElementById('customPresetOptions');
+  const trigger = document.getElementById('customPresetTrigger');
+  opts.classList.toggle('open');
+  trigger.classList.toggle('active');
+}
+
+function pickCustomPreset(val, label) {
+  document.getElementById('customPresetSelectedLabel').innerText = label;
+  document.querySelectorAll('.custom-menu-item').forEach(el => el.classList.remove('selected'));
+  if (event && event.currentTarget) event.currentTarget.classList.add('selected');
+  document.getElementById('customPresetOptions').classList.remove('open');
+  document.getElementById('customPresetTrigger').classList.remove('active');
+  onSelectPreset(val);
+}
+
+// Close custom menu if clicking outside
+document.addEventListener('click', function(e) {
+  const wrapper = document.getElementById('customPresetWrapper');
+  if (wrapper && !wrapper.contains(e.target)) {
+    const opts = document.getElementById('customPresetOptions');
+    const trigger = document.getElementById('customPresetTrigger');
+    if (opts) opts.classList.remove('open');
+    if (trigger) trigger.classList.remove('active');
+  }
+});
 
 function onSelectPreset(preset) {
   const cLen = document.getElementById('cfgCanvas');
