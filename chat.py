@@ -149,13 +149,17 @@ def generate_bfg_stream(
             if st in raw_text:
                 raw_text = raw_text.split(st)[0]
     full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-    tps = total_tokens / max(1e-5, elapsed)
+    
+    # Calculate true overall average TPS based on actual emitted response tokens
+    actual_tokens = len(tok.encode(full_text, add_special_tokens=False)) if full_text else 0
+    reported_tokens = max(1, actual_tokens) if full_text else total_tokens
+    tps = reported_tokens / max(1e-5, elapsed)
     alpha = stats.get("alpha", 1.0)
     r_kv = stats.get("r_kv", 0.0)
 
     return {
         "text": full_text,
-        "tokens": total_tokens,
+        "tokens": reported_tokens,
         "elapsed": elapsed,
         "tps": tps,
         "alpha": alpha,
@@ -227,7 +231,10 @@ def generate_bfg_traced(
             if st in raw_text:
                 raw_text = raw_text.split(st)[0]
     full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-    tps = total_tokens / max(1e-5, elapsed)
+
+    actual_tokens = len(tok.encode(full_text, add_special_tokens=False)) if full_text else 0
+    reported_tokens = max(1, actual_tokens) if full_text else total_tokens
+    tps = reported_tokens / max(1e-5, elapsed)
     alpha = stats.get("alpha", 1.0)
     r_kv = stats.get("r_kv", 0.0)
 
@@ -243,7 +250,7 @@ def generate_bfg_traced(
 
     return {
         "text": full_text,
-        "tokens": total_tokens,
+        "tokens": reported_tokens,
         "elapsed": elapsed,
         "tps": tps,
         "alpha": alpha,
@@ -450,9 +457,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: var(--sans-font);
     font-size: 12px;
     font-weight: 500;
-    padding: 5px 12px;
+    padding: 5px 11px;
     border-radius: 4px;
     cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     transition: all 0.15s ease;
   }
   .seg-btn:hover { color: var(--text-primary); }
@@ -467,13 +477,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: 1px solid var(--border);
     color: var(--text-secondary);
     font-size: 12px;
-    padding: 5px 10px;
+    padding: 6px;
     border-radius: 5px;
     cursor: pointer;
     font-family: var(--sans-font);
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: center;
     transition: all 0.15s ease;
   }
   .icon-btn:hover {
@@ -518,8 +528,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     z-index: 200;
     display: none;
     flex-direction: column;
-    max-height: 240px;
-    overflow-y: auto;
+    max-height: 220px;
+    overflow-y: scroll;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     touch-action: pan-y;
@@ -1093,13 +1103,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div class="header-actions">
       <nav class="segmented-control">
-        <button class="seg-btn active" id="btnTabChat" onclick="navigateTab('chat')">Chat</button>
-        <button class="seg-btn" id="btnTabVisualizer" onclick="navigateTab('visualizer')">Visualizer</button>
-        <button class="seg-btn" id="btnTabManual" onclick="navigateTab('manual')">Manual</button>
+        <button class="seg-btn active" id="btnTabChat" onclick="navigateTab('chat')" title="Interactive Chat">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+          <span>Chat</span>
+        </button>
+        <button class="seg-btn" id="btnTabVisualizer" onclick="navigateTab('visualizer')" title="Block Trace Visualizer">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+          <span>Visualizer</span>
+        </button>
+        <button class="seg-btn" id="btnTabManual" onclick="navigateTab('manual')" title="Architecture & Settings Manual">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>
+          <span>Manual</span>
+        </button>
       </nav>
-      <button class="icon-btn" onclick="openSettingsModal()">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-        <span class="settings-text">Settings</span>
+      <button class="icon-btn" onclick="openSettingsModal()" title="Settings" aria-label="Settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
       </button>
     </div>
   </header>
@@ -1147,7 +1165,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="custom-menu-item" onclick="pickCustomPreset('infill', 'High-Throughput Infilling', this)">
                 <div>
                   <div style="font-weight:500;">High-Throughput Infilling</div>
-                  <div class="item-sub">C=32 · sub-blocks=32 · parallel span completion</div>
+                  <div class="item-sub">C=48 · sub-blocks=16 · parallel span completion</div>
                 </div>
               </div>
               <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative Narrative', this)">
@@ -1781,6 +1799,10 @@ async function runVisualizerComparison() {
     btn.innerText = 'Execute & Compare';
   }
 }
+// Initialize default preset on page load
+window.addEventListener('DOMContentLoaded', () => {
+  onSelectPreset('balanced');
+});
 </script>
 </body>
 </html>
