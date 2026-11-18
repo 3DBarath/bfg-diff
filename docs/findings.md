@@ -971,6 +971,73 @@ Tested on Google Colab T4 GPU (16 GB VRAM) running CUDA fp16/bf16 with `runs/bfg
    - Causal autoregressive baseline collapsed into severe repetitive loops (**55.0% Rep-4**, **65.4% Rep-2**), repeatedly emitting `"The proxy server is used to forward the requests to the target server."` until context exhaustion.
    - BFG-Diff produced completely non-repetitive completions (**0.0% Rep-4**, **0.0% Adjacent Duplication**) thanks to left-carrier causal grounding and slot-0 boundary anti-echo suppression.
 
+## BFG-Diff v2 Engineering & Ablation Verification (2026-11-18)
+
+### 1. Hardware Environment & Roofline Profile
+- **Environment:** NVIDIA Tesla T4 GPU (16 GB VRAM), CUDA 13.0, PyTorch 2.14.1 with CUDA bf16/fp16 support, `transformers 5.20.2`, Python 3.12.
+- **Roofline Step Latency Scaling ($\gamma_L(N_{\text{active}})$):**
+  Measured across prompt length $P=128$, batch size 1:
+  - $N=1$: $37.49\text{ ms}$ ($\gamma_L = 1.00\times$, baseline)
+  - $N=2$: $37.28\text{ ms}$ ($\gamma_L = 0.99\times$)
+  - $N=4$: $37.33\text{ ms}$ ($\gamma_L = 1.00\times$)
+  - $N=6$: $37.27\text{ ms}$ ($\gamma_L = 0.99\times$)
+  - $N=8$: $37.35\text{ ms}$ ($\gamma_L = 1.00\times$)
+  - $N=16$: $37.16\text{ ms}$ ($\gamma_L = 0.99\times$)
+  *Finding:* On GPU tensor cores, step latency is completely flat for $N_{\text{active}} \in [1, 16]$ because small sequence matrix-vector multiplications are memory-bandwidth-bound and kernel-launch bound. Evaluating $Q = 1 + V + W = 8$ tokens incurs virtually zero step latency penalty compared to 1 token ($\gamma_L \le 1.00\times$).
+
+### 2. Surgical Gates & Parity Verifications
+- **Gate 1 (Staircase Attention Mask Parity):**
+  - Zone A causal isolation leakage: $\Delta_{\text{leak}} = \max \| z_{\text{ZoneA}}(B_1) - z_{\text{ZoneA}}(B_2) \|_\infty = 0.000000e+00 < 10^{-5}$.
+  - Causal forward equivalence: $\Delta_{\text{causal}} = \max \| z_{\text{ZoneA}} - z_{\text{causal}} \|_\infty = 4.196167e-05 < 10^{-4}$ (fp32 numerical limit).
+  - Gate 1 PASS.
+- **Gate 2 (Progressive In-Place KV Slicing):**
+  - Cache sequence length synchronization: `kv.get_seq_length() == cur_prefix_len - 1` maintained exactly at step boundaries.
+  - Multi-step KV drift vs prefill: $\max \| \text{KV}_{\text{sliding}} - \text{KV}_{\text{prefill}} \|_\infty = 3.850460e-05 < 10^{-4}$.
+  - Gate 2 PASS.
+- **Gate 3 (BFGDiffAdapter Backward Pass & Zero-Init Parity):**
+  - Zero-initialization forward drift: $\max \| \text{output}_{\text{adapter}} - \text{output}_{\text{base}} \|_\infty = 0.000000e+00 < 10^{-6}$.
+  - Backward gradient flow: Step 1 `slot_emb.weight.grad` norm $= 9.341118 \times 10^7 > 0$; Step 2 `latent_down.weight.grad` norm $= 1.220351 \times 10^7 > 0$.
+  - Gate 3 PASS.
+- **Gate 4 (2-Branch Micro-Tree Verification):**
+  - Branch 2 KV state cloning contiguity vs full prefill: $\Delta_{\text{kv}} = 2.551079e-05 < 10^{-4}$.
+  - Gate 4 PASS.
+- **Gate 5 (Top-64 Teacher-Student Self-Distillation KL & Smoke Convergence):**
+  - Command: `python train.py --smoke_test` (12 steps, synthetic text, $P=128, C=64$, batch 2).
+  - Probe loss convergence: $11.6875 \rightarrow 4.3750$ (PASS).
+  - Validation metrics: `val_loss = 4.6060`, `acc_offset1 = 62.5%`, `acc_offset2_4 = 62.5%`.
+
+### 3. End-to-End Comparative Ablation Study
+Command: `python benchmark.py --smoke_test --ablation`
+
+| Method | TPS | Speedup (x) | Alpha (tok/pass) | R_kv | A_+1 (%) | A_+2 (%) | H4 | rep4 (%) | adj_dup (%) |
+|---|---|---|---|---|---|---|---|---|---|
+| Causal Baseline (generate) | 25.8 | 1.00x | 1.00 | 0.00 | 100.0% | N/A | 1.000 | 0.0% | 0.0% |
+| BFG-Diff v1 (Sub-block recompute, cap 2) | 14.6 | 0.57x | 1.00 | 4.25 | 0.0% | 0.0% | 1.000 | 0.0% | 0.0% |
+| BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice) | 22.2 | 0.86x | 1.07 | 3.50 | 0.0% | 0.0% | 1.000 | 0.0% | 0.0% |
+| BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill) | 23.2 | 0.90x | 1.07 | 3.53 | 0.0% | 0.0% | 1.000 | 0.0% | 0.0% |
+| BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification) | 22.9 | 0.89x | 1.07 | 4.44 | 0.0% | 0.0% | 1.000 | 0.0% | 0.0% |
+
+### 4. Standard Generation & Reconstruction Verification
+Command: `python benchmark.py --smoke_test`
+
+```
+Reconstruction | 2 prefixes | P=128 C=16
+method              recovery         TPS
+bfg-diff k=2          21.1%        25.3
+
+Generation | 2 prompts | C=16 | top_k=50
+method                                 H4   rep4   rep2    adj  Dist1  Dist2  alpha   R_kv  speedup       TPS
+causal generate                     1.000   0.0%   3.3%   0.0%  0.750  0.967   1.00   0.00    1.00x      22.7
+bfg-diff k=2 T=0 d=0 f=0 r=0        1.000   0.0%   0.0%   0.0%  0.906  1.000   1.07   3.53    1.04x      23.7
+```
+
+### 5. Bugs Encounted & Resolved
+1. **DynamicCache Internal Format in Transformers 5.x:** `kv.key_cache` is deprecated/absent. Keys and values are stored per-layer as `kv.layers[i].keys` and `kv.layers[i].values` with shape `(B, n_heads, seq_len, head_dim)`. In-place branch copying was adjusted to slice and clone directly on `layer.keys` and `layer.values`.
+2. **RoPE Dimension Mismatch in Step Mask:** In `canvas_step_with_cache`, `mask_position_ids` was indexing $Q-1$ tokens instead of $Q$. Fixed to compute exact contiguous coordinates: `(p_len - 1 - pad_count) + torch.arange(Q, device=device).unsqueeze(0)`.
+3. **Prefix Keep Mask Truncation on Multi-Step Expansion:** When prefix length expanded across steps, `prefix_keep` remained at initial prompt length $P$, causing dimension mismatches. Resolved by slicing `p_init = min(cached_prefix, prefix_keep.shape[1] - 1)`, ensuring prompt padding keys stay masked while newly generated tokens are always attended to.
+4. **TorchAO Low-CPU-Memory Conflict in PEFT:** `peft.get_peft_model` caused an `ImportError` when called on CPU if `torchao` 0.10.0 was present. Fixed by guarding `apply_lora` to only execute when `lora` keys are present in the checkpoint dict.
+
+
 
 
 

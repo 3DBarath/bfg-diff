@@ -250,3 +250,49 @@ When turning this into a hybrid prefix-canvas architecture:
 3. **Carrier-Frontier & Island Anchoring:** Because slot $j$'s logits sit on top of input token $j-1$'s residual stream, unmasking slot $j$ when $j-1$ is still `[MASK]` forces the model to guess without a carrier token. The sampler prioritizes slots with concrete left carriers (`has_carrier == True`), while unmasking non-adjacent island anchors ($j \ge 2$) when the step budget exceeds available carriers, enabling independent frontiers to double carriers cleanly ($1 \to 2 \to 4 \to 8$) in parallel.
 4. **Sliding Sub-Blocks & Stop Token Early Termination:** To generate sequences of arbitrary length without quadratic memory or unanchored degradation, `sample_canvas` slides across sub-blocks ($C_{\text{sub}}=8$ or $16$) that are committed into the causal prefix KV cache as they finish. When a stop token (e.g. `<|im_end|>`, `<|endoftext|>`) is carrier-verified within a sub-block, the sampler terminates future steps and trailing sub-blocks immediately, cutting generation latency by up to 50–75%.
 
+## BFG-Diff v2: Fused Verify-and-Diffuse Staircase Engine
+
+BFG-Diff v2 upgrades the right-shifted discrete block-diffusion architecture into a unified, single-pass speculative verification and diffusion engine. It eliminates redundant sub-block recomputations and raises verification throughput via five core architectural pillars:
+
+### Pillar 1: Fused Staircase Attention (Zone A + Zone B)
+
+In BFG-Diff v1, verification and drafting operated in separate or unisolated attention structures where unverified `[MASK]` tokens could pollute prompt queries. In BFG-Diff v2, each active forward step evaluates a unified window of size $Q = 1 + V + W$ tokens:
+- **Token 0:** The prompt boundary token (`prefix_last_id` at coordinate $P-1$).
+- **Zone A ($1 + V$ tokens):** Prefix last token plus $V$ speculative draft tokens under a **strictly causal mask**. Zone A queries attend causally to the prefix and prior Zone A tokens, but attention to Zone B keys is strictly masked to $-\infty$ (`torch.finfo(dtype).min`). This guarantees complete causal isolation: Zone A representations are numerically identical to a true causal forward pass ($\Delta_{\text{causal}} < 10^{-4}$, $\Delta_{\text{leak}} = 0.0$).
+- **Zone B ($W$ tokens):** Lookahead diffusion slots filled with `[MASK]` tokens (`<|extra_0|>`). Zone B queries attend bidirectionally to Prefix, all of Zone A, and all of Zone B.
+In every single forward pass, Zone A verifies $1 \dots V+1$ speculative tokens while Zone B simultaneously diffuses drafts for the next $W$ tokens.
+
+### Pillar 2: Progressive In-Place KV Cache Slicing
+
+Because Zone A queries never attend rightward to Zone B, the key-value states computed for Zone A in `DynamicCache` are mathematically valid causal KV states.
+- At the start of step $s$, the prefix KV cache has length `cur_prefix_len - 1`.
+- Step $s$ forwards $Q = 1 + V + W$ tokens, appending $Q$ keys and values to the cache.
+- The sampler verifies $k \in [1, 1+V]$ contiguous tokens in Zone A.
+- Rather than discarding the entire sub-block cache and recomputing prefix states via separate `advance_tokens` passes, the sampler performs in-place slicing:
+  $$\text{kv.crop}(-(Q - k))$$
+- This keeps the first $k$ tokens permanently in the cache, synchronizes `kv.get_seq_length() == cur_prefix_len - 1 + k`, and crops only the unverified Zone A tail and Zone B diffusion states. Redundant token evaluation ratio drops from $R_{\text{kv}} \approx 4.5$ down to near theoretical minimum.
+
+### Pillar 3: BFGDiffAdapter (Slot-Offset Embeddings & Latent Recycling)
+
+Pretrained causal transformers rely on positional embeddings (RoPE) to distinguish tokens. When multiple identical `[MASK]` tokens are passed in Zone B, diffusion drafting lacks explicit structural distance signals. `BFGDiffAdapter` introduces:
+1. **Learnable Slot-Offset Table (`slot_emb`):** Shape $(W_{\text{max}}, D)$. Adds explicit distance embeddings for offsets $+1 \dots +W$ relative to the active frontier.
+2. **Latent Residual Recycling (`latent_proj`):** A low-rank bottleneck projection ($W_{\text{down}}: D \to r$, $W_{\text{up}}: r \to D$, rank $r=64$) mapping top-layer hidden states $h^{(L)}$ of unverified slots from step $s-1$ into step $s$ inputs:
+   $$E_{\text{Zone B}}[j] = \text{Emb}(\text{mask\_id}) + \text{SlotEmb}[j] + W_{\text{up}}(\text{GELU}(W_{\text{down}}(h^{(L)}_{\text{prev}}[j])))$$
+3. **Zero-Initialization Compatibility:** `slot_emb.weight` and `latent_up.weight` are initialized to zero, ensuring exact mathematical backward compatibility with base and v1 checkpoints ($0.000000$ drift on step 0).
+
+### Pillar 4: Confidence-Gated 2-Branch Micro-Tree Verification
+
+When the primary draft token in Zone B exhibits low confidence (top-2 logit margin $z_{(1)} - z_{(2)} < \theta_{\text{branch}}$), single-linear verification risks immediate rejection. BFG-Diff v2 forks Zone A into a 2-branch micro-tree:
+- Zone A contains two parallel hypotheses: branch 1 (`[top1, draft_c1]`) and branch 2 (`[top2, draft_c2]`).
+- A 2D tree attention mask prevents branch 1 from seeing branch 2 and vice versa, while both attend to the causal root.
+- When branch 2 is accepted, the KV cache layers are updated in-place by copying branch 2 states over branch 1 positions before cropping.
+
+### Pillar 5: On-Policy Teacher-Student Self-Distillation KL & Suffix Curriculum
+
+Instead of hard cross-entropy against fixed training tokens, `train.py` trains the adapter via self-distillation against the frozen base causal model:
+- **Teacher Pass:** Computed causally using `with model.disable_adapter():`.
+- **Top-64 Gathered KL Divergence:** Gathers student logits for the teacher's top 64 tokens, avoiding memory materialization of full $151,936$-dim vocabulary distributions.
+- **Suffix Curriculum:** `make_mask` draws 50% contiguous lookahead suffixes (mimicking decoding state), 30% simulated corrupted drafts, and 20% scatter masks.
+- **Distance Weighting:** Loss is weighted by $w(j) = 1.0 / (1.0 + 0.3 \cdot j)$, prioritizing immediate frontier accuracy $A_{+1}$.
+
+

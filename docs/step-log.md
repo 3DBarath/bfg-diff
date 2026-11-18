@@ -443,6 +443,51 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - `python benchmark.py --smoke_test`: `recovery = 21.1% (TPS 11.7); Generation rep4 = 0.0%, rep2 = 0.0%, adj = 0.0%`.
    - Documented in [docs/findings.md](file:///home/gces/.bin/.s/.scripts/bfg-diff/docs/findings.md).
 
+## 29. BFG-Diff v2 Verify-and-Diffuse Staircase Engine Implementation (2026-11-18)
+
+1. **Phase 0: Diagnostic Harness & Baseline Capture:**
+   - Added `stats_out` tracking across `sampler.py` (`sample_canvas`, `sample_canvas_block`, and `sample_staircase_sliding`) capturing forward passes, active tokens, and verified tokens.
+   - Implemented `run_hardware_roofline` in `benchmark.py`. Measured hardware roofline on NVIDIA Tesla T4 GPU: step latency across $N_{\text{active}} \in [1, 16]$ is nearly flat ($\approx 37.4\text{ ms}$, $\gamma_L(8) = 1.00\times$, $\gamma_L(16) = 0.99\times$).
+   - Implemented `run_offset_accuracy_probe` in `benchmark.py` evaluating multi-offset acceptance $A_{+0 \dots +4}$.
+   - Updated generation benchmark table to record $\alpha$, $R_{\text{kv}}$, and speedup.
+
+2. **Phase 1: Staircase Attention Mask & Zone A Causal Isolation:**
+   - Implemented `build_staircase_step_mask` in `model.py` generating 4D additive attention masks for $Q = 1 + V + W$ tokens: Zone A causal, Zone B bidirectional.
+   - Refactored `canvas_step_with_cache` to support both legacy and v2 staircase active windows.
+   - Created `test_gate1.py` unit test suite.
+   - Verification: $\Delta_{\text{leak}} = 0.000000e+00 < 10^{-5}$, $\Delta_{\text{causal}} = 4.196167e-05 < 10^{-4}$ (Gate 1 PASS).
+
+3. **Phase 2: Progressive In-Place KV Slicing & Sliding Sampler:**
+   - Implemented `sample_staircase_sliding` in `sampler.py`: forwards $Q = 1 + V + W$ tokens, verifies contiguous tokens in Zone A, performs in-place `kv.crop(-(Q - k))` slicing with zero token recomputations, and retains cached KV states for verified prefix tokens.
+   - Synchronized sequence length invariant `kv.get_seq_length() == cur_prefix_len - 1` across all step boundaries.
+   - Created `test_gate2.py` verifying multi-step KV drift against prefill: $\max \|\text{KV}_{\text{sliding}} - \text{KV}_{\text{prefill}}\| = 3.850460e-05 < 10^{-4}$ (Gate 2 PASS).
+
+4. **Phase 3: BFGDiffAdapter (Slot-Offset Embeddings & Latent Recycling):**
+   - Added `BFGDiffAdapter` and `setup_bfg_adapter` to `model.py` with zero-initialized `slot_emb.weight` and `latent_up.weight`.
+   - Wired adapter forward calls into `canvas_step_with_cache` and `canvas_forward`.
+   - Updated checkpoint saving/loading in `train.py`, `benchmark.py`, and `chat.py`.
+   - Created `test_gate3.py`.
+   - Verification: zero-initialization drift $0.000000e+00 < 10^{-6}$; step 1 `slot_emb` grad norm $9.341118 \times 10^7 > 0$; step 2 `latent_down` grad norm $1.220351 \times 10^7 > 0$ (Gate 3 PASS).
+
+5. **Phase 4: Confidence-Gated 2-Branch Micro-Tree Verification:**
+   - Integrated 2-branch micro-tree generation into `sample_staircase_sliding` in `sampler.py` and tree parent mapping in `build_staircase_step_mask` in `model.py`.
+   - Implemented in-place cache key/value copying for accepted branch 2 tokens across `DynamicCache.layers`.
+   - Created `test_gate4.py`.
+   - Verification: Branch 2 KV state cloning contiguity vs prefill $\Delta_{\text{kv}} = 2.551079e-05 < 10^{-4}$ (Gate 4 PASS).
+
+6. **Phase 5: Top-64 Teacher-Student Self-Distillation KL & Suffix Curriculum:**
+   - Rewrote `make_mask` in `train.py` with suffix curriculum (50% contiguous lookahead suffix, 30% corrupted draft suffix, 20% scatter).
+   - Replaced cross-entropy in `train.py` with `diffusion_loss` computing causal teacher logits (`with model.disable_adapter():`), 2-step student unroll on 30% of steps, Top-64 gathered KL divergence, and offset position weighting.
+   - Updated `evaluate()` to compute `val_loss`, `acc_offset1`, and `acc_offset2_4`.
+   - Verification: `python train.py --smoke_test` printed `smoke probe loss (before): 11.6875`, `step 12 val_loss 4.6060 acc_offset1 62.5% acc_offset2_4 62.5%`, `smoke convergence: 11.6875 -> 4.3750 PASS` (Gate 5 PASS).
+
+7. **Phase 6: End-to-End CLI/Web Integration & Ablation Benchmark:**
+   - Added `--ablation` flag to `benchmark.py` running the comparative ablation study table.
+   - Updated `chat.py` with badge reporting ($\alpha$ tok/step and TPS) and safe checkpoint loading.
+   - Verification: `python benchmark.py --smoke_test --ablation` ran and outputted full comparative markdown table cleanly.
+   - Verification: `python benchmark.py --smoke_test` passed standard generation and reconstruction evaluations.
+
+
 
 
 

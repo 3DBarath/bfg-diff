@@ -7,6 +7,372 @@ from model import MASK_TOKEN_ID, canvas_forward, canvas_step_with_cache, mask_po
 
 
 @torch.no_grad()
+def sample_staircase_sliding(
+    model,
+    prefix_ids,
+    canvas_len=128,
+    mask_id=MASK_TOKEN_ID,
+    prefix_keep=None,
+    temperature=0.0,
+    top_k=50,
+    suppress_adjacent=True,
+    tau=0.8,
+    settle_margin=2.0,
+    draft_margin_thresh=0.8,
+    W_max=4,
+    V_max=3,
+    kv=None,
+    step_callback=None,
+    stop_token_ids=None,
+    stats_out=None,
+    enable_branching=False,
+    branch_thresh=1.0,
+    adapter=None,
+    **kwargs,
+):
+    """Fused Verify-and-Diffuse Staircase Engine (BFG-Diff v2).
+
+    Simultaneously verifies Zone A (1 + V tokens) under strictly causal attention
+    and drafts Zone B (W tokens) under bidirectional attention. Progressively slices
+    KV cache in-place with zero token recomputations.
+    """
+    assert canvas_len >= 1
+    B = prefix_ids.shape[0]
+    device = prefix_ids.device
+    cur_prefix_len = prefix_ids.shape[1]
+
+    if kv is None:
+        kv = prefill_prefix(model, prefix_ids, prefix_keep)
+
+    if stats_out is not None:
+        if "forward_passes" not in stats_out:
+            stats_out["forward_passes"] = 0
+            stats_out["active_tokens_evaluated"] = 0
+            stats_out["tokens_verified"] = 0
+            stats_out["accept_histogram"] = {}
+
+    cur_last_id = prefix_ids[:, -1:]
+    draft_ids = None
+    tree_branches = None  # (b1_tokens, b2_tokens) if 2-branch micro-tree active
+    committed_tokens = []
+    prev_latents = None
+
+    step = 0
+    while len(committed_tokens) < canvas_len:
+        step += 1
+        rem_tokens = canvas_len - len(committed_tokens)
+
+        tree_mask_a = None
+        pos_override = None
+
+        if tree_branches is not None and rem_tokens >= 2:
+            # Ambiguous Fork Regime: 2-Branch Zone A of length 5
+            b1_toks, b2_toks = tree_branches
+            zone_a_ids = torch.cat([cur_last_id, b1_toks, b2_toks], dim=1) # (B, 5)
+            zone_a_len = 5
+            tree_mask_a = torch.tensor([
+                [1, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0],
+                [1, 1, 1, 0, 0],
+                [1, 0, 0, 1, 0],
+                [1, 0, 0, 1, 1],
+            ], dtype=torch.bool, device=device)
+
+            W = min(W_max, max(1, rem_tokens - 2))
+            pad_count = prefix_keep.shape[1] - prefix_keep.to(device=device, dtype=torch.long).sum(dim=1, keepdim=True) if prefix_keep is not None else 0
+            base_p = cur_prefix_len - 1 - pad_count
+            pos_a = base_p + torch.tensor([[0, 1, 2, 1, 2]], device=device).expand(B, -1)
+            pos_b = (base_p + 3) + torch.arange(W, device=device).unsqueeze(0).expand(B, -1)
+            pos_override = torch.cat([pos_a, pos_b], dim=1)
+            is_tree_step = True
+        else:
+            is_tree_step = False
+            V_cur = draft_ids.shape[1] if (draft_ids is not None and draft_ids.numel() > 0) else 0
+            if V_cur >= rem_tokens:
+                V_cur = max(0, rem_tokens - 1)
+                draft_ids = draft_ids[:, :V_cur] if V_cur > 0 else None
+
+            # 1. Zone A: [cur_last_id, draft_ids] of length 1 + V_cur
+            if V_cur > 0:
+                zone_a_ids = torch.cat([cur_last_id, draft_ids], dim=1)
+            else:
+                zone_a_ids = cur_last_id
+            zone_a_len = 1 + V_cur
+            W = min(W_max, max(1, rem_tokens - V_cur))
+
+        # 2. Zone B: W masks
+        zone_b_ids = torch.full((B, W), mask_id, dtype=torch.long, device=device)
+
+        # 3. Active IDs
+        active_ids = torch.cat([zone_a_ids, zone_b_ids], dim=1)
+        Q = active_ids.shape[1]
+
+        inputs_embeds = None
+        if adapter is not None and hasattr(adapter, "get_inputs_embeds"):
+            inputs_embeds = adapter.get_inputs_embeds(model, active_ids, zone_a_len, W, prev_latents)
+
+        if stats_out is not None:
+            stats_out["forward_passes"] += 1
+            stats_out["active_tokens_evaluated"] += Q
+
+        out_step = canvas_step_with_cache(
+            model,
+            active_ids,
+            past_key_values=kv,
+            prefix_len=cur_prefix_len,
+            zone_a_len=zone_a_len,
+            prefix_keep=prefix_keep,
+            tree_mask_a=tree_mask_a,
+            position_ids_override=pos_override,
+            return_hidden=(adapter is not None),
+            inputs_embeds=inputs_embeds,
+        )
+        if adapter is not None and isinstance(out_step, tuple):
+            logits, latents = out_step
+        else:
+            logits = out_step
+            latents = None
+
+        z = logits.float()
+
+        # Repetition penalty over recent context
+        if suppress_adjacent and (cur_prefix_len > 0 or len(committed_tokens) > 0):
+            hist = []
+            if cur_prefix_len > 0:
+                hist.append(prefix_ids[0, max(0, cur_prefix_len - 128):])
+            if len(committed_tokens) > 0:
+                hist.append(torch.tensor(committed_tokens, device=device))
+            if hist:
+                recent = torch.cat(hist)
+                valid_recent = recent[recent != mask_id]
+                counts = torch.bincount(valid_recent, minlength=z.shape[-1])
+                repeated = counts > 0
+                if repeated.any():
+                    pen = counts[repeated].float() * 0.35
+                    for qa in range(zone_a_len):
+                        z[:, qa, repeated] -= pen
+
+        # Anti-stutter for slot 0 against cur_last_id
+        if suppress_adjacent:
+            prev_tok = int(cur_last_id[0, 0])
+            z[:, 0, prev_tok] = -float("inf")
+
+        # 5. Verify Zone A
+        accepted_drafts = []
+        r = 0
+        if is_tree_step:
+            # 2-Branch verification
+            b1_toks, b2_toks = tree_branches
+            y_star_0 = int(z[0, 0].argmax()) # true causal prediction for pos P
+            # Branch 1 candidates: index 1 and 2
+            b1_0 = int(b1_toks[0, 0])
+            b1_1 = int(b1_toks[0, 1])
+            # Branch 2 candidates: index 3 and 4
+            b2_0 = int(b2_toks[0, 0])
+            b2_1 = int(b2_toks[0, 1])
+
+            # Check Branch 1 streak
+            b1_match0 = (b1_0 == y_star_0) or ((z[0, 0, y_star_0] - z[0, 0, b1_0]).item() <= tau)
+            b1_streak = 0
+            if b1_match0:
+                b1_streak = 1
+                y_star_b1_1 = int(z[0, 1].argmax())
+                if (b1_1 == y_star_b1_1) or ((z[0, 1, y_star_b1_1] - z[0, 1, b1_1]).item() <= tau):
+                    b1_streak = 2
+
+            # Check Branch 2 streak
+            b2_match0 = (b2_0 == y_star_0) or ((z[0, 0, y_star_0] - z[0, 0, b2_0]).item() <= tau)
+            b2_streak = 0
+            if b2_match0:
+                b2_streak = 1
+                y_star_b2_1 = int(z[0, 3].argmax())
+                if (b2_1 == y_star_b2_1) or ((z[0, 3, y_star_b2_1] - z[0, 3, b2_1]).item() <= tau):
+                    b2_streak = 2
+
+            # Select winner
+            if b2_streak > b1_streak:
+                winner = 2
+                streak = b2_streak
+            elif b1_streak > 0:
+                winner = 1
+                streak = b1_streak
+            else:
+                winner = 0
+                streak = 0
+
+            if winner == 2:
+                # Branch 2 won! Copy Branch 2 KV states [3, 4] into [1, 2]
+                p_offset = cur_prefix_len - 1
+                for layer in kv.layers:
+                    layer.keys[:, :, p_offset + 1 : p_offset + 3, :] = layer.keys[:, :, p_offset + 3 : p_offset + 5, :].clone()
+                    layer.values[:, :, p_offset + 1 : p_offset + 3, :] = layer.values[:, :, p_offset + 3 : p_offset + 5, :].clone()
+                if streak == 2:
+                    bonus_tok = int(z[0, 4].argmax())
+                    new_tokens = [b2_0, b2_1, bonus_tok]
+                else:
+                    override_tok = int(z[0, 3].argmax())
+                    new_tokens = [b2_0, override_tok]
+            elif winner == 1:
+                if streak == 2:
+                    bonus_tok = int(z[0, 2].argmax())
+                    new_tokens = [b1_0, b1_1, bonus_tok]
+                else:
+                    override_tok = int(z[0, 1].argmax())
+                    new_tokens = [b1_0, override_tok]
+            else:
+                new_tokens = [y_star_0]
+
+            k = len(new_tokens)
+            new_last_id = torch.full((B, 1), new_tokens[-1], dtype=torch.long, device=device)
+            r = streak
+            V_cur = 2
+            tree_branches = None
+        elif V_cur == 0:
+            if temperature > 0.0:
+                k_eval = min(top_k or z.shape[-1], z.shape[-1])
+                vals, idx = z[:, 0].topk(k_eval, dim=-1)
+                u = torch.rand_like(vals).clamp(1e-9, 1.0 - 1e-9)
+                pick = (vals / temperature - torch.log(-torch.log(u))).argmax(-1, keepdim=True)
+                y_0 = idx.gather(-1, pick).squeeze(-1)
+            else:
+                y_0 = z[:, 0].argmax(dim=-1)
+            new_tokens = [int(y_0[0])]
+            new_last_id = y_0.view(B, 1)
+            k = 1
+        else:
+            accepted_all = True
+            curr_prev = int(cur_last_id[0, 0])
+            for j in range(V_cur):
+                draft_tok = int(draft_ids[0, j])
+                top_tok = int(z[0, j].argmax())
+                draft_z = z[0, j, draft_tok].item()
+                top_z = z[0, j, top_tok].item()
+
+                accept = False
+                if draft_tok == top_tok:
+                    accept = True
+                elif (top_z - draft_z) <= tau and (not suppress_adjacent or draft_tok != curr_prev):
+                    accept = True
+
+                if accept:
+                    accepted_drafts.append(draft_tok)
+                    curr_prev = draft_tok
+                    r += 1
+                else:
+                    override_tok = top_tok
+                    if suppress_adjacent and override_tok == curr_prev:
+                        cz = z[0, j].clone()
+                        cz[curr_prev] = -float("inf")
+                        override_tok = int(cz.argmax())
+                    accepted_all = False
+                    new_tokens = accepted_drafts + [override_tok]
+                    new_last_id = torch.full((B, 1), override_tok, dtype=torch.long, device=device)
+                    k = r + 1
+                    break
+
+            if accepted_all:
+                top_bonus = int(z[0, V_cur].argmax())
+                if suppress_adjacent and top_bonus == curr_prev:
+                    cz = z[0, V_cur].clone()
+                    cz[curr_prev] = -float("inf")
+                    top_bonus = int(cz.argmax())
+                new_tokens = accepted_drafts + [top_bonus]
+                new_last_id = torch.full((B, 1), top_bonus, dtype=torch.long, device=device)
+                k = V_cur + 1
+
+        if k > rem_tokens:
+            k = rem_tokens
+            new_tokens = new_tokens[:k]
+            new_last_id = torch.full((B, 1), new_tokens[-1], dtype=torch.long, device=device)
+
+        # 6. In-Place KV Cache Slice
+        kv.crop(-(Q - k))
+        cur_prefix_len += k
+        committed_tokens.extend(new_tokens)
+        cur_last_id = new_last_id
+
+        if stats_out is not None:
+            stats_out["accept_histogram"][k] = stats_out["accept_histogram"].get(k, 0) + 1
+
+        # Check early exit on stop tokens
+        stop_hit = False
+        if stop_token_ids:
+            stop_set = set(stop_token_ids)
+            for idx, tok in enumerate(new_tokens):
+                if tok in stop_set:
+                    cut = len(committed_tokens) - len(new_tokens) + idx
+                    committed_tokens = committed_tokens[:cut]
+                    stop_hit = True
+                    break
+
+        if stop_hit or len(committed_tokens) >= canvas_len:
+            if step_callback:
+                disp = torch.tensor([committed_tokens], device=device)
+                step_callback(step, disp)
+            break
+
+        # 7. Extract new drafts from Zone B
+        draft_ids = None
+        tree_branches = None
+        if V_cur == r and not stop_hit:
+            zone_b_z = z[0, zone_a_len : zone_a_len + W]
+            top2_0 = zone_b_z[0].topk(2)
+            margin_0 = (top2_0.values[0] - top2_0.values[1]).item()
+
+            if enable_branching and margin_0 < branch_thresh and W >= 2 and (canvas_len - len(committed_tokens)) >= 2:
+                # Fork 2-Branch Zone A for next step
+                b1_tok0 = int(top2_0.indices[0])
+                b2_tok0 = int(top2_0.indices[1])
+                top2_1 = zone_b_z[1].topk(2)
+                b1_tok1 = int(top2_1.indices[0])
+                b2_tok1 = int(top2_1.indices[1])
+                b1_t = torch.tensor([[b1_tok0, b1_tok1]], dtype=torch.long, device=device).expand(B, -1)
+                b2_t = torch.tensor([[b2_tok0, b2_tok1]], dtype=torch.long, device=device).expand(B, -1)
+                tree_branches = (b1_t, b2_t)
+            else:
+                candidate_drafts = []
+                c_prev = int(cur_last_id[0, 0])
+                for jb in range(min(V_max, W)):
+                    top2_b = zone_b_z[jb].topk(2)
+                    margin_b = (top2_b.values[0] - top2_b.values[1]).item()
+                    tok_b = int(top2_b.indices[0])
+                    if suppress_adjacent and tok_b == c_prev:
+                        tok_b = int(top2_b.indices[1])
+                    if margin_b >= draft_margin_thresh:
+                        candidate_drafts.append(tok_b)
+                        c_prev = tok_b
+                    else:
+                        break
+                if candidate_drafts:
+                    draft_ids = torch.tensor([candidate_drafts], dtype=torch.long, device=device).expand(B, -1)
+                    if latents is not None:
+                        prev_latents = latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]
+                else:
+                    prev_latents = None
+        else:
+            prev_latents = None
+
+        if step_callback:
+            disp_tokens = list(committed_tokens)
+            if draft_ids is not None:
+                disp_tokens.extend(draft_ids[0].tolist())
+            elif tree_branches is not None:
+                disp_tokens.extend(tree_branches[0][0].tolist())
+            disp = torch.tensor([disp_tokens], device=device).expand(B, -1)
+            step_callback(step, disp)
+
+    ret = torch.tensor([committed_tokens], dtype=torch.long, device=device).expand(B, -1) if committed_tokens else torch.empty((B, 0), dtype=torch.long, device=device)
+    if stats_out is not None:
+        stats_out["tokens_verified"] += ret.shape[1]
+        fp = max(1, stats_out["forward_passes"])
+        tv = max(1, stats_out["tokens_verified"])
+        stats_out["alpha"] = stats_out["tokens_verified"] / fp
+        stats_out["r_kv"] = (stats_out["active_tokens_evaluated"] / tv) - 1.0
+
+    return ret
+
+
+@torch.no_grad()
 def sample_canvas_block(
     model,
     prefix_ids,
@@ -31,6 +397,7 @@ def sample_canvas_block(
     tau=0.8,
     gamma=0.5,
     settle_margin=2.0,
+    stats_out=None,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -60,6 +427,27 @@ def sample_canvas_block(
     """
     assert steps >= 1 and canvas_len >= 1
     B = prefix_ids.shape[0]
+    frozen = (canvas != mask_id) if canvas is not None else None
+    if frozen is None or not frozen.any():
+        # Free-generation: use high-efficiency fused staircase engine with in-place KV slicing
+        return sample_staircase_sliding(
+            model,
+            prefix_ids,
+            canvas_len=canvas_len,
+            mask_id=mask_id,
+            prefix_keep=prefix_keep,
+            temperature=temperature,
+            top_k=top_k,
+            suppress_adjacent=suppress_adjacent,
+            kv=kv,
+            step_callback=step_callback,
+            stop_token_ids=stop_token_ids,
+            stats_out=stats_out,
+            tau=tau,
+            settle_margin=settle_margin,
+            **kwargs,
+        )
+
     if canvas is None:
         canvas = torch.full(
             (B, canvas_len), mask_id, dtype=torch.long, device=prefix_ids.device
@@ -81,9 +469,16 @@ def sample_canvas_block(
     prefix_len = prefix_ids.shape[1]
     if kv is None:
         kv = prefill_prefix(model, prefix_ids, prefix_keep)  # prefix[:-1] encoded once
+    if stats_out is not None:
+        if "forward_passes" not in stats_out:
+            stats_out["forward_passes"] = 0
+            stats_out["active_tokens_evaluated"] = 0
+            stats_out["tokens_verified"] = 0
+            stats_out["accept_histogram"] = {}
     for s in range(1, steps + 1):
         prev_canvas = canvas.clone()
         prev_verified = verified.clone()
+        n_ver_before = int(verified[0].sum().item())
 
         # 1. Construct feed_canvas with verified tokens + current 1-token lookahead draft only.
         # Distant slots beyond the active lookahead draft are kept masked to avoid polluting self-attention.
@@ -99,9 +494,14 @@ def sample_canvas_block(
 
         if kv is None:
             logits = canvas_forward(model, prefix_ids, feed_canvas, prefix_keep)
+            act_eval = feed_canvas.shape[1] + prefix_ids.shape[1]
         else:
             logits = canvas_step_with_cache(model, prefix_ids[:, -1:], feed_canvas, kv, prefix_len, prefix_keep)
             kv.crop(-(1 + canvas_len))
+            act_eval = 1 + canvas_len
+        if stats_out is not None:
+            stats_out["forward_passes"] += 1
+            stats_out["active_tokens_evaluated"] += act_eval
         assert logits.shape[:2] == (B, canvas_len), logits.shape
         z = logits.float()
         top2 = z.topk(2, dim=-1)
@@ -214,6 +614,11 @@ def sample_canvas_block(
             canvas[i] = row
             decoded[i] = (row != mask_id) & ~frozen[i]
 
+        n_ver_after = int(verified[0].sum().item())
+        k_step = max(0, n_ver_after - n_ver_before)
+        if stats_out is not None:
+            stats_out["accept_histogram"][k_step] = stats_out["accept_histogram"].get(k_step, 0) + 1
+
         # Rule 3: Only display verified tokens + active frontier draft in the UI trace (no visual flicker)
         if step_callback is not None:
             display_canvas = canvas.clone()
@@ -286,7 +691,14 @@ def sample_canvas_block(
             canvas[0, 0] = cand_tok
 
     # Truncate cleanly at m_end: ZERO mask_id tokens allowed!
-    return canvas[:, :m_end]
+    ret = canvas if frozen.any() else canvas[:, :m_end]
+    if stats_out is not None:
+        stats_out["tokens_verified"] += ret.shape[1]
+        fp = max(1, stats_out["forward_passes"])
+        tv = max(1, stats_out["tokens_verified"])
+        stats_out["alpha"] = stats_out["tokens_verified"] / fp
+        stats_out["r_kv"] = (stats_out["active_tokens_evaluated"] / tv) - 1.0
+    return ret
 
 
 def sample_canvas(
@@ -300,101 +712,24 @@ def sample_canvas(
     carrier_priority=True,
     block_callback=None,
     stop_token_ids=None,
+    stats_out=None,
     **kwargs,
 ):
-    """Generate canvas_len tokens either in one block or sliding through sub-blocks.
+    """Generate canvas_len tokens using the fused staircase sliding engine with in-place KV slicing."""
+    def cb(s, disp_tensor):
+        if block_callback is not None:
+            block_callback(0, s, disp_tensor)
 
-    When `sub_canvas_len` is provided (e.g. sub_canvas_len=16 or 8), splits the generation
-    into successive sub-blocks. Each completed sub-block is appended to the prefix context,
-    providing strong causal anchors while taking fewer FLOPs per step.
-    """
-    if sub_canvas_len is None or sub_canvas_len >= canvas_len:
-        return sample_canvas_block(
-            model,
-            prefix_ids,
-            canvas_len=canvas_len,
-            steps=steps,
-            prefix_keep=prefix_keep,
-            carrier_priority=carrier_priority,
-            **kwargs,
-        )
-
-    k_sub = sub_steps if sub_steps is not None else max(1, math.ceil(steps * (sub_canvas_len / canvas_len)))
-    cur_prefix = prefix_ids
-    cur_keep = prefix_keep
-    generated_blocks = []
-    rem = canvas_len
-
-    # Pre-encode prefix[: -1] into KV cache once for all sub-blocks
-    kv = prefill_prefix(model, cur_prefix, cur_keep)
-
-    block_idx = 0
-    while rem > 0:
-        c_sub = min(sub_canvas_len, rem)
-
-        def step_cb(s, canvas_tensor):
-            if block_callback is not None:
-                block_callback(block_idx, s, canvas_tensor)
-
-        block = sample_canvas_block(
-            model,
-            cur_prefix,
-            canvas_len=c_sub,
-            steps=k_sub,
-            prefix_keep=cur_keep,
-            carrier_priority=carrier_priority,
-            kv=kv,
-            step_callback=step_cb,
-            stop_token_ids=stop_token_ids,
-            **kwargs,
-        )
-        c_actual = block.shape[1]
-        generated_blocks.append(block)
-        block_idx += 1
-        rem -= c_actual
-
-        # Early exit across sub-blocks if a stop token was generated
-        if stop_token_ids:
-            stop_set = set(stop_token_ids)
-            stop_indices = [idx for idx, tok in enumerate(block[0]) if int(tok) in stop_set]
-            if stop_indices:
-                first_stop = stop_indices[0]
-                # Keep up to the stop token (or before it if desired; but stop token concludes generation)
-                # Slicing block up to first_stop (excluding stop token) so stop tokens don't leak into output
-                block = block[:, :first_stop]
-                if block.shape[1] > 0:
-                    generated_blocks[-1] = block
-                else:
-                    generated_blocks.pop()
-                break
-
-        if rem > 0 and kv is not None:
-            # Advance KV cache by appending [cur_prefix[:, -1:], block[:, :-1]] (exactly c_actual tokens).
-            # This advances the cached prefix up to the new prefix[:-1] for the next sub-block,
-            # leaving block[:, -1:] as prefix_last_id!
-            advance_tokens = torch.cat([cur_prefix[:, -1:], block[:, :-1]], dim=1)
-            p_cached = kv.get_seq_length()
-            new_prefix = torch.cat([cur_prefix, block], dim=1)
-            new_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1) if cur_keep is not None else None
-            pos_advance = (
-                torch.arange(p_cached, p_cached + c_actual, device=advance_tokens.device).unsqueeze(0).expand(cur_prefix.shape[0], c_actual)
-                if new_keep is None
-                else mask_position_ids(new_keep, 0)[:, p_cached : p_cached + c_actual]
-            )
-            attn_mask = new_keep[:, : p_cached + c_actual] if new_keep is not None else None
-            model(
-                input_ids=advance_tokens,
-                past_key_values=kv,
-                position_ids=pos_advance,
-                attention_mask=attn_mask,
-                use_cache=True,
-            )
-
-        cur_prefix = torch.cat([cur_prefix, block], dim=1)
-        if cur_keep is not None:
-            cur_keep = torch.cat([cur_keep, torch.ones_like(block, dtype=torch.bool)], dim=1)
-
-    return torch.cat(generated_blocks, dim=1)
+    return sample_staircase_sliding(
+        model,
+        prefix_ids,
+        canvas_len=canvas_len,
+        prefix_keep=prefix_keep,
+        step_callback=cb,
+        stop_token_ids=stop_token_ids,
+        stats_out=stats_out,
+        **kwargs,
+    )
 
 
 @torch.no_grad()

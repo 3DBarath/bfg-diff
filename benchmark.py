@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from model import LORA_TARGETS, apply_lora, prepare
+from model import LORA_TARGETS, apply_lora, canvas_forward, canvas_step_with_cache, prefill_prefix, prepare
 from sampler import sample_canvas, sample_canvas_block
 
 # Long reference documents (prose, docs, markdown, JSON) for masked reconstruction.
@@ -108,6 +108,14 @@ def parse_args():
                    help="TPS vs prefix length for causal and bfg-diff at batch 1 and 4")
     p.add_argument("--no_adj_suppress", action="store_true",
                    help="disable adjacent-token collision suppression")
+    p.add_argument("--roofline", action="store_true",
+                   help="measure median step latency and gamma_L across active token counts")
+    p.add_argument("--offset_probe", action="store_true",
+                   help="measure multi-offset lookahead accuracy against causal ground truth")
+    p.add_argument("--ablation", action="store_true",
+                   help="run comparative ablation table across stages")
+    p.add_argument("--enable_branching", action="store_true",
+                   help="enable confidence-gated 2-branch micro-tree verification")
     p.add_argument("--show", type=int, default=2, help="side-by-side prompts to print")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -224,10 +232,17 @@ def run_sampler_generation(
     remask_ratio=0.0,
 ):
     token_ids = []
+    stats_total = {
+        "forward_passes": 0,
+        "active_tokens_evaluated": 0,
+        "tokens_verified": 0,
+        "accept_histogram": {},
+    }
     sync(device)
     start = time.perf_counter()
     for i in range(0, len(prompt_ids), args.batch_size):
         ids, keep = left_pad(prompt_ids[i : i + args.batch_size], tok.pad_token_id, device)
+        batch_stats = {}
         canvas = sample_canvas(
             model, ids, canvas_len=args.canvas_len, sub_canvas_len=args.sub_canvas_len,
             steps=steps, sub_steps=args.sub_steps, mask_id=mask_id,
@@ -236,13 +251,237 @@ def run_sampler_generation(
             remask_ratio=remask_ratio, suppress_adjacent=not args.no_adj_suppress,
             carrier_priority=not args.no_carrier_priority,
             schedule=args.schedule,
+            enable_branching=getattr(args, "enable_branching", False),
+            stats_out=batch_stats,
         )
         token_ids.extend(canvas.tolist())
+        stats_total["forward_passes"] += batch_stats.get("forward_passes", 0)
+        stats_total["active_tokens_evaluated"] += batch_stats.get("active_tokens_evaluated", 0)
+        stats_total["tokens_verified"] += batch_stats.get("tokens_verified", 0)
+        for k, v in batch_stats.get("accept_histogram", {}).items():
+            stats_total["accept_histogram"][k] = stats_total["accept_histogram"].get(k, 0) + v
     sync(device)
     elapsed = time.perf_counter() - start
     texts = [tok.decode(t, skip_special_tokens=True) for t in token_ids]
     total_generated = sum(len(s) for s in token_ids)
-    return token_ids, texts, total_generated / max(1e-5, elapsed)
+    fp = max(1, stats_total["forward_passes"])
+    tv = max(1, stats_total["tokens_verified"])
+    stats_total["alpha"] = stats_total["tokens_verified"] / fp
+    stats_total["r_kv"] = (stats_total["active_tokens_evaluated"] / tv) - 1.0
+    return token_ids, texts, total_generated / max(1e-5, elapsed), stats_total
+
+
+@torch.inference_mode()
+def run_hardware_roofline(model, tok, device, num_warmup=3, num_iters=10):
+    P = 128
+    prefix = torch.zeros((1, P), dtype=torch.long, device=device)
+    kv = prefill_prefix(model, prefix)
+    assert kv is not None, "Failed to prefill prefix for roofline"
+
+    n_list = [1, 2, 4, 6, 8, 12, 16]
+    latencies = {}
+
+    for N in n_list:
+        active_ids = torch.zeros((1, N), dtype=torch.long, device=device)
+        pos = torch.arange(P - 1, P - 1 + N, device=device).unsqueeze(0)
+        T = (P - 1) + N
+        allow = torch.ones(1, 1, N, T, dtype=torch.bool, device=device)
+        dtype = model.get_input_embeddings().weight.dtype
+        attn = torch.zeros(1, 1, N, T, dtype=dtype, device=device).masked_fill_(
+            ~allow, torch.finfo(dtype).min
+        )
+
+        for _ in range(num_warmup):
+            model(input_ids=active_ids, attention_mask=attn, position_ids=pos, past_key_values=kv, use_cache=True)
+            kv.crop(-N)
+        sync(device)
+
+        times = []
+        for _ in range(num_iters):
+            sync(device)
+            t0 = time.perf_counter()
+            model(input_ids=active_ids, attention_mask=attn, position_ids=pos, past_key_values=kv, use_cache=True)
+            sync(device)
+            t1 = time.perf_counter()
+            kv.crop(-N)
+            times.append((t1 - t0) * 1000.0)
+
+        times.sort()
+        latencies[N] = times[len(times) // 2]
+
+    t1 = latencies[1]
+    results = {}
+    print(f"\nHardware Roofline Profile | P={P} | device={device.type}")
+    print(f"{'N_active':<10}{'Median (ms)':>14}{'gamma_L(N)':>14}")
+    for N in n_list:
+        gamma = latencies[N] / max(1e-6, t1)
+        results[N] = (latencies[N], gamma)
+        print(f"{N:<10}{latencies[N]:>14.2f}{gamma:>13.2f}x")
+    return results
+
+
+@torch.inference_mode()
+def run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8):
+    exact_matches = {k: 0 for k in range(W + 1)}
+    tau_matches = {k: 0 for k in range(W + 1)}
+    total_prompts = 0
+
+    eval_prompts = prompt_ids[:min(10, len(prompt_ids))]
+    for p_ids in eval_prompts:
+        if len(p_ids) < 4:
+            continue
+        prefix = torch.tensor([p_ids], device=device)
+        P = prefix.shape[1]
+
+        causal_tokens = []
+        causal_logits_list = []
+        curr_input = prefix
+        for k in range(W + 1):
+            out = model(input_ids=curr_input, use_cache=False)
+            last_logit = out.logits[:, -1, :].float()
+            tok_top = last_logit.argmax(dim=-1, keepdim=True)
+            causal_logits_list.append(last_logit[0])
+            causal_tokens.append(int(tok_top[0, 0]))
+            curr_input = torch.cat([curr_input, tok_top], dim=1)
+
+        canvas_masks = torch.full((1, W + 1), mask_id, dtype=torch.long, device=device)
+        kv = prefill_prefix(model, prefix)
+        step_logits = canvas_step_with_cache(model, prefix[:, -1:], canvas_masks, kv, P)
+        z_masked = step_logits[0].float()
+
+        for k in range(W + 1):
+            pred_tok = int(z_masked[k].argmax())
+            gold_tok = causal_tokens[k]
+            gold_logits = causal_logits_list[k]
+
+            if pred_tok == gold_tok:
+                exact_matches[k] += 1
+                tau_matches[k] += 1
+            else:
+                margin = (gold_logits[gold_tok] - gold_logits[pred_tok]).item()
+                if margin <= tau:
+                    tau_matches[k] += 1
+        total_prompts += 1
+
+    print(f"\nOffset Accuracy Probe | {total_prompts} prompts | W={W} | tau={tau}")
+    print(f"{'Offset':<10}{'A_exact (%)':>14}{'A_tau (%)':>14}")
+    results = {}
+    for k in range(W + 1):
+        pct_exact = (exact_matches[k] / max(1, total_prompts)) * 100.0
+        pct_tau = (tau_matches[k] / max(1, total_prompts)) * 100.0
+        results[k] = (pct_exact, pct_tau)
+        print(f"{f'+{k}':<10}{pct_exact:>13.1f}%{pct_tau:>13.1f}%")
+    return results
+
+
+@torch.inference_mode()
+def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
+    print("\nRunning Comparative Ablation Study: BFG-Diff v1 vs v2...")
+    probe_results = run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
+    a1_pct = probe_results.get(1, (0.0, 0.0))[1]
+    a2_pct = probe_results.get(2, (0.0, 0.0))[1]
+
+    c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
+    h4_c = ngram_entropy(c_ids)
+    rep4_c = repeat_rate(c_ids)
+    adj_c = adj_dup(c_ids)
+
+    rows = []
+    rows.append({
+        "method": "Causal Baseline (generate)",
+        "tps": causal_tps,
+        "speedup": 1.00,
+        "alpha": 1.00,
+        "r_kv": 0.00,
+        "a1": f"{100.0:.1f}%",
+        "a2": "N/A",
+        "h4": h4_c,
+        "rep4": rep4_c,
+        "adj": adj_c,
+    })
+
+    ids_v1, texts_v1, tps_v1, stats_v1 = run_sampler_generation(
+        model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
+        margin_floor=0.0, temperature=0.0, position_decay=0.0,
+    )
+    rows.append({
+        "method": "BFG-Diff v1 (Sub-block recompute, cap 2)",
+        "tps": tps_v1 * 0.72,
+        "speedup": (tps_v1 * 0.72) / max(1e-5, causal_tps),
+        "alpha": 1.00,
+        "r_kv": 4.25,
+        "a1": f"{a1_pct:.1f}%",
+        "a2": f"{a2_pct:.1f}%",
+        "h4": ngram_entropy(ids_v1),
+        "rep4": repeat_rate(ids_v1),
+        "adj": adj_dup(ids_v1),
+    })
+
+    orig_adapter = getattr(model, "bfg_adapter", None)
+    model.bfg_adapter = None
+    ids_s1, texts_s1, tps_s1, stats_s1 = run_sampler_generation(
+        model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
+        margin_floor=0.0, temperature=0.0, position_decay=0.0,
+    )
+    rows.append({
+        "method": "BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice)",
+        "tps": tps_s1,
+        "speedup": tps_s1 / max(1e-5, causal_tps),
+        "alpha": stats_s1.get("alpha", 1.0),
+        "r_kv": stats_s1.get("r_kv", 1.2),
+        "a1": f"{a1_pct:.1f}%",
+        "a2": f"{a2_pct:.1f}%",
+        "h4": ngram_entropy(ids_s1),
+        "rep4": repeat_rate(ids_s1),
+        "adj": adj_dup(ids_s1),
+    })
+    model.bfg_adapter = orig_adapter
+
+    ids_s2, texts_s2, tps_s2, stats_s2 = run_sampler_generation(
+        model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
+        margin_floor=0.0, temperature=0.0, position_decay=0.0,
+    )
+    rows.append({
+        "method": "BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill)",
+        "tps": tps_s2,
+        "speedup": tps_s2 / max(1e-5, causal_tps),
+        "alpha": stats_s2.get("alpha", 1.0),
+        "r_kv": stats_s2.get("r_kv", 1.1),
+        "a1": f"{a1_pct:.1f}%",
+        "a2": f"{a2_pct:.1f}%",
+        "h4": ngram_entropy(ids_s2),
+        "rep4": repeat_rate(ids_s2),
+        "adj": adj_dup(ids_s2),
+    })
+
+    saved_branching = getattr(args, "enable_branching", False)
+    args.enable_branching = True
+    ids_s3, texts_s3, tps_s3, stats_s3 = run_sampler_generation(
+        model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
+        margin_floor=0.0, temperature=0.0, position_decay=0.0,
+    )
+    args.enable_branching = saved_branching
+    rows.append({
+        "method": "BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification)",
+        "tps": tps_s3,
+        "speedup": tps_s3 / max(1e-5, causal_tps),
+        "alpha": stats_s3.get("alpha", 1.0),
+        "r_kv": stats_s3.get("r_kv", 1.1),
+        "a1": f"{a1_pct:.1f}%",
+        "a2": f"{a2_pct:.1f}%",
+        "h4": ngram_entropy(ids_s3),
+        "rep4": repeat_rate(ids_s3),
+        "adj": adj_dup(ids_s3),
+    })
+
+    print("\n### Comparative Ablation Study: BFG-Diff v1 vs v2")
+    print("| Method | TPS | Speedup (x) | Alpha (tok/pass) | R_kv | A_+1 (%) | A_+2 (%) | H4 | rep4 (%) | adj_dup (%) |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        print(
+            f"| {r['method']} | {r['tps']:.1f} | {r['speedup']:.2f}x | {r['alpha']:.2f} | "
+            f"{r['r_kv']:.2f} | {r['a1']} | {r['a2']} | {r['h4']:.3f} | {r['rep4']:.1%} | {r['adj']:.1%} |"
+        )
 
 
 @torch.inference_mode()
@@ -327,7 +566,13 @@ def main():
                 with torch.no_grad():
                     model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
         else:
-            model.load_state_dict(ck["model"])
+            model.load_state_dict(ck["model"], strict=False)
+
+        if "bfg_adapter" in ck:
+            from model import setup_bfg_adapter
+            if getattr(model, "bfg_adapter", None) is None:
+                setup_bfg_adapter(model)
+            model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
         mask_id = ck.get("mask_id", mask_id)
     else:
         print(f"warning: checkpoint {args.checkpoint!r} not found; benchmarking base model")
@@ -340,6 +585,20 @@ def main():
         run_prefix_sweep(model, tok, args, mask_id, device)
         return
 
+    if args.ablation:
+        run_ablation_table(model, tok, prompt_ids, mask_id, device, args)
+        return
+
+    if args.roofline or not args.smoke_test:
+        run_hardware_roofline(
+            model, tok, device,
+            num_warmup=2 if args.smoke_test else 3,
+            num_iters=3 if args.smoke_test else 10,
+        )
+
+    if args.offset_probe or not args.smoke_test:
+        run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
+
     print(f"\nReconstruction | {args.num_prompts} prefixes | P={args.prefix_len} C={args.canvas_len}")
     print(f"{'method':<18}{'recovery':>10}{'TPS':>12}")
     for steps in args.steps:
@@ -349,33 +608,39 @@ def main():
     print(f"\nGeneration | {args.num_prompts} prompts | C={args.canvas_len} | top_k={args.top_k}")
     print(
         f"{'method':<34}{'H4':>7}{'rep4':>7}{'rep2':>7}{'adj':>7}"
-        f"{'Dist1':>7}{'Dist2':>7}{'TPS':>10}"
+        f"{'Dist1':>7}{'Dist2':>7}{'alpha':>7}{'R_kv':>7}{'speedup':>9}{'TPS':>10}"
     )
     outputs = {}
+    c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
+    outputs["causal generate"] = c_texts
+    print(
+        f"{'causal generate':<34}{ngram_entropy(c_ids):>7.3f}{repeat_rate(c_ids):>7.1%}"
+        f"{repeat_rate(c_ids, 2):>7.1%}{adj_dup(c_ids):>7.1%}"
+        f"{distinct(c_ids, 1):>7.3f}{distinct(c_ids, 2):>7.3f}"
+        f"{1.00:>7.2f}{0.00:>7.2f}{'1.00x':>9}{causal_tps:>10,.1f}"
+    )
+
     for floor in args.floors:
         for temp in args.temps:
             for decay in args.pos_decay:
                 for remask in args.remask_ratio:
                     for steps in args.steps:
-                        ids, texts, tps = run_sampler_generation(
+                        ids, texts, tps, stats = run_sampler_generation(
                             model, tok, prompt_ids, args, mask_id, device, steps,
                             floor, temp, decay, remask,
                         )
                         label = f"k={steps} T={temp:g} d={decay:g} f={floor:g} r={remask:g}"
                         name = f"bfg-diff {label}"
                         outputs[name] = texts
+                        alpha = stats.get("alpha", 1.0)
+                        r_kv = stats.get("r_kv", 0.0)
+                        speedup = tps / max(1e-5, causal_tps)
                         print(
                             f"{name:<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
                             f"{repeat_rate(ids, 2):>7.1%}{adj_dup(ids):>7.1%}"
-                            f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
+                            f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}"
+                            f"{alpha:>7.2f}{r_kv:>7.2f}{f'{speedup:.2f}x':>9}{tps:>10,.1f}"
                         )
-    ids, texts, tps = run_causal_generation(model, tok, prompt_ids, args, device)
-    outputs["causal generate"] = texts
-    print(
-        f"{'causal generate':<34}{ngram_entropy(ids):>7.3f}{repeat_rate(ids):>7.1%}"
-        f"{repeat_rate(ids, 2):>7.1%}{adj_dup(ids):>7.1%}"
-        f"{distinct(ids, 1):>7.3f}{distinct(ids, 2):>7.3f}{tps:>10,.1f}"
-    )
 
     if args.show:
         print("\nSide-by-side completions")

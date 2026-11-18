@@ -19,13 +19,12 @@ from model import LORA_TARGETS, apply_lora, prepare
 from sampler import sample_canvas
 
 
-def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B-Instruct", device="cpu"):
+def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B", device=None):
     """Load base Qwen model and apply checkpoint adapters."""
     torch.set_num_threads(10)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
-    model, tok, mask_id = prepare(model_name, device=device, dtype=torch.float32)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
 
     ck_file = Path(checkpoint_path)
     if not ck_file.exists():
@@ -33,24 +32,40 @@ def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B-Instruct", dev
         if fallback.exists():
             print(f"Notice: {checkpoint_path} not found. Falling back to {fallback}")
             ck_file = fallback
+        elif Path("runs/smoke/last.pt").exists():
+            ck_file = Path("runs/smoke/last.pt")
         else:
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found.")
 
     print(f"Loading checkpoint from {ck_file}...")
     ck = torch.load(ck_file, map_location="cpu")
-    cfg = ck.get("lora_config", {})
-    model = apply_lora(
-        model,
-        cfg.get("r", 16),
-        cfg.get("alpha", 32),
-        cfg.get("dropout", 0.05),
-        cfg.get("targets", LORA_TARGETS),
-    )
+    model_name = ck.get("model_name", model_name)
+
+    model, tok, mask_id = prepare(model_name, device=device, dtype=torch.float32)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+
     if "lora" in ck:
+        cfg = ck.get("lora_config", {})
+        model = apply_lora(
+            model,
+            cfg.get("r", 16),
+            cfg.get("alpha", 32),
+            cfg.get("dropout", 0.05),
+            cfg.get("targets", LORA_TARGETS),
+        )
         set_peft_model_state_dict(model, ck["lora"])
-    if "mask_emb" in ck:
-        with torch.no_grad():
-            model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
+        if "mask_emb" in ck:
+            with torch.no_grad():
+                model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
+    elif "model" in ck:
+        model.load_state_dict(ck["model"], strict=False)
+
+    if "bfg_adapter" in ck:
+        from model import setup_bfg_adapter
+        if getattr(model, "bfg_adapter", None) is None:
+            setup_bfg_adapter(model)
+        model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
     model.eval()
     return model, tok, mask_id
 
@@ -104,6 +119,7 @@ def generate_bfg_stream(
             if tid is not None and tid != tok.unk_token_id:
                 stop_token_ids.append(tid)
 
+    stats = {}
     canvas_out = sample_canvas(
         model,
         prefix_ids,
@@ -115,6 +131,7 @@ def generate_bfg_stream(
         carrier_priority=carrier_priority,
         block_callback=block_trace_cb,
         stop_token_ids=stop_token_ids,
+        stats_out=stats,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -129,12 +146,17 @@ def generate_bfg_stream(
                 raw_text = raw_text.split(st)[0]
     full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
     tps = total_tokens / max(1e-5, elapsed)
+    alpha = stats.get("alpha", 1.0)
+    r_kv = stats.get("r_kv", 0.0)
 
     return {
         "text": full_text,
         "tokens": total_tokens,
         "elapsed": elapsed,
         "tps": tps,
+        "alpha": alpha,
+        "r_kv": r_kv,
+        "badge": f"{tps:.1f} TPS | α={alpha:.2f} tok/step",
     }
 
 
@@ -173,6 +195,7 @@ def generate_bfg_traced(
             if tid is not None and tid != tok.unk_token_id:
                 stop_token_ids.append(tid)
 
+    stats = {}
     canvas_out = sample_canvas(
         model,
         prefix_ids,
@@ -184,11 +207,13 @@ def generate_bfg_traced(
         carrier_priority=carrier_priority,
         block_callback=block_trace_cb,
         stop_token_ids=stop_token_ids,
+        stats_out=stats,
     )
 
     elapsed = time.perf_counter() - start_time
     total_tokens = canvas_out.shape[1]
     raw_text = tok.decode(canvas_out[0], skip_special_tokens=False)
+    raw_text = raw_text.replace("<|extra_0|>", "")
 
     # In chat mode, truncate cleanly at stop tokens
     if stop_tokens:
@@ -197,6 +222,8 @@ def generate_bfg_traced(
                 raw_text = raw_text.split(st)[0]
     full_text = raw_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
     tps = total_tokens / max(1e-5, elapsed)
+    alpha = stats.get("alpha", 1.0)
+    r_kv = stats.get("r_kv", 0.0)
 
     trace = []
     for b_idx in sorted(trace_blocks.keys()):
@@ -213,6 +240,9 @@ def generate_bfg_traced(
         "tokens": total_tokens,
         "elapsed": elapsed,
         "tps": tps,
+        "alpha": alpha,
+        "r_kv": r_kv,
+        "badge": f"{tps:.1f} TPS | α={alpha:.2f} tok/step",
         "trace": trace,
     }
 

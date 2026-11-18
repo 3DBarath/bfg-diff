@@ -76,59 +76,161 @@ def pick_device(name):
 
 
 def make_mask(target, mask_id):
-    """Hybrid Suffix + Random Mask Curriculum:
-    - 20% chance: Full Mask (t = 1.0) for step-1 initialization.
-    - 40% chance: Contiguous Suffix Mask [m:] (matches free generation carrier frontier;
-      trains 2-step and 3-step lookahead without right-hand leaks).
-    - 40% chance: Random Scatter Mask (t ~ U(0.20, 0.95)) to preserve infilling recovery.
+    """Staircase-Aligned Mask Curriculum:
+    - 50% Contiguous Lookahead Window Mask: target[:, :m] clean, target[:, m:] masked.
+    - 30% Simulated Draft Corruption + Suffix Mask: target[:, :m] clean, 1-2 corrupted drafts at m..m+2, and target[:, m+3:] masked.
+    - 20% Full or Random Scatter Mask.
+    Returns: noisy_target, mask, frontiers
     """
     B, C = target.shape
+    device = target.device
+    noisy = target.clone()
     mask = torch.zeros_like(target, dtype=torch.bool)
+    frontiers = []
+
     for i in range(B):
         u = torch.rand(1).item()
-        if u < 0.20:
-            # Full mask
-            mask[i, :] = True
-        elif u < 0.60:
-            # Contiguous suffix mask: pick split point m in 1..C-1
-            m = torch.randint(1, C, (1,)).item() if C > 1 else 0
+        if u < 0.50:
+            m = torch.randint(0, max(1, C - 1), (1,)).item()
             mask[i, m:] = True
+            noisy[i, m:] = mask_id
+            frontiers.append(m)
+        elif u < 0.80:
+            m = torch.randint(0, max(1, C - 4), (1,)).item()
+            frontiers.append(m)
+            n_corr = min(2, C - m)
+            corr_indices = torch.randperm(min(3, C - m), device=device)[:n_corr] + m
+            rand_toks = torch.randint(100, 10000, (n_corr,), device=device)
+            noisy[i, corr_indices] = rand_toks
+            mask[i, corr_indices] = True
+            m_suffix = min(C, m + 3)
+            if m_suffix < C:
+                mask[i, m_suffix:] = True
+                noisy[i, m_suffix:] = mask_id
         else:
-            # Random scatter mask
-            ratio = 0.20 + 0.75 * torch.rand(1).item()
-            n = max(1, int(ratio * C))
-            mask[i, torch.randperm(C, device=target.device)[:n]] = True
-    return target.masked_fill(mask, mask_id), mask
+            if torch.rand(1).item() < 0.5:
+                mask[i, :] = True
+                noisy[i, :] = mask_id
+                frontiers.append(0)
+            else:
+                ratio = 0.20 + 0.75 * torch.rand(1).item()
+                n = max(1, int(ratio * C))
+                perm = torch.randperm(C, device=device)[:n]
+                mask[i, perm] = True
+                noisy[i, perm] = mask_id
+                frontiers.append(int(perm.min().item()))
+
+    return noisy, mask, frontiers
 
 
-def diffusion_loss(model, prefix, target, mask_id):
-    noisy, mask = make_mask(target, mask_id)
-    logits = canvas_forward(model, prefix, noisy)
-    assert logits.shape[:2] == target.shape, logits.shape
-    return F.cross_entropy(logits[mask], target[mask])
+def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0):
+    B, C = target.shape
+    P = prefix.shape[1]
+    device = prefix.device
+    noisy, mask, frontiers = make_mask(target, mask_id)
+
+    # 1. Teacher Pass (Frozen Base Causal Model on clean sequence)
+    clean_seq = torch.cat([prefix, target], dim=1)
+    with torch.no_grad():
+        if hasattr(model, "disable_adapter"):
+            with model.disable_adapter():
+                t_out = model(input_ids=clean_seq, use_cache=False)
+        else:
+            t_out = model(input_ids=clean_seq, use_cache=False)
+        Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
+
+    # 2. Student Pass (2-Step Latent Recycling Unroll on 30% of steps)
+    if torch.rand(1).item() < 0.30:
+        with torch.no_grad():
+            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True)
+            latents_1 = latents_1.detach()
+        student_logits = canvas_forward(model, prefix, noisy, prev_latents=latents_1, return_hidden=False)
+    else:
+        student_logits = canvas_forward(model, prefix, noisy, prev_latents=None, return_hidden=False)
+
+    Z_student = student_logits.float()
+
+    # 3. Top-64 Teacher Gather KL Divergence (Memory Invariant 4)
+    topk_T = Z_teacher.topk(64, dim=-1)
+    topk_vals_T = topk_T.values
+    topk_idx = topk_T.indices
+    topk_vals_S = Z_student.gather(dim=-1, index=topk_idx)
+
+    p_teacher = F.softmax(topk_vals_T / T_distill, dim=-1)
+    log_p_student = F.log_softmax(topk_vals_S / T_distill, dim=-1)
+    kl_per_token = F.kl_div(log_p_student, p_teacher, reduction="none").sum(dim=-1) * (T_distill ** 2)
+
+    # Cross-Entropy against true target
+    ce_per_token = F.cross_entropy(Z_student.view(-1, Z_student.shape[-1]), target.view(-1), reduction="none").view(B, C)
+
+    loss_per_token = lambda_kl * kl_per_token + (1.0 - lambda_kl) * ce_per_token
+
+    # Offset position weighting: w_j = exp(-0.15 * (j - frontier))
+    weights = torch.ones_like(loss_per_token)
+    for i, front in enumerate(frontiers):
+        if front < C:
+            j_rel = torch.arange(C - front, device=device).float()
+            weights[i, front:] = torch.exp(-0.15 * j_rel)
+
+    return (loss_per_token[mask] * weights[mask]).sum() / weights[mask].sum().clamp_min(1.0)
 
 
 @torch.inference_mode()
 def evaluate(model, loader, mask_id, device, batches):
     model.eval()
-    total, n = 0.0, 0
+    total_loss, n = 0.0, 0
+    correct_1, total_1 = 0, 0
+    correct_2_4, total_2_4 = 0, 0
+
     for i, (prefix, target) in enumerate(loader):
         if i >= batches:
             break
         prefix, target = prefix.to(device), target.to(device)
-        mask = torch.rand(target.shape, device=device) < 0.5
-        mask[:, :1] = True
-        logits = canvas_forward(model, prefix, target.masked_fill(mask, mask_id))
-        total += F.cross_entropy(logits[mask], target[mask]).item()
+        B, C = target.shape
+        P = prefix.shape[1]
+
+        clean_seq = torch.cat([prefix, target], dim=1)
+        if hasattr(model, "disable_adapter"):
+            with model.disable_adapter():
+                t_out = model(input_ids=clean_seq, use_cache=False)
+        else:
+            t_out = model(input_ids=clean_seq, use_cache=False)
+        Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
+
+        mask = torch.zeros_like(target, dtype=torch.bool)
+        mask[:, 1:] = True
+        noisy = target.masked_fill(mask, mask_id)
+
+        Z_student = canvas_forward(model, prefix, noisy).float()
+
+        loss = F.cross_entropy(Z_student[mask], target[mask])
+        total_loss += loss.item()
         n += 1
+
+        top1_T = Z_teacher.argmax(dim=-1)
+        top1_S = Z_student.argmax(dim=-1)
+
+        if C > 1:
+            correct_1 += (top1_S[:, 1] == top1_T[:, 1]).sum().item()
+            total_1 += B
+
+        if C > 4:
+            correct_2_4 += (top1_S[:, 2:5] == top1_T[:, 2:5]).sum().item()
+            total_2_4 += (B * 3)
+
     model.train()
-    return total / max(1, n)
+    acc_offset1 = correct_1 / max(1, total_1)
+    acc_offset2_4 = correct_2_4 / max(1, total_2_4)
+    val_loss = total_loss / max(1, n)
+    return val_loss, acc_offset1, acc_offset2_4
 
 
 def save_checkpoint(path, model, mask_id, args, step):
     """LoRA runs save ~10 MB of adapters; full fine-tunes save the whole model."""
     path.parent.mkdir(parents=True, exist_ok=True)
     ck = {"mask_id": mask_id, "model_name": args.model, "step": step, "args": vars(args)}
+    if getattr(model, "bfg_adapter", None) is not None:
+        ck["bfg_adapter"] = model.bfg_adapter.state_dict()
     if args.lora:
         from peft import get_peft_model_state_dict
 
@@ -164,6 +266,9 @@ def main():
     )
 
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
+    from model import setup_bfg_adapter
+    setup_bfg_adapter(model, lora_r=args.lora_r if args.lora else 16)
+
     if args.lora:
         targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
         model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets, mask_id=mask_id)
@@ -176,6 +281,8 @@ def main():
             if "mask_emb" in ck:
                 with torch.no_grad():
                     model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
+            if "bfg_adapter" in ck and getattr(model, "bfg_adapter", None) is not None:
+                model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
             print(f"resumed from {args.resume} (source step {ck.get('step', '?')})")
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
@@ -207,9 +314,11 @@ def main():
         f"train={len(train_ds)} val={len(val_ds)} chunks"
     )
 
-    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_tokens" not in n]
+    adapter_params = list(model.bfg_adapter.parameters()) if getattr(model, "bfg_adapter", None) is not None else []
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_tokens" not in n]
+    all_trainable = list(dict.fromkeys(trainable_params + adapter_params))
     opt = torch.optim.AdamW(
-        lora_params,
+        all_trainable,
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
@@ -266,7 +375,7 @@ def main():
         tokens += prefix.numel() + target.numel()
 
         if step % args.grad_accum == 0 or step == args.steps:
-            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
             opt.step()
             sched.step()  # one schedule step per optimizer update
             opt.zero_grad(set_to_none=True)
@@ -295,9 +404,10 @@ def main():
             running, tokens, logged, last_log = 0.0, 0, 0, now
 
         if step % args.eval_every == 0 or step == args.steps:
+            val_loss, acc1, acc2_4 = evaluate(model, val_loader, mask_id, device, args.eval_batches)
             print(
-                f"step {step:5d} val_loss "
-                f"{evaluate(model, val_loader, mask_id, device, args.eval_batches):.4f}"
+                f"step {step:5d} val_loss {val_loss:.4f} "
+                f"acc_offset1 {acc1:.1%} acc_offset2_4 {acc2_4:.1%}"
             )
 
         if step % args.save_every == 0 or step == args.steps:

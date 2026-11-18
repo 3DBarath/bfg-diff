@@ -128,41 +128,233 @@ def prefill_prefix(model, prefix_ids, prefix_keep=None):
     ).past_key_values
 
 
-def canvas_step_with_cache(model, prefix_last_id, canvas_ids, past_key_values, prefix_len, prefix_keep=None):
-    """Logits (B, C, vocab) for canvas positions using cached prefix[:P-1] and active [prefix_last, canvas].
+class BFGDiffAdapter(torch.nn.Module):
+    """Pillar 3: Slot-Offset Embeddings & Latent Residual Recycling.
 
-    Slot 0 (canvas[0]) is predicted by prefix_last_id (pos P-1) attending to all prefix and canvas.
-    Slot j (canvas[j]) is predicted by canvas[j-1] (pos P-1+j) attending to all prefix and canvas.
+    - slot_emb: Learnable offset embeddings for Zone B positions +1..+W
+    - latent_norm + latent_down + latent_up: Residual projection recycling
+      previous step's top-layer hidden states h^(L) into Zone B lookahead slots.
+    Zero-initialized so that legacy checkpoints and step 0 produce 100% identical outputs.
     """
-    B, C = canvas_ids.shape
-    device = canvas_ids.device
-    dtype = model.get_input_embeddings().weight.dtype
-    active_ids = torch.cat([prefix_last_id, canvas_ids], dim=1)  # length 1 + C
-    T = prefix_len + C
+    def __init__(self, hidden_size, max_w=16, lora_r=16):
+        super().__init__()
+        self.max_w = max_w
+        self.slot_emb = torch.nn.Embedding(max_w, hidden_size)
+        torch.nn.init.zeros_(self.slot_emb.weight)
 
-    allow = torch.ones(B, 1, 1 + C, T, dtype=torch.bool, device=device)
-    if prefix_keep is not None and prefix_len > 1:
-        allow[..., : prefix_len - 1] &= prefix_keep[:, : prefix_len - 1].to(device=device, dtype=torch.bool).view(B, 1, 1, prefix_len - 1)
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+            self.latent_norm = Qwen2RMSNorm(hidden_size, eps=1e-6)
+        except Exception:
+            self.latent_norm = torch.nn.LayerNorm(hidden_size)
 
-    attn = torch.zeros(B, 1, 1 + C, T, dtype=dtype, device=device).masked_fill_(
+        self.latent_down = torch.nn.Linear(hidden_size, lora_r, bias=False)
+        self.latent_up = torch.nn.Linear(lora_r, hidden_size, bias=False)
+        torch.nn.init.zeros_(self.latent_up.weight)
+
+    def forward_offset(self, j_indices):
+        return self.slot_emb(j_indices)
+
+    def forward_latent(self, prev_latents):
+        normed = self.latent_norm(prev_latents)
+        return self.latent_up(torch.nn.functional.silu(self.latent_down(normed)))
+
+    def apply_to_embeds(self, embeds, zone_a_len, zone_b_len, prev_latents=None):
+        if zone_b_len <= 0:
+            return embeds
+        B, Q, H = embeds.shape
+        device = embeds.device
+        j_idx = torch.arange(zone_b_len, device=device).clamp_max(self.max_w - 1)
+        offset_embs = self.slot_emb(j_idx).unsqueeze(0)
+
+        out_embeds = embeds.clone()
+        out_embeds[:, zone_a_len : zone_a_len + zone_b_len] = (
+            out_embeds[:, zone_a_len : zone_a_len + zone_b_len] + offset_embs
+        )
+
+        if prev_latents is not None:
+            w_use = min(zone_b_len, prev_latents.shape[1])
+            if w_use > 0:
+                rec_embs = self.forward_latent(prev_latents[:, :w_use])
+                out_embeds[:, zone_a_len : zone_a_len + w_use] = (
+                    out_embeds[:, zone_a_len : zone_a_len + w_use] + rec_embs
+                )
+
+        return out_embeds
+
+
+def setup_bfg_adapter(model, max_w=16, lora_r=16):
+    """Attach BFGDiffAdapter to model matching its dtype and device."""
+    hidden_size = getattr(model.config, "hidden_size", 896)
+    adapter = BFGDiffAdapter(hidden_size, max_w=max_w, lora_r=lora_r)
+    emb = model.get_input_embeddings()
+    dtype = emb.weight.dtype
+    device = emb.weight.device
+    adapter.to(device=device, dtype=dtype)
+    model.bfg_adapter = adapter
+    return adapter
+
+
+def build_staircase_step_mask(
+    batch_size,
+    prefix_len,
+    zone_a_len,
+    zone_b_len,
+    dtype=torch.bfloat16,
+    device="cuda",
+    prefix_keep=None,
+    tree_mask_a=None,
+):
+    """Additive attention mask for fused staircase verification + lookahead drafting pass.
+
+    Zone A (queries 0..zone_a_len-1):
+      - Causal attention to cached prefix keys 0..prefix_len-2 (respecting prefix_keep)
+      - Strictly causal attention to Zone A keys (or tree_mask_a)
+      - ZERO attention to Zone B keys (strict causal isolation, Delta_leak = 0)
+    Zone B (queries zone_a_len..Q-1):
+      - Bidirectional attention across cached prefix, all Zone A keys, and all Zone B keys.
+    """
+    Q = zone_a_len + zone_b_len
+    cached_prefix = max(0, prefix_len - 1)
+    K = cached_prefix + Q
+    allow = torch.zeros(batch_size, 1, Q, K, dtype=torch.bool, device=device)
+
+    # 1. Prefix visibility
+    if cached_prefix > 0:
+        allow[:, :, :, :cached_prefix] = True
+        if prefix_keep is not None:
+            p_init = min(cached_prefix, prefix_keep.shape[1] - 1)
+            if p_init > 0:
+                keep = prefix_keep[:, :p_init].to(device=device, dtype=torch.bool).view(batch_size, 1, 1, p_init)
+                allow[:, :, :, :p_init] &= keep
+
+    # 2. Zone A queries
+    if zone_a_len > 0:
+        if tree_mask_a is not None:
+            t_mask = tree_mask_a.to(device=device, dtype=torch.bool)
+            if t_mask.dim() == 2:
+                t_mask = t_mask.unsqueeze(0).unsqueeze(0)
+            elif t_mask.dim() == 3:
+                t_mask = t_mask.unsqueeze(1)
+            allow[:, :, :zone_a_len, cached_prefix : cached_prefix + zone_a_len] = t_mask
+        else:
+            causal_a = torch.tril(torch.ones(zone_a_len, zone_a_len, dtype=torch.bool, device=device))
+            allow[:, :, :zone_a_len, cached_prefix : cached_prefix + zone_a_len] = causal_a
+        # Causal isolation: Zone A cannot attend to Zone B keys
+        allow[:, :, :zone_a_len, cached_prefix + zone_a_len :] = False
+
+    # 3. Zone B queries
+    if zone_b_len > 0:
+        allow[:, :, zone_a_len :, cached_prefix : cached_prefix + zone_a_len] = True
+        allow[:, :, zone_a_len :, cached_prefix + zone_a_len :] = True
+
+    return torch.zeros(batch_size, 1, Q, K, dtype=dtype, device=device).masked_fill_(
         ~allow, torch.finfo(dtype).min
     )
-    pos = (
-        torch.arange(prefix_len - 1, prefix_len + C, device=device).unsqueeze(0).expand(B, 1 + C)
-        if prefix_keep is None
-        else mask_position_ids(prefix_keep, C)[:, prefix_len - 1 :]
-    )
-    out = model(
-        input_ids=active_ids,
-        attention_mask=attn,
-        position_ids=pos,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
-    return out.logits[:, :C, :]
 
 
-def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None):
+def canvas_step_with_cache(
+    model,
+    active_ids_or_prefix_last,
+    past_key_values_or_canvas_ids=None,
+    past_key_values=None,
+    prefix_len=None,
+    zone_a_len=None,
+    prefix_keep=None,
+    tree_mask_a=None,
+    position_ids_override=None,
+    return_hidden=False,
+    inputs_embeds=None,
+    prev_latents=None,
+):
+    """Logits for staircase step pass.
+
+    Supports both:
+    1. Legacy v1 signature:
+       canvas_step_with_cache(model, prefix_last_id, canvas_ids, past_key_values, prefix_len, prefix_keep=None)
+       -> returns logits[:, :C, :] of shape (B, C, vocab)
+    2. v2 fused staircase signature:
+       canvas_step_with_cache(model, active_ids, past_key_values, prefix_len, zone_a_len=1+V, ...)
+       -> returns logits of shape (B, Q, vocab) (and hidden states if return_hidden=True)
+    """
+    if isinstance(past_key_values_or_canvas_ids, torch.Tensor):
+        # Legacy v1 call
+        prefix_last_id = active_ids_or_prefix_last
+        canvas_ids = past_key_values_or_canvas_ids
+        active_ids = torch.cat([prefix_last_id, canvas_ids], dim=1) if inputs_embeds is None else None
+        pkv = past_key_values
+        p_len = prefix_len
+        p_keep = zone_a_len  # 6th positional arg was prefix_keep in v1
+        z_a_len = 1
+        z_b_len = canvas_ids.shape[1]
+        is_v1_call = True
+    else:
+        # v2 staircase call
+        active_ids = active_ids_or_prefix_last
+        pkv = past_key_values_or_canvas_ids if past_key_values is None else past_key_values
+        p_len = prefix_len
+        z_a_len = 1 if zone_a_len is None else zone_a_len
+        total_len = active_ids.shape[1] if active_ids is not None else inputs_embeds.shape[1]
+        z_b_len = max(0, total_len - z_a_len)
+        p_keep = prefix_keep
+        is_v1_call = False
+
+    B = active_ids.shape[0] if active_ids is not None else inputs_embeds.shape[0]
+    Q = active_ids.shape[1] if active_ids is not None else inputs_embeds.shape[1]
+    device = active_ids.device if active_ids is not None else inputs_embeds.device
+    dtype = model.get_input_embeddings().weight.dtype
+
+    attn = build_staircase_step_mask(
+        batch_size=B,
+        prefix_len=p_len,
+        zone_a_len=z_a_len,
+        zone_b_len=z_b_len,
+        dtype=dtype,
+        device=device,
+        prefix_keep=p_keep,
+        tree_mask_a=tree_mask_a,
+    )
+
+    if position_ids_override is not None:
+        pos = position_ids_override
+    elif p_keep is not None:
+        pad_count = p_keep.shape[1] - p_keep.to(device=device, dtype=torch.long).sum(dim=1, keepdim=True)
+        pos = (p_len - 1 - pad_count) + torch.arange(Q, device=device).unsqueeze(0)
+    else:
+        pos = torch.arange(p_len - 1, p_len - 1 + Q, device=device).unsqueeze(0).expand(B, Q)
+
+    if inputs_embeds is None and getattr(model, "bfg_adapter", None) is not None:
+        base_embeds = model.get_input_embeddings()(active_ids)
+        inputs_embeds = model.bfg_adapter.apply_to_embeds(
+            base_embeds, z_a_len, z_b_len, prev_latents=prev_latents
+        )
+
+    kwargs = {
+        "attention_mask": attn,
+        "position_ids": pos,
+        "past_key_values": pkv,
+        "use_cache": True,
+    }
+    if return_hidden:
+        kwargs["output_hidden_states"] = True
+
+    if inputs_embeds is not None:
+        kwargs["inputs_embeds"] = inputs_embeds
+    else:
+        kwargs["input_ids"] = active_ids
+
+    out = model(**kwargs)
+
+    logits = out.logits
+    res = logits[:, :z_b_len, :] if is_v1_call else logits
+
+    if return_hidden:
+        hidden = out.hidden_states[-1]
+        return res, hidden
+    return res
+
+
+def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, return_hidden=False):
     """Logits for the canvas block only: (B, C, vocab), aligned with Qwen's k -> k+1 prediction."""
     B, P = prefix_ids.shape
     C = canvas_ids.shape[1]
@@ -175,5 +367,20 @@ def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None):
         if prefix_keep is None
         else mask_position_ids(prefix_keep, C)
     )
-    out = model(input_ids=input_ids, attention_mask=attn, position_ids=pos, use_cache=False)
-    return out.logits[:, P - 1 : P + C - 1, :]
+    kwargs = {"attention_mask": attn, "position_ids": pos, "use_cache": False}
+    if return_hidden:
+        kwargs["output_hidden_states"] = True
+
+    if getattr(model, "bfg_adapter", None) is not None:
+        base_embeds = model.get_input_embeddings()(input_ids)
+        inputs_embeds = model.bfg_adapter.apply_to_embeds(base_embeds, P, C, prev_latents=prev_latents)
+        kwargs["inputs_embeds"] = inputs_embeds
+    else:
+        kwargs["input_ids"] = input_ids
+
+    out = model(**kwargs)
+    logits = out.logits[:, P - 1 : P + C - 1, :]
+    if return_hidden:
+        hidden = out.hidden_states[-1][:, P - 1 : P + C - 1, :]
+        return logits, hidden
+    return logits
