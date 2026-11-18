@@ -296,23 +296,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
 <title>BFG-Diff Engine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #000000;
-    --surface: #0a0a0a;
-    --surface-elevated: #111111;
-    --border: #222222;
-    --border-hover: #333333;
-    --text-primary: #ededed;
-    --text-secondary: #888888;
-    --text-tertiary: #555555;
+    --bg: #09090b;
+    --sidebar-bg: #040405;
+    --surface: #121215;
+    --surface-elevated: #1a1a1f;
+    --border: #222226;
+    --border-hover: #333339;
+    --border-subtle: #19191d;
+    --text-primary: #f4f4f5;
+    --text-secondary: #a1a1aa;
+    --text-tertiary: #52525b;
     --accent: #ffffff;
-    --accent-dim: #262626;
+    --accent-contrast: #000000;
     --mono-font: "Geist Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     --sans-font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
@@ -324,229 +326,427 @@ HTML_PAGE = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent;
   }
 
-  body {
+  html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
     background-color: var(--bg);
     color: var(--text-primary);
     font-family: var(--sans-font);
     font-size: 14px;
     line-height: 1.5;
     letter-spacing: -0.01em;
-    padding: 20px 16px;
-    display: flex;
-    justify-content: center;
-    min-height: 100vh;
     -webkit-font-smoothing: antialiased;
   }
 
-  .shell {
-    max-width: 880px;
+  /* Main Viewport Layout */
+  .app-frame {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
     width: 100%;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
+    position: relative;
   }
 
-  /* Top Navigation Bar */
-  .top-bar {
+  /* Fixed Clean Header */
+  .top-header {
+    height: 52px;
+    min-height: 52px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--border-subtle);
     display: flex;
-    flex-direction: column;
-    gap: 16px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--border);
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg);
+    z-index: 20;
   }
-  @media (min-width: 640px) {
-    .top-bar {
-      flex-direction: row;
-      justify-content: space-between;
-      align-items: center;
-    }
+  @media (min-width: 768px) {
+    .top-header { padding: 0 24px; }
   }
 
-  .brand {
+  .header-brand {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
+    align-items: center;
+    gap: 8px;
+    cursor: default;
   }
-  .brand-name {
-    font-size: 15px;
+  .brand-title {
+    font-size: 14.5px;
     font-weight: 600;
     letter-spacing: -0.02em;
     color: var(--text-primary);
   }
-  .brand-version {
+  .brand-tag {
     font-family: var(--mono-font);
-    font-size: 11px;
+    font-size: 10.5px;
     color: var(--text-tertiary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 2px 6px;
+    border-radius: 4px;
   }
 
-  .segmented-nav {
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  /* Segmented Nav */
+  .segmented-control {
     display: inline-flex;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 2px;
   }
-  .nav-item {
+  .seg-btn {
     background: transparent;
     border: none;
     color: var(--text-secondary);
     font-family: var(--sans-font);
     font-size: 12px;
     font-weight: 500;
-    padding: 6px 14px;
+    padding: 5px 12px;
     border-radius: 4px;
     cursor: pointer;
-    transition: color 0.15s, background-color 0.15s;
-    white-space: nowrap;
+    transition: all 0.15s ease;
   }
-  .nav-item:hover {
-    color: var(--text-primary);
-  }
-  .nav-item.active {
+  .seg-btn:hover { color: var(--text-primary); }
+  .seg-btn.active {
     background: var(--surface-elevated);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
   }
 
-  /* Parameter Strip */
-  .config-strip {
-    background: var(--surface);
+  .icon-btn {
+    background: transparent;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 14px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: var(--sans-font);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+  }
+  .icon-btn:hover {
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+    background: var(--surface);
+  }
+
+  /* Sliding Drawer / Settings Bar */
+  .settings-tray {
+    display: none;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 16px;
+    animation: traySlide 0.15s ease-out;
+    z-index: 15;
+  }
+  @media (min-width: 768px) {
+    .settings-tray { padding: 12px 24px; }
+  }
+  @keyframes traySlide {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .settings-tray.open {
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
-
-  .preset-row {
+  .tray-presets {
     display: flex;
     align-items: center;
     gap: 8px;
     overflow-x: auto;
     scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
-    padding-bottom: 2px;
   }
-  .preset-row::-webkit-scrollbar { display: none; }
-  .preset-label {
-    font-size: 11px;
-    font-family: var(--mono-font);
-    color: var(--text-tertiary);
-    text-transform: uppercase;
-    white-space: nowrap;
-    letter-spacing: 0.04em;
-  }
-  .preset-btn {
+  .tray-presets::-webkit-scrollbar { display: none; }
+  .preset-pill {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--text-secondary);
+    font-size: 11.5px;
     font-family: var(--sans-font);
-    font-size: 12px;
-    padding: 4px 10px;
+    padding: 3px 10px;
     border-radius: 4px;
     cursor: pointer;
     white-space: nowrap;
     transition: all 0.15s;
   }
-  .preset-btn:hover {
-    border-color: var(--border-hover);
-    color: var(--text-primary);
-  }
-  .preset-btn.active {
+  .preset-pill:hover { border-color: var(--border-hover); color: var(--text-primary); }
+  .preset-pill.active {
     background: var(--accent);
-    color: var(--bg);
+    color: var(--accent-contrast);
     border-color: var(--accent);
     font-weight: 500;
   }
-
-  .params-grid {
+  .tray-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     gap: 10px;
-    padding-top: 10px;
-    border-top: 1px solid var(--border);
   }
   @media (min-width: 640px) {
-    .params-grid {
-      grid-template-columns: repeat(5, 1fr);
-      gap: 12px;
-    }
+    .tray-grid { grid-template-columns: repeat(5, 1fr); }
   }
-
-  .field-group {
+  .tray-field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
   }
-  .field-label {
+  .tray-field label {
     font-family: var(--mono-font);
     font-size: 10px;
     color: var(--text-tertiary);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .field-input, .field-select {
-    background: var(--surface-elevated);
+  .tray-field input, .tray-field select {
+    background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text-primary);
     font-family: var(--mono-font);
     font-size: 12px;
-    padding: 6px 8px;
+    padding: 5px 8px;
     border-radius: 4px;
     outline: none;
-    transition: border-color 0.15s;
-    width: 100%;
-  }
-  .field-input:focus, .field-select:focus {
-    border-color: var(--border-hover);
   }
 
-  /* Buttons */
-  .btn-primary {
-    background: var(--accent);
-    color: var(--bg);
-    border: none;
-    font-family: var(--sans-font);
-    font-size: 13px;
-    font-weight: 500;
-    padding: 8px 16px;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: opacity 0.15s;
+  /* -------------------------------------------------------------
+     FULLSCREEN CHAT INTERFACE (ChatGPT/Claude Style)
+     ------------------------------------------------------------- */
+  #tabChatView {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    height: calc(100% - 52px);
     width: 100%;
+    position: relative;
+    overflow: hidden;
   }
-  @media (min-width: 640px) {
-    .btn-primary { width: auto; }
-  }
-  .btn-primary:hover { opacity: 0.9; }
-  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  .btn-ghost {
-    background: transparent;
+  .chat-stream-viewport {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 20px 16px 120px 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    scroll-behavior: smooth;
+  }
+  @media (min-width: 768px) {
+    .chat-stream-viewport { padding: 32px 24px 140px 24px; }
+  }
+
+  .chat-conversation-flow {
+    max-width: 768px;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  .message-block {
+    display: flex;
+    width: 100%;
+    gap: 14px;
+    animation: fadeIn 0.2s ease-out;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .message-block.user {
+    justify-content: flex-end;
+  }
+  .message-block.assistant {
+    justify-content: flex-start;
+  }
+
+  .message-content {
+    display: flex;
+    flex-direction: column;
+    max-width: 88%;
+  }
+  @media (min-width: 768px) {
+    .message-content { max-width: 82%; }
+  }
+
+  .user-bubble {
+    background: var(--surface-elevated);
     border: 1px solid var(--border);
-    color: var(--text-secondary);
-    font-family: var(--sans-font);
-    font-size: 12px;
-    padding: 5px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.15s;
+    color: var(--text-primary);
+    padding: 10px 16px;
+    border-radius: 18px;
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
-  .btn-ghost:hover {
-    border-color: var(--border-hover);
+
+  .assistant-stream {
+    color: var(--text-primary);
+    font-size: 14.5px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 4px 0;
+  }
+
+  .message-stats {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--text-tertiary);
+    margin-top: 6px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .chat-welcome {
+    margin: auto;
+    text-align: center;
+    max-width: 480px;
+    padding: 40px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  .welcome-logo {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono-font);
+    font-size: 15px;
+    font-weight: 600;
     color: var(--text-primary);
   }
+  .welcome-title {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+  }
+  .welcome-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
 
-  /* Workspace Cards */
-  .card {
+  /* Floating Bottom Input Deck */
+  .chat-composer-floating {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    padding: 12px 16px 20px 16px;
+    display: flex;
+    justify-content: center;
+    background: linear-gradient(180deg, transparent 0%, var(--bg) 28%);
+    pointer-events: none;
+    z-index: 10;
+  }
+  @media (min-width: 768px) {
+    .chat-composer-floating { padding: 16px 24px 28px 24px; }
+  }
+
+  .composer-capsule {
+    max-width: 768px;
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    padding: 8px 10px 8px 18px;
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
+    pointer-events: auto;
+    transition: border-color 0.15s ease;
+  }
+  .composer-capsule:focus-within {
+    border-color: var(--border-hover);
+  }
+
+  .chat-prompt-field {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: var(--sans-font);
+    font-size: 14.5px;
+    line-height: 1.45;
+    padding: 6px 0;
+    resize: none;
+    min-height: 24px;
+    max-height: 160px;
+    outline: none;
+  }
+  .chat-prompt-field::placeholder {
+    color: var(--text-tertiary);
+  }
+
+  .submit-circle-btn {
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: opacity 0.15s ease, transform 0.1s ease;
+  }
+  .submit-circle-btn:hover { opacity: 0.9; }
+  .submit-circle-btn:active { transform: scale(0.96); }
+  .submit-circle-btn:disabled { opacity: 0.2; cursor: not-allowed; }
+  .submit-circle-btn svg { width: 15px; height: 15px; fill: currentColor; }
+
+  /* -------------------------------------------------------------
+     VISUALIZER TAB INTERFACE
+     ------------------------------------------------------------- */
+  #tabVisualizerView {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 16px 40px 16px;
+    display: flex;
+    justify-content: center;
+  }
+  @media (min-width: 768px) {
+    .tabVisualizerView { padding: 28px 24px 60px 24px; }
+  }
+
+  .vis-container {
+    max-width: 860px;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .vis-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
   }
-  .card-header {
+  .vis-header {
     padding: 10px 14px;
     background: var(--surface-elevated);
     border-bottom: 1px solid var(--border);
@@ -554,25 +754,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     justify-content: space-between;
     align-items: center;
   }
-  .card-title {
+  .vis-title {
     font-size: 12px;
     font-weight: 500;
     color: var(--text-secondary);
-    letter-spacing: -0.01em;
   }
-  .telemetry-chip {
+  .vis-meta {
     font-family: var(--mono-font);
     font-size: 11px;
     color: var(--text-tertiary);
   }
 
-  .prompt-box {
+  .vis-prompt-deck {
     padding: 14px;
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
-  .prompt-textarea {
+  .vis-textarea {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -584,52 +783,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
     resize: vertical;
     min-height: 80px;
     outline: none;
-    transition: border-color 0.15s;
     width: 100%;
   }
-  .prompt-textarea:focus { border-color: var(--border-hover); }
 
-  /* Output Comparison */
-  .comparison-split {
+  .vis-split {
     display: grid;
     grid-template-columns: 1fr;
     gap: 12px;
   }
   @media (min-width: 768px) {
-    .comparison-split { grid-template-columns: 1fr 1fr; }
+    .vis-split { grid-template-columns: 1fr 1fr; }
   }
-  .output-view {
+  .vis-output {
     padding: 14px;
     font-size: 13.5px;
     line-height: 1.55;
     color: var(--text-primary);
-    min-height: 120px;
+    min-height: 110px;
     white-space: pre-wrap;
     word-break: break-word;
   }
 
-  /* Execution Trace */
-  .trace-container {
+  .trace-feed {
     padding: 12px 14px;
     display: flex;
     flex-direction: column;
     gap: 8px;
   }
-  .trace-sub-block {
+  .trace-block {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 5px;
     padding: 8px 10px;
   }
-  .trace-header {
+  .trace-sub-title {
     font-family: var(--mono-font);
     font-size: 10px;
     text-transform: uppercase;
     color: var(--text-tertiary);
-    margin-bottom: 6px;
+    margin-bottom: 5px;
     letter-spacing: 0.04em;
   }
-  .trace-row {
+  .trace-step-row {
     font-family: var(--mono-font);
     font-size: 11.5px;
     display: flex;
@@ -638,7 +833,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex-wrap: wrap;
     line-height: 1.8;
   }
-  .chip {
+  .token-tag {
     padding: 1px 5px;
     background: var(--surface-elevated);
     border: 1px solid var(--border);
@@ -646,221 +841,146 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--text-secondary);
     font-size: 11px;
   }
-
-  /* Multi-Turn Chat View */
-  .chat-wrapper {
-    height: calc(100vh - 200px);
-    min-height: 480px;
-    max-height: 720px;
-    display: flex;
-    flex-direction: column;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .chat-feed {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .message-unit {
-    display: flex;
-    flex-direction: column;
-    max-width: 86%;
-  }
-  .message-unit.user {
+  .btn-execute {
+    background: var(--accent);
+    color: var(--accent-contrast);
+    border: none;
+    font-family: var(--sans-font);
+    font-size: 13px;
+    font-weight: 500;
+    padding: 8px 16px;
+    border-radius: 5px;
+    cursor: pointer;
     align-self: flex-end;
   }
-  .message-unit.assistant {
-    align-self: flex-start;
-  }
-  .message-meta {
-    font-family: var(--mono-font);
-    font-size: 10px;
-    color: var(--text-tertiary);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-bottom: 4px;
-  }
-  .message-unit.user .message-meta {
-    text-align: right;
-  }
-  .message-body {
-    padding: 10px 14px;
-    border-radius: 6px;
-    font-size: 13.5px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .message-unit.user .message-body {
-    background: var(--surface-elevated);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-  }
-  .message-unit.assistant .message-body {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-  }
-  .message-telemetry {
-    font-family: var(--mono-font);
-    font-size: 10.5px;
-    color: var(--text-tertiary);
-    margin-top: 4px;
-  }
-
-  .chat-input-deck {
-    padding: 12px 14px;
-    border-top: 1px solid var(--border);
-    background: var(--surface-elevated);
-    display: flex;
-    gap: 10px;
-    align-items: flex-end;
-  }
-  .chat-textarea {
-    flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--text-primary);
-    font-family: var(--sans-font);
-    font-size: 13.5px;
-    line-height: 1.45;
-    padding: 8px 12px;
-    resize: none;
-    min-height: 40px;
-    max-height: 110px;
-    outline: none;
-  }
-  .chat-textarea:focus { border-color: var(--border-hover); }
-
-  .chat-placeholder {
-    margin: auto;
-    text-align: center;
-    color: var(--text-tertiary);
-    font-size: 12.5px;
-    font-family: var(--mono-font);
-    padding: 20px;
-  }
+  .btn-execute:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 </head>
 <body>
 
-<div class="shell">
-  <!-- Minimal Top Header -->
-  <header class="top-bar">
-    <div class="brand">
-      <span class="brand-name">BFG-Diff</span>
-      <span class="brand-version">v2 · Staircase Diffusion</span>
+<div class="app-frame">
+  <!-- Minimal Header -->
+  <header class="top-header">
+    <div class="header-brand">
+      <span class="brand-title">BFG-Diff</span>
+      <span class="brand-tag">v2</span>
     </div>
-    <nav class="segmented-nav">
-      <button class="nav-item active" id="navVisualizer" onclick="selectTab('visualizer')">Visualizer</button>
-      <button class="nav-item" id="navChat" onclick="selectTab('chat')">Chat</button>
-    </nav>
+    <div class="header-actions">
+      <nav class="segmented-control">
+        <button class="seg-btn active" id="btnTabChat" onclick="navigateTab('chat')">Chat</button>
+        <button class="seg-btn" id="btnTabVisualizer" onclick="navigateTab('visualizer')">Visualizer</button>
+      </nav>
+      <button class="icon-btn" onclick="toggleSettingsTray()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        <span>Settings</span>
+      </button>
+    </div>
   </header>
 
-  <!-- Clean Config Strip -->
-  <section class="config-strip">
-    <div class="preset-row">
-      <span class="preset-label">Preset:</span>
-      <button class="preset-btn active" onclick="loadPreset('balanced')">Balanced</button>
-      <button class="preset-btn" onclick="loadPreset('creative')">Creative</button>
-      <button class="preset-btn" onclick="loadPreset('fast')">Fast Lookahead</button>
-      <button class="preset-btn" onclick="loadPreset('greedy')">Deterministic</button>
+  <!-- Sliding Config Tray -->
+  <div class="settings-tray" id="settingsTray">
+    <div class="tray-presets">
+      <span style="font-family:var(--mono-font); font-size:10.5px; color:var(--text-tertiary); text-transform:uppercase;">Preset:</span>
+      <button class="preset-pill active" onclick="activatePreset('balanced')">Balanced</button>
+      <button class="preset-pill" onclick="activatePreset('creative')">Creative (T=0.7)</button>
+      <button class="preset-pill" onclick="activatePreset('fast')">Fast Lookahead</button>
+      <button class="preset-pill" onclick="activatePreset('greedy')">Deterministic</button>
+      <button class="preset-pill" onclick="clearConversation()" style="margin-left:auto; color:#ef4444; border-color:#3f1414;">Reset History</button>
     </div>
-    <div class="params-grid">
-      <div class="field-group">
-        <label class="field-label">Mode</label>
-        <select class="field-select" id="mode">
+    <div class="tray-grid">
+      <div class="tray-field">
+        <label>Mode</label>
+        <select id="cfgMode">
           <option value="chat" selected>ChatML</option>
           <option value="completion">Raw</option>
         </select>
       </div>
-      <div class="field-group">
-        <label class="field-label">Tokens</label>
-        <input class="field-input" type="number" id="canvas_len" value="32" min="8" max="256" step="8">
+      <div class="tray-field">
+        <label>Canvas Tokens</label>
+        <input type="number" id="cfgCanvas" value="32" min="8" max="256" step="8">
       </div>
-      <div class="field-group">
-        <label class="field-label">Block Size</label>
-        <input class="field-input" type="number" id="sub_canvas_len" value="8" min="4" max="32" step="4">
+      <div class="tray-field">
+        <label>Sub-Block Size</label>
+        <input type="number" id="cfgSubCanvas" value="8" min="4" max="32" step="4">
       </div>
-      <div class="field-group">
-        <label class="field-label">Steps / Block</label>
-        <input class="field-input" type="number" id="sub_steps" value="4" min="1" max="16" step="1">
+      <div class="tray-field">
+        <label>Sub-Steps</label>
+        <input type="number" id="cfgSubSteps" value="4" min="1" max="16" step="1">
       </div>
-      <div class="field-group" style="grid-column: span 1;">
-        <label class="field-label">Temperature</label>
-        <input class="field-input" type="number" id="temp" value="0.3" min="0.0" max="1.5" step="0.1">
+      <div class="tray-field">
+        <label>Temperature</label>
+        <input type="number" id="cfgTemp" value="0.3" min="0.0" max="1.5" step="0.1">
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 1: FULLSCREEN CHAT (ChatGPT Style) -->
+  <section id="tabChatView">
+    <div class="chat-stream-viewport" id="chatViewport">
+      <div class="chat-conversation-flow" id="conversationFlow">
+        <div class="chat-welcome" id="chatWelcome">
+          <div class="welcome-logo">BD</div>
+          <div class="welcome-title">BFG-Diff Discrete Diffusion</div>
+          <div class="welcome-sub">Ask a question, brainstorm ideas, or write code. Past messages are preserved across turns.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating Bottom Composer Deck -->
+    <div class="chat-composer-floating">
+      <div class="composer-capsule">
+        <textarea class="chat-prompt-field" id="chatInputText" placeholder="Message BFG-Diff..." rows="1"></textarea>
+        <button class="submit-circle-btn" id="chatSubmitCircleBtn" onclick="transmitChatMessage()">
+          <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
       </div>
     </div>
   </section>
 
-  <!-- VIEW 1: VISUALIZER -->
-  <main id="paneVisualizer">
-    <div class="card" style="margin-bottom: 16px;">
-      <div class="prompt-box">
-        <textarea class="prompt-textarea" id="prompt" rows="3">Explain the difference between a process and a thread in one short paragraph.</textarea>
-        <div style="display: flex; justify-content: flex-end;">
-          <button class="btn-primary" id="runBtn" onclick="executeGeneration()">Execute & Compare</button>
+  <!-- TAB 2: VISUALIZER -->
+  <section id="tabVisualizerView" style="display: none;">
+    <div class="vis-container">
+      <div class="vis-card">
+        <div class="vis-prompt-deck">
+          <textarea class="vis-textarea" id="visPrompt" rows="3">Explain the difference between a process and a thread in one short paragraph.</textarea>
+          <button class="btn-execute" id="btnRunVis" onclick="runVisualizerComparison()">Execute & Compare</button>
         </div>
       </div>
-    </div>
 
-    <div class="comparison-split" style="margin-bottom: 16px;">
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">BFG-Diff (Discrete Diffusion)</span>
-          <span class="telemetry-chip" id="bfgTelemetry">0.0 TPS</span>
+      <div class="vis-split">
+        <div class="vis-card">
+          <div class="vis-header">
+            <span class="vis-title">BFG-Diff (Verify & Diffuse)</span>
+            <span class="vis-meta" id="visBfgMeta">0.0 TPS</span>
+          </div>
+          <div class="vis-output" id="visBfgOutput">Awaiting execution...</div>
         </div>
-        <div class="output-view" id="bfgOutput">Awaiting execution...</div>
-      </div>
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Causal Baseline (generate)</span>
-          <span class="telemetry-chip" id="causalTelemetry">0.0 TPS</span>
+        <div class="vis-card">
+          <div class="vis-header">
+            <span class="vis-title">Causal Baseline (generate)</span>
+            <span class="vis-meta" id="visCausalMeta">0.0 TPS</span>
+          </div>
+          <div class="vis-output" id="visCausalOutput">Awaiting execution...</div>
         </div>
-        <div class="output-view" id="causalOutput">Awaiting execution...</div>
       </div>
-    </div>
 
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Block Unmasking Trace</span>
-      </div>
-      <div class="trace-container" id="traceContainer">
-        <div class="chat-placeholder">Execute a prompt to inspect speculative lookahead stages.</div>
-      </div>
-    </div>
-  </main>
-
-  <!-- VIEW 2: MULTI-TURN CHAT -->
-  <main id="paneChat" style="display: none;">
-    <div class="chat-wrapper">
-      <div class="card-header">
-        <span class="card-title">Session Memory</span>
-        <button class="btn-ghost" onclick="resetChat()">Reset Context</button>
-      </div>
-      <div class="chat-feed" id="chatFeed">
-        <div class="chat-placeholder" id="chatPlaceholder">
-          Context retained across turns. Send a message to begin.
+      <div class="vis-card">
+        <div class="vis-header">
+          <span class="vis-title">Block Unmasking Trace</span>
+        </div>
+        <div class="trace-feed" id="visTraceFeed">
+          <div style="font-family:var(--mono-font); font-size:12px; color:var(--text-tertiary); text-align:center; padding:16px;">
+            Execute a prompt to inspect speculative lookahead stages.
+          </div>
         </div>
       </div>
-      <div class="chat-input-deck">
-        <textarea class="chat-textarea" id="chatInput" placeholder="Write a message..."></textarea>
-        <button class="btn-primary" id="chatSubmitBtn" onclick="submitMessage()" style="width:auto; padding:8px 14px;">Send</button>
-      </div>
     </div>
-  </main>
+  </section>
 </div>
 
 <script>
-let activeTab = 'visualizer';
-let sessionContext = [
+let currentActiveTab = 'chat';
+let sessionChatHistory = [
   { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
 ];
 
@@ -868,70 +988,203 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function selectTab(tab) {
-  activeTab = tab;
-  document.getElementById('navVisualizer').className = 'nav-item' + (tab === 'visualizer' ? ' active' : '');
-  document.getElementById('navChat').className = 'nav-item' + (tab === 'chat' ? ' active' : '');
-  document.getElementById('paneVisualizer').style.display = tab === 'visualizer' ? 'block' : 'none';
-  document.getElementById('paneChat').style.display = tab === 'chat' ? 'block' : 'none';
+function navigateTab(tab) {
+  currentActiveTab = tab;
+  document.getElementById('btnTabChat').className = 'seg-btn' + (tab === 'chat' ? ' active' : '');
+  document.getElementById('btnTabVisualizer').className = 'seg-btn' + (tab === 'visualizer' ? ' active' : '');
+  document.getElementById('tabChatView').style.display = tab === 'chat' ? 'flex' : 'none';
+  document.getElementById('tabVisualizerView').style.display = tab === 'visualizer' ? 'flex' : 'none';
 }
 
-function loadPreset(name) {
-  document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+function toggleSettingsTray() {
+  const tray = document.getElementById('settingsTray');
+  tray.classList.toggle('open');
+}
+
+function activatePreset(preset) {
+  document.querySelectorAll('.preset-pill').forEach(p => p.classList.remove('active'));
   if (event && event.target) event.target.classList.add('active');
 
-  const canvasLen = document.getElementById('canvas_len');
-  const subCanvas = document.getElementById('sub_canvas_len');
-  const subSteps = document.getElementById('sub_steps');
-  const temp = document.getElementById('temp');
+  const cLen = document.getElementById('cfgCanvas');
+  const scLen = document.getElementById('cfgSubCanvas');
+  const scSteps = document.getElementById('cfgSubSteps');
+  const scTemp = document.getElementById('cfgTemp');
 
-  if (name === 'balanced') {
-    canvasLen.value = 32;
-    subCanvas.value = 8;
-    subSteps.value = 4;
-    temp.value = 0.3;
-  } else if (name === 'creative') {
-    canvasLen.value = 48;
-    subCanvas.value = 8;
-    subSteps.value = 4;
-    temp.value = 0.7;
-  } else if (name === 'fast') {
-    canvasLen.value = 32;
-    subCanvas.value = 16;
-    subSteps.value = 2;
-    temp.value = 0.1;
-  } else if (name === 'greedy') {
-    canvasLen.value = 32;
-    subCanvas.value = 8;
-    subSteps.value = 4;
-    temp.value = 0.0;
+  if (preset === 'balanced') {
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.3;
+  } else if (preset === 'creative') {
+    cLen.value = 48; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.7;
+  } else if (preset === 'fast') {
+    cLen.value = 32; scLen.value = 16; scSteps.value = 2; scTemp.value = 0.1;
+  } else if (preset === 'greedy') {
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0;
   }
 }
 
-async function executeGeneration() {
-  const btn = document.getElementById('runBtn');
+function clearConversation() {
+  sessionChatHistory = [
+    { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
+  ];
+  document.getElementById('conversationFlow').innerHTML = `
+    <div class="chat-welcome" id="chatWelcome">
+      <div class="welcome-logo">BD</div>
+      <div class="welcome-title">BFG-Diff Discrete Diffusion</div>
+      <div class="welcome-sub">Ask a question, brainstorm ideas, or write code. Past messages are preserved across turns.</div>
+    </div>
+  `;
+  document.getElementById('settingsTray').classList.remove('open');
+}
+
+// Auto-grow textarea like ChatGPT
+const chatInputArea = document.getElementById('chatInputText');
+chatInputArea.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+});
+
+chatInputArea.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    transmitChatMessage();
+  }
+});
+
+async function transmitChatMessage() {
+  const inputEl = document.getElementById('chatInputText');
+  const userText = inputEl.value.trim();
+  if (!userText) return;
+
+  const btn = document.getElementById('chatSubmitCircleBtn');
   btn.disabled = true;
-  btn.innerText = 'Processing...';
+  inputEl.disabled = true;
 
-  const bfgOutput = document.getElementById('bfgOutput');
-  const causalOutput = document.getElementById('causalOutput');
-  const bfgTelemetry = document.getElementById('bfgTelemetry');
-  const causalTelemetry = document.getElementById('causalTelemetry');
-  const traceContainer = document.getElementById('traceContainer');
+  const welcomeNotice = document.getElementById('chatWelcome');
+  if (welcomeNotice) welcomeNotice.remove();
 
-  bfgOutput.innerText = 'Unmasking active blocks...';
-  causalOutput.innerText = 'Generating token stream...';
-  bfgTelemetry.innerText = '0.0 TPS';
-  causalTelemetry.innerText = '0.0 TPS';
-  traceContainer.innerHTML = '';
+  sessionChatHistory.push({ role: "user", content: userText });
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+
+  const flow = document.getElementById('conversationFlow');
+  const viewport = document.getElementById('chatViewport');
+
+  // User message block
+  const userBlock = document.createElement('div');
+  userBlock.className = 'message-block user';
+  userBlock.innerHTML = `
+    <div class="message-content">
+      <div class="user-bubble">${escapeHtml(userText)}</div>
+    </div>
+  `;
+  flow.appendChild(userBlock);
+
+  // Assistant stream block
+  const botBlock = document.createElement('div');
+  botBlock.className = 'message-block assistant';
+  const replySpanId = 'replySpan_' + Date.now();
+  const replyMetaId = 'replyMeta_' + Date.now();
+  botBlock.innerHTML = `
+    <div class="message-content" style="max-width:100%;">
+      <div class="assistant-stream" id="${replySpanId}">Diffusing...</div>
+      <div class="message-stats" id="${replyMetaId}"></div>
+    </div>
+  `;
+  flow.appendChild(botBlock);
+  viewport.scrollTop = viewport.scrollHeight;
+
+  const replySpan = document.getElementById(replySpanId);
+  const replyMeta = document.getElementById(replyMetaId);
 
   const payload = {
-    prompt: document.getElementById('prompt').value,
-    mode: document.getElementById('mode').value,
-    canvas_len: parseInt(document.getElementById('canvas_len').value),
-    sub_canvas_len: parseInt(document.getElementById('sub_canvas_len').value),
-    sub_steps: parseInt(document.getElementById('sub_steps').value),
-    temp: parseFloat(document.getElementById('temp').value),
+    messages: sessionChatHistory,
+    canvas_len: parseInt(document.getElementById('cfgCanvas').value) || 32,
+    sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value) || 8,
+    sub_steps: parseInt(document.getElementById('cfgSubSteps').value) || 4,
+    temp: parseFloat(document.getElementById('cfgTemp').value) || 0.3,
+  };
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) throw new Error("HTTP error " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let raw = '';
+    let completedReply = '';
+
+    const NL = String.fromCharCode(10);
+    const CR = String.fromCharCode(13);
+    const DBL_NL = NL + NL;
+
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      raw += decoder.decode(chunk.value, { stream: true });
+
+      const normalized = raw.split(CR + NL).join(NL);
+      const items = normalized.split(DBL_NL);
+      raw = items.pop();
+
+      for (const item of items) {
+        const line = item.trim();
+        if (!line.startsWith('data:')) continue;
+        const bodyStr = line.substring(5).trim();
+        if (!bodyStr) continue;
+
+        const evt = JSON.parse(bodyStr);
+        if (evt.type === 'chat_step') {
+          replySpan.innerText = evt.text;
+          replyMeta.innerText = evt.tps.toFixed(1) + " TPS · " + evt.elapsed.toFixed(2) + "s";
+          viewport.scrollTop = viewport.scrollHeight;
+        } else if (evt.type === 'chat_done') {
+          completedReply = evt.text;
+          replySpan.innerText = evt.text;
+          replyMeta.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
+          sessionChatHistory.push({ role: "assistant", content: completedReply });
+          viewport.scrollTop = viewport.scrollHeight;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Chat failure:", err);
+    replySpan.innerText = "Error: " + err.message;
+  } finally {
+    btn.disabled = false;
+    inputEl.disabled = false;
+    inputEl.focus();
+  }
+}
+
+// Visualizer Handler
+async function runVisualizerComparison() {
+  const btn = document.getElementById('btnRunVis');
+  btn.disabled = true;
+  btn.innerText = 'Executing...';
+
+  const bfgOut = document.getElementById('visBfgOutput');
+  const causalOut = document.getElementById('visCausalOutput');
+  const bfgMeta = document.getElementById('visBfgMeta');
+  const causalMeta = document.getElementById('visCausalMeta');
+  const traceFeed = document.getElementById('visTraceFeed');
+
+  bfgOut.innerText = 'Unmasking active blocks...';
+  causalOut.innerText = 'Generating token stream...';
+  bfgMeta.innerText = '0.0 TPS';
+  causalMeta.innerText = '0.0 TPS';
+  traceFeed.innerHTML = '';
+
+  const payload = {
+    prompt: document.getElementById('visPrompt').value,
+    mode: document.getElementById('cfgMode').value,
+    canvas_len: parseInt(document.getElementById('cfgCanvas').value),
+    sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value),
+    sub_steps: parseInt(document.getElementById('cfgSubSteps').value),
+    temp: parseFloat(document.getElementById('cfgTemp').value),
   };
 
   const blockMap = {};
@@ -944,145 +1197,11 @@ async function executeGeneration() {
       body: JSON.stringify(payload)
     });
 
-    if (!res.ok) throw new Error("Server returned HTTP " + res.status);
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let raw = '';
-
-    const NL = String.fromCharCode(10);
-    const CR = String.fromCharCode(13);
-    const DBL_NL = NL + NL;
-
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      raw += decoder.decode(chunk.value, { stream: true });
-
-      const normalized = raw.split(CR + NL).join(NL);
-      const items = normalized.split(DBL_NL);
-      raw = items.pop();
-
-      for (const item of items) {
-        const line = item.trim();
-        if (!line.startsWith('data:')) continue;
-        const body = line.substring(5).trim();
-        if (!body) continue;
-
-        const evt = JSON.parse(body);
-
-        if (evt.type === 'causal_token') {
-          causalBuffer += evt.token;
-          causalOutput.innerText = causalBuffer;
-          causalTelemetry.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
-        } else if (evt.type === 'causal_done') {
-          causalOutput.innerText = evt.causal.text;
-          causalTelemetry.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
-        } else if (evt.type === 'bfg_step') {
-          bfgOutput.innerText = evt.text;
-          bfgTelemetry.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
-
-          if (!blockMap[evt.block_idx]) {
-            const blockEl = document.createElement('div');
-            blockEl.className = 'trace-sub-block';
-            blockEl.innerHTML = '<div class="trace-header">Sub-Block ' + (evt.block_idx + 1) + '</div>';
-            traceContainer.appendChild(blockEl);
-            blockMap[evt.block_idx] = blockEl;
-          }
-
-          const blockEl = blockMap[evt.block_idx];
-          const row = document.createElement('div');
-          row.className = 'trace-row';
-          const chips = evt.tokens.map(t => '<span class="chip">' + escapeHtml(t) + '</span>').join(' ');
-          row.innerHTML = '<span style="color:var(--text-tertiary); min-width:44px;">P' + evt.step + '</span>' + chips;
-          blockEl.appendChild(row);
-        } else if (evt.type === 'bfg_done') {
-          bfgOutput.innerText = evt.bfg.text;
-          bfgTelemetry.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
-        }
-      }
-    }
-  } catch (err) {
-    console.error("Execution error:", err);
-    bfgOutput.innerText = "Error: " + err.message;
-  } finally {
-    btn.disabled = false;
-    btn.innerText = 'Execute & Compare';
-  }
-}
-
-function resetChat() {
-  sessionContext = [
-    { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
-  ];
-  document.getElementById('chatFeed').innerHTML = `
-    <div class="chat-placeholder" id="chatPlaceholder">
-      Context retained across turns. Send a message to begin.
-    </div>
-  `;
-}
-
-async function submitMessage() {
-  const input = document.getElementById('chatInput');
-  const text = input.value.trim();
-  if (!text) return;
-
-  const btn = document.getElementById('chatSubmitBtn');
-  btn.disabled = true;
-  input.disabled = true;
-
-  const placeholder = document.getElementById('chatPlaceholder');
-  if (placeholder) placeholder.remove();
-
-  sessionContext.push({ role: "user", content: text });
-  input.value = '';
-
-  const feed = document.getElementById('chatFeed');
-
-  const userUnit = document.createElement('div');
-  userUnit.className = 'message-unit user';
-  userUnit.innerHTML = `
-    <div class="message-meta">You</div>
-    <div class="message-body">${escapeHtml(text)}</div>
-  `;
-  feed.appendChild(userUnit);
-
-  const assistantUnit = document.createElement('div');
-  assistantUnit.className = 'message-unit assistant';
-  const bodyId = 'replyBody_' + Date.now();
-  const telemetryId = 'replyTelem_' + Date.now();
-  assistantUnit.innerHTML = `
-    <div class="message-meta">BFG-Diff</div>
-    <div class="message-body" id="${bodyId}">Diffusing...</div>
-    <div class="message-telemetry" id="${telemetryId}"></div>
-  `;
-  feed.appendChild(assistantUnit);
-  feed.scrollTop = feed.scrollHeight;
-
-  const bodyEl = document.getElementById(bodyId);
-  const telemEl = document.getElementById(telemetryId);
-
-  const payload = {
-    messages: sessionContext,
-    canvas_len: parseInt(document.getElementById('canvas_len').value) || 32,
-    sub_canvas_len: parseInt(document.getElementById('sub_canvas_len').value) || 8,
-    sub_steps: parseInt(document.getElementById('sub_steps').value) || 4,
-    temp: parseFloat(document.getElementById('temp').value) || 0.3,
-  };
-
-  try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-
     if (!res.ok) throw new Error("HTTP " + res.status);
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let raw = '';
-    let finalAnswer = '';
 
     const NL = String.fromCharCode(10);
     const CR = String.fromCharCode(13);
@@ -1104,35 +1223,45 @@ async function submitMessage() {
         if (!body) continue;
 
         const evt = JSON.parse(body);
-        if (evt.type === 'chat_step') {
-          bodyEl.innerText = evt.text;
-          telemEl.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
-          feed.scrollTop = feed.scrollHeight;
-        } else if (evt.type === 'chat_done') {
-          finalAnswer = evt.text;
-          bodyEl.innerText = evt.text;
-          telemEl.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
-          sessionContext.push({ role: "assistant", content: finalAnswer });
-          feed.scrollTop = feed.scrollHeight;
+        if (evt.type === 'causal_token') {
+          causalBuffer += evt.token;
+          causalOut.innerText = causalBuffer;
+          causalMeta.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+        } else if (evt.type === 'causal_done') {
+          causalOut.innerText = evt.causal.text;
+          causalMeta.innerText = evt.causal.tps.toFixed(1) + " TPS (" + evt.causal.elapsed.toFixed(2) + "s)";
+        } else if (evt.type === 'bfg_step') {
+          bfgOut.innerText = evt.text;
+          bfgMeta.innerText = evt.tps.toFixed(1) + " TPS (" + evt.elapsed.toFixed(2) + "s)";
+
+          if (!blockMap[evt.block_idx]) {
+            const bDiv = document.createElement('div');
+            bDiv.className = 'trace-block';
+            bDiv.innerHTML = '<div class="trace-sub-title">Sub-Block ' + (evt.block_idx + 1) + '</div>';
+            traceFeed.appendChild(bDiv);
+            blockMap[evt.block_idx] = bDiv;
+          }
+
+          const bDiv = blockMap[evt.block_idx];
+          const row = document.createElement('div');
+          row.className = 'trace-step-row';
+          const chips = evt.tokens.map(t => '<span class="token-tag">' + escapeHtml(t) + '</span>').join(' ');
+          row.innerHTML = '<span style="color:var(--text-tertiary); min-width:40px;">P' + evt.step + '</span>' + chips;
+          bDiv.appendChild(row);
+        } else if (evt.type === 'bfg_done') {
+          bfgOut.innerText = evt.bfg.text;
+          bfgMeta.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
         }
       }
     }
   } catch (err) {
-    console.error("Chat failure:", err);
-    bodyEl.innerText = "Error: " + err.message;
+    console.error("Visualizer error:", err);
+    bfgOut.innerText = "Error: " + err.message;
   } finally {
     btn.disabled = false;
-    input.disabled = false;
-    input.focus();
+    btn.innerText = 'Execute & Compare';
   }
 }
-
-document.getElementById('chatInput').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    submitMessage();
-  }
-});
 </script>
 </body>
 </html>
