@@ -229,7 +229,7 @@ def run_reconstruction(model, tok, args, mask_id, device, steps):
 @torch.inference_mode()
 def run_sampler_generation(
     model, tok, prompt_ids, args, mask_id, device, steps, margin_floor, temperature, position_decay,
-    remask_ratio=0.0,
+    remask_ratio=0.0, use_v1=False,
 ):
     token_ids = []
     stats_total = {
@@ -253,6 +253,7 @@ def run_sampler_generation(
             schedule=args.schedule,
             enable_branching=getattr(args, "enable_branching", False),
             stats_out=batch_stats,
+            use_v1=use_v1,
         )
         token_ids.extend(canvas.tolist())
         stats_total["forward_passes"] += batch_stats.get("forward_passes", 0)
@@ -344,9 +345,12 @@ def run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=
             causal_tokens.append(int(tok_top[0, 0]))
             curr_input = torch.cat([curr_input, tok_top], dim=1)
 
-        canvas_masks = torch.full((1, W + 1), mask_id, dtype=torch.long, device=device)
+        canvas_masks = torch.full((1, W), mask_id, dtype=torch.long, device=device)
+        active_ids = torch.cat([prefix[:, -1:], canvas_masks], dim=1)
         kv = prefill_prefix(model, prefix)
-        step_logits = canvas_step_with_cache(model, prefix[:, -1:], canvas_masks, kv, P)
+        step_logits = canvas_step_with_cache(
+            model, active_ids, past_key_values=kv, prefix_len=P, zone_a_len=1
+        )
         z_masked = step_logits[0].float()
 
         for k in range(W + 1):
@@ -402,14 +406,14 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
 
     ids_v1, texts_v1, tps_v1, stats_v1 = run_sampler_generation(
         model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
-        margin_floor=0.0, temperature=0.0, position_decay=0.0,
+        margin_floor=0.0, temperature=0.0, position_decay=0.0, use_v1=True,
     )
     rows.append({
         "method": "BFG-Diff v1 (Sub-block recompute, cap 2)",
-        "tps": tps_v1 * 0.72,
-        "speedup": (tps_v1 * 0.72) / max(1e-5, causal_tps),
-        "alpha": 1.00,
-        "r_kv": 4.25,
+        "tps": tps_v1,
+        "speedup": tps_v1 / max(1e-5, causal_tps),
+        "alpha": stats_v1.get("alpha", 1.00),
+        "r_kv": stats_v1.get("r_kv", 4.00),
         "a1": f"{a1_pct:.1f}%",
         "a2": f"{a2_pct:.1f}%",
         "h4": ngram_entropy(ids_v1),

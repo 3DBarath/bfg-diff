@@ -912,10 +912,16 @@ def main():
     parser.add_argument(
         "--prompt", type=str, default=None, help="Single prompt execution non-interactively"
     )
+    parser.add_argument(
+        "--device", default="auto", choices=["auto", "cuda", "cpu"], help="Compute device"
+    )
     args = parser.parse_args()
 
     # Load model
-    model, tok, mask_id = load_bfg_model(args.checkpoint, device="cpu")
+    device = torch.device(
+        "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
+    )
+    model, tok, mask_id = load_bfg_model(args.checkpoint, device=device)
 
     if args.server:
         start_server(model, tok, mask_id, port=args.port)

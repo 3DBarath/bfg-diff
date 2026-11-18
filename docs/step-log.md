@@ -487,6 +487,37 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Verification: `python benchmark.py --smoke_test --ablation` ran and outputted full comparative markdown table cleanly.
    - Verification: `python benchmark.py --smoke_test` passed standard generation and reconstruction evaluations.
 
+## 30. Dual Checkpoint Bug Fixes, Gates Re-Verification & v2 Adapter Distillation (2026-11-18)
+
+1. **Surgical Defect Remediation:**
+   - **Bug 1 (`sampler.py`):** Changed default `draft_margin_thresh` from `0.8` to `0.0`, allowing candidate lookahead drafts to actively propose and verify in Zone A.
+   - **Bug 2 (`model.py`, `train.py`, `sampler.py`):** Fixed `apply_to_embeds` in `model.py` to condition on `mask` and apply slot embeddings relative to the sample mask frontier $P+m$ rather than clean context. Added `get_inputs_embeds` helper in `BFGDiffAdapter`. Auto-detected adapter and enabled latent recycling `latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]` in `sample_staircase_sliding`.
+   - **Bug 3 (`benchmark.py`):** Replaced hardcoded multiplier placeholders with genuine `use_v1=True` sub-block execution (`sample_canvas_block`).
+   - **Bug 4 (`sampler.py`):** Fixed batch overwriting in `sample_canvas` by processing multi-sequence batches sequentially with isolated KV caches.
+   - **Bug 5 (`chat.py`):** Added `--device` argument (`auto`, `cuda`, `cpu`) with automatic GPU acceleration.
+
+2. **Gates & Smoke Re-Verification:**
+   - Ran `python test_gate1.py && python test_gate2.py && python test_gate3.py && python test_gate4.py`: ALL PASS.
+   - Ran `python train.py --smoke_test`: `val_loss 4.5798 acc_offset1 75.0% acc_offset2_4 70.8%`, `smoke convergence: 11.6875 -> 4.3438 PASS`.
+   - Ran `python benchmark.py --smoke_test`: Reconstruction recovery 21.1% (25.2 TPS), Generation 23.4 TPS (alpha 1.07, R_kv 3.53).
+
+3. **Checkpoints Unzipped & Evaluated:**
+   - Extracted `bfg-instruct-last.zip` to `runs/bfg-instruct/last.pt`.
+   - Extracted `bfg-polished.zip` to `runs/bfg-polished/last.pt`.
+   - Evaluated both checkpoints on GPU with `benchmark.py --smoke_test --ablation`. Both achieved 75.0% $A_{+1}$ accuracy in the offset probe.
+
+4. **v2 Adapter Distillation Training:**
+   - Distilled `runs/bfg-polished/last.pt` for 300 steps with teacher-student KL loss. Validation loss improved from 5.1450 to 3.5648. Saved `runs/bfg-polished-v2/last.pt`.
+   - Launched 300-step distillation on `runs/bfg-instruct/last.pt` saving to `runs/bfg-instruct-v2/last.pt`. Validation loss improved from 5.1364 to 3.6153. Saved `runs/bfg-instruct-v2/last.pt`.
+
+5. **Full 100-Prompt Ablation Benchmark on GPU:**
+   - Evaluated `runs/bfg-polished-v2/last.pt` across 100 prompts on Tesla T4 GPU (`benchmark.py --ablation`).
+   - Probe demonstrated learned multi-offset lookahead: $A_{+1} = 60.0\%$, $A_{+2} = 20.0\%$, $A_{+3} = 10.0\%$.
+   - Measured $\alpha = 1.53$ tokens/pass (up from 1.07).
+   - Zero adjacent duplications ($0.0\%$) and reduced 4-gram repetition compared to causal attractor baseline ($56.5\% \to 39.4\%$).
+
+
+
 
 
 

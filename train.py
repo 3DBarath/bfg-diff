@@ -142,11 +142,15 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0)
     # 2. Student Pass (2-Step Latent Recycling Unroll on 30% of steps)
     if torch.rand(1).item() < 0.30:
         with torch.no_grad():
-            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True)
+            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
             latents_1 = latents_1.detach()
-        student_logits = canvas_forward(model, prefix, noisy, prev_latents=latents_1, return_hidden=False)
+        student_logits = canvas_forward(
+            model, prefix, noisy, prev_latents=latents_1, return_hidden=False, mask=mask
+        )
     else:
-        student_logits = canvas_forward(model, prefix, noisy, prev_latents=None, return_hidden=False)
+        student_logits = canvas_forward(
+            model, prefix, noisy, prev_latents=None, return_hidden=False, mask=mask
+        )
 
     Z_student = student_logits.float()
 
@@ -201,7 +205,7 @@ def evaluate(model, loader, mask_id, device, batches):
         mask[:, 1:] = True
         noisy = target.masked_fill(mask, mask_id)
 
-        Z_student = canvas_forward(model, prefix, noisy).float()
+        Z_student = canvas_forward(model, prefix, noisy, mask=mask).float()
 
         loss = F.cross_entropy(Z_student[mask], target[mask])
         total_loss += loss.item()

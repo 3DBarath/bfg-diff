@@ -18,7 +18,7 @@ def sample_staircase_sliding(
     suppress_adjacent=True,
     tau=0.8,
     settle_margin=2.0,
-    draft_margin_thresh=0.8,
+    draft_margin_thresh=0.0,
     W_max=4,
     V_max=3,
     kv=None,
@@ -40,6 +40,9 @@ def sample_staircase_sliding(
     B = prefix_ids.shape[0]
     device = prefix_ids.device
     cur_prefix_len = prefix_ids.shape[1]
+
+    if adapter is None:
+        adapter = getattr(model, "bfg_adapter", None)
 
     if kv is None:
         kv = prefill_prefix(model, prefix_ids, prefix_keep)
@@ -115,6 +118,7 @@ def sample_staircase_sliding(
             stats_out["forward_passes"] += 1
             stats_out["active_tokens_evaluated"] += Q
 
+        return_hidden = (adapter is not None)
         out_step = canvas_step_with_cache(
             model,
             active_ids,
@@ -124,10 +128,11 @@ def sample_staircase_sliding(
             prefix_keep=prefix_keep,
             tree_mask_a=tree_mask_a,
             position_ids_override=pos_override,
-            return_hidden=(adapter is not None),
+            return_hidden=return_hidden,
             inputs_embeds=inputs_embeds,
+            prev_latents=prev_latents,
         )
-        if adapter is not None and isinstance(out_step, tuple):
+        if return_hidden and isinstance(out_step, tuple):
             logits, latents = out_step
         else:
             logits = out_step
@@ -338,7 +343,7 @@ def sample_staircase_sliding(
                     tok_b = int(top2_b.indices[0])
                     if suppress_adjacent and tok_b == c_prev:
                         tok_b = int(top2_b.indices[1])
-                    if margin_b >= draft_margin_thresh:
+                    if draft_margin_thresh <= 0.0 or margin_b >= draft_margin_thresh:
                         candidate_drafts.append(tok_b)
                         c_prev = tok_b
                     else:
@@ -398,6 +403,7 @@ def sample_canvas_block(
     gamma=0.5,
     settle_margin=2.0,
     stats_out=None,
+    **kwargs,
 ):
     """Return concrete canvas token ids (B, C). Pass `canvas` pre-filled with mask_id at
     unknown slots to do reconstruction; otherwise the canvas starts fully masked.
@@ -713,12 +719,58 @@ def sample_canvas(
     block_callback=None,
     stop_token_ids=None,
     stats_out=None,
+    use_v1=False,
     **kwargs,
 ):
     """Generate canvas_len tokens using the fused staircase sliding engine with in-place KV slicing."""
+    if use_v1:
+        sub_c_len = sub_canvas_len or 8
+        sub_s = sub_steps or max(1, steps // max(1, canvas_len // sub_c_len))
+        cur_prefix = prefix_ids
+        cur_keep = prefix_keep
+        all_blocks = []
+        for blk_start in range(0, canvas_len, sub_c_len):
+            cur_len = min(sub_c_len, canvas_len - blk_start)
+            block_out = sample_canvas_block(
+                model,
+                cur_prefix,
+                canvas_len=cur_len,
+                steps=sub_s,
+                prefix_keep=cur_keep,
+                carrier_priority=carrier_priority,
+                stop_token_ids=stop_token_ids,
+                stats_out=stats_out,
+                **kwargs,
+            )
+            all_blocks.append(block_out)
+            cur_prefix = torch.cat([cur_prefix, block_out], dim=1)
+            if cur_keep is not None:
+                cur_keep = torch.cat(
+                    [cur_keep, torch.ones_like(block_out, dtype=cur_keep.dtype)], dim=1
+                )
+        return torch.cat(all_blocks, dim=1)
+
     def cb(s, disp_tensor):
         if block_callback is not None:
             block_callback(0, s, disp_tensor)
+
+    B = prefix_ids.shape[0]
+    if B > 1:
+        chunks = []
+        for b in range(B):
+            p_keep_b = prefix_keep[b : b + 1] if prefix_keep is not None else None
+            out_b = sample_staircase_sliding(
+                model,
+                prefix_ids[b : b + 1],
+                canvas_len=canvas_len,
+                prefix_keep=p_keep_b,
+                step_callback=cb if b == 0 else None,
+                stop_token_ids=stop_token_ids,
+                stats_out=stats_out,
+                **kwargs,
+            )
+            chunks.append(out_b)
+        return torch.cat(chunks, dim=0)
 
     return sample_staircase_sliding(
         model,

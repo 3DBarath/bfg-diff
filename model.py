@@ -159,15 +159,35 @@ class BFGDiffAdapter(torch.nn.Module):
         normed = self.latent_norm(prev_latents)
         return self.latent_up(torch.nn.functional.silu(self.latent_down(normed)))
 
-    def apply_to_embeds(self, embeds, zone_a_len, zone_b_len, prev_latents=None):
-        if zone_b_len <= 0:
-            return embeds
-        B, Q, H = embeds.shape
+    def apply_to_embeds(
+        self, embeds, zone_a_len=0, zone_b_len=0, prev_latents=None, mask=None, prefix_len=None
+    ):
+        out_embeds = embeds.clone()
+        B = embeds.shape[0]
         device = embeds.device
+
+        # Training / full sequence mode with explicit mask (B, C)
+        if mask is not None and prefix_len is not None:
+            for b in range(B):
+                masked_idx = torch.where(mask[b])[0]
+                if len(masked_idx) > 0:
+                    j_idx = torch.arange(len(masked_idx), device=device).clamp_max(self.max_w - 1)
+                    seq_pos = prefix_len + masked_idx
+                    out_embeds[b, seq_pos] = out_embeds[b, seq_pos] + self.slot_emb(j_idx)
+                    if prev_latents is not None:
+                        w_use = min(len(masked_idx), prev_latents.shape[1])
+                        if w_use > 0:
+                            rec = self.forward_latent(prev_latents[b : b + 1, :w_use])
+                            out_embeds[b, seq_pos[:w_use]] = out_embeds[b, seq_pos[:w_use]] + rec[0]
+            return out_embeds
+
+        if zone_b_len <= 0:
+            return out_embeds
+
+        # Step / inference mode: Zone A (clean) followed by Zone B (masks)
         j_idx = torch.arange(zone_b_len, device=device).clamp_max(self.max_w - 1)
         offset_embs = self.slot_emb(j_idx).unsqueeze(0)
 
-        out_embeds = embeds.clone()
         out_embeds[:, zone_a_len : zone_a_len + zone_b_len] = (
             out_embeds[:, zone_a_len : zone_a_len + zone_b_len] + offset_embs
         )
@@ -181,6 +201,12 @@ class BFGDiffAdapter(torch.nn.Module):
                 )
 
         return out_embeds
+
+    def get_inputs_embeds(self, model, active_ids, zone_a_len, zone_b_len, prev_latents=None):
+        base_embeds = model.get_input_embeddings()(active_ids)
+        return self.apply_to_embeds(
+            base_embeds, zone_a_len=zone_a_len, zone_b_len=zone_b_len, prev_latents=prev_latents
+        )
 
 
 def setup_bfg_adapter(model, max_w=16, lora_r=16):
@@ -354,7 +380,9 @@ def canvas_step_with_cache(
     return res
 
 
-def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, return_hidden=False):
+def canvas_forward(
+    model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, return_hidden=False, mask=None
+):
     """Logits for the canvas block only: (B, C, vocab), aligned with Qwen's k -> k+1 prediction."""
     B, P = prefix_ids.shape
     C = canvas_ids.shape[1]
@@ -373,7 +401,10 @@ def canvas_forward(model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents
 
     if getattr(model, "bfg_adapter", None) is not None:
         base_embeds = model.get_input_embeddings()(input_ids)
-        inputs_embeds = model.bfg_adapter.apply_to_embeds(base_embeds, P, C, prev_latents=prev_latents)
+        mask_to_use = mask if mask is not None else (canvas_ids == getattr(model, "mask_id", 151665))
+        inputs_embeds = model.bfg_adapter.apply_to_embeds(
+            base_embeds, mask=mask_to_use, prefix_len=P, prev_latents=prev_latents
+        )
         kwargs["inputs_embeds"] = inputs_embeds
     else:
         kwargs["input_ids"] = input_ids

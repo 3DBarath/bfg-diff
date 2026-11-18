@@ -295,4 +295,34 @@ Instead of hard cross-entropy against fixed training tokens, `train.py` trains t
 - **Suffix Curriculum:** `make_mask` draws 50% contiguous lookahead suffixes (mimicking decoding state), 30% simulated corrupted drafts, and 20% scatter masks.
 - **Distance Weighting:** Loss is weighted by $w(j) = 1.0 / (1.0 + 0.3 \cdot j)$, prioritizing immediate frontier accuracy $A_{+1}$.
 
+## BFG-Diff v2 Surgical Bug Fixes & Alignment (2026-11-18)
+
+During dual-checkpoint verification on real weights (`runs/bfg-polished/last.pt` and `runs/bfg-instruct/last.pt`), five surgical alignment bugs in the initial implementation were identified and resolved:
+
+### 1. Lookahead Draft Proposal & Offset Alignment in `sampler.py`
+- **Issue:** In `sample_staircase_sliding`, candidate lookahead drafts were gated behind `margin_b >= draft_margin_thresh` with a high default threshold `0.8`. For undertrained or standard models, lookahead drafts were almost always suppressed (`draft_ids = None`), preventing Zone A speculative leaps. In addition, offset indexing between Zone A output logits and Zone B lookahead drafting required strict verification against carrier tokens.
+- **Resolution:** Set `draft_margin_thresh = 0.0` by default so lookahead tokens are always proposed for verification. Zone B mask index `0` (at `zone_a_len`) directly predicts the token following the Zone A bonus token, ensuring seamless speculative pipeline execution.
+
+### 2. Full Adapter Wire-Up During Training and Inference
+- **Issue:** `BFGDiffAdapter` was disconnected at both training and inference time:
+  1. During training, `apply_to_embeds(base_embeds, P, C)` mistakenly treated `P` as `zone_a_len` and added slot offsets to clean prompt/target tokens rather than unmasked slots starting at frontier $P+m$.
+  2. During inference, `sampler.py` defaulted `adapter=None` and checked `hasattr(adapter, "get_inputs_embeds")` while the adapter method was named `apply_to_embeds`, causing latent recycling to never execute.
+- **Resolution:** 
+  - Updated `apply_to_embeds` in `model.py` to accept `mask` and `prefix_len` tensors, applying zero offset to clean context and adding `slot_emb[0..]` strictly to masked canvas slots relative to each sample's mask frontier.
+  - Added `get_inputs_embeds` convenience wrapper in `BFGDiffAdapter`.
+  - In `sampler.py`, auto-detected `adapter = getattr(model, "bfg_adapter", None)`, enabled `return_hidden = (adapter is not None)`, and recycled top-layer hidden states `latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]` into subsequent forward passes.
+
+### 3. Removal of Synthetic Placeholders in Ablation Benchmarks
+- **Issue:** `benchmark.py` (`run_ablation_table`) previously used hardcoded placeholders (`tps_v1 * 0.72`, `"alpha": 1.00, "r_kv": 4.25`) instead of executing real sub-block diffusion.
+- **Resolution:** Replaced all synthetic placeholders with actual execution passes via `use_v1=True` and real sliding sub-block loops (`sample_canvas_block`), measuring genuine hardware throughput and acceptance rates on GPU.
+
+### 4. Batch Isolation in `sample_canvas`
+- **Issue:** `sample_staircase_sliding` indexed batch element 0 (`z[0, j]`) and returned `committed_tokens` expanded to batch size $B$, discarding elements $1 \dots B-1$ and corrupting corpus diversity metrics ($Dist1, Dist2$) when $B > 1$.
+- **Resolution:** Updated `sample_canvas` to chunk multi-prompt batches into independent prompt passes ($B=1$), isolating cache and committed states and eliminating cross-batch overwrite.
+
+### 5. CLI Device Selection in `chat.py`
+- **Issue:** `chat.py` hardcoded `device="cpu"` and `dtype=torch.float32`.
+- **Resolution:** Introduced dynamic `--device` CLI argument (`auto`, `cuda`, `cpu`) with automatic GPU acceleration when CUDA is available.
+
+
 
