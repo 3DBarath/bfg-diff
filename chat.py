@@ -82,6 +82,8 @@ def generate_bfg_stream(
     carrier_priority=True,
     stop_tokens=None,
     step_callback=None,
+    enable_branching=False,
+    tau=0.8,
 ):
     """Generate tokens using sample_canvas while streaming step-by-step updates via callback."""
     torch.set_num_threads(10)
@@ -132,6 +134,8 @@ def generate_bfg_stream(
         block_callback=block_trace_cb,
         stop_token_ids=stop_token_ids,
         stats_out=stats,
+        enable_branching=enable_branching,
+        tau=tau,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -208,6 +212,8 @@ def generate_bfg_traced(
         block_callback=block_trace_cb,
         stop_token_ids=stop_token_ids,
         stats_out=stats,
+        enable_branching=enable_branching,
+        tau=tau,
     )
 
     elapsed = time.perf_counter() - start_time
@@ -1107,21 +1113,47 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
             </div>
             <div class="custom-menu-options" id="customPresetOptions">
-              <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', 'Balanced')">
-                <span>Balanced</span>
-                <span class="item-sub">T=0.3 · 4 steps</span>
+              <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', '⚡ Balanced (Standard)')">
+                <div>
+                  <div style="font-weight:500;">Balanced Standard</div>
+                  <div class="item-sub">T=0.3 · 4 passes · calibrated lookahead</div>
+                </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative')">
-                <span>Creative</span>
-                <span class="item-sub">T=0.7 · diverse</span>
+              <div class="custom-menu-item" onclick="pickCustomPreset('snappy', '⚡ Snappy Chat (<1s)')">
+                <div>
+                  <div style="font-weight:500;">Snappy Low-Latency</div>
+                  <div class="item-sub">T=0.2 · 2 passes · immediate stop termination</div>
+                </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('fast', 'Fast Lookahead')">
-                <span>Fast Lookahead</span>
-                <span class="item-sub">C=16 · 2 steps</span>
+              <div class="custom-menu-item" onclick="pickCustomPreset('branching', '🌿 Multi-Branch Speculative (Pillar 4)')">
+                <div>
+                  <div style="font-weight:500;">Multi-Branch Speculative</div>
+                  <div class="item-sub">2-branch micro-tree · parallel runner-up exploration</div>
+                </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Deterministic')">
-                <span>Deterministic</span>
-                <span class="item-sub">T=0.0 · argmax</span>
+              <div class="custom-menu-item" onclick="pickCustomPreset('code', '💻 Code & Precision JSON')">
+                <div>
+                  <div style="font-weight:500;">Code & Strict Syntax</div>
+                  <div class="item-sub">T=0.0 · strict tau=0.4 · zero hallucinations</div>
+                </div>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('infill', '🧩 Maximum Infilling (200+ TPS)')">
+                <div>
+                  <div style="font-weight:500;">High-Throughput Infilling</div>
+                  <div class="item-sub">C=32 · sub-blocks=32 · parallel span completion</div>
+                </div>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('creative', '🎨 Creative Writing')">
+                <div>
+                  <div style="font-weight:500;">Creative Narrative</div>
+                  <div class="item-sub">T=0.7 · anti-loop frequency suppression</div>
+                </div>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', '🎯 Pure Deterministic')">
+                <div>
+                  <div style="font-weight:500;">Pure Argmax</div>
+                  <div class="item-sub">T=0.0 · exact greedy decoding for benchmarks</div>
+                </div>
               </div>
             </div>
           </div>
@@ -1146,9 +1178,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <label>Sub-Block Size</label>
             <input type="number" id="cfgSubCanvas" value="8" min="4" max="32" step="4">
           </div>
-          <div class="modal-field" style="grid-column: span 2;">
+          <div class="modal-field">
             <label>Diffusion Sub-Steps</label>
             <input type="number" id="cfgSubSteps" value="4" min="1" max="16" step="1">
+          </div>
+          <div class="modal-field">
+            <label>Lookahead Tau</label>
+            <input type="number" id="cfgTau" value="0.8" min="0.1" max="2.0" step="0.1">
+          </div>
+          <div class="modal-field" style="grid-column: span 2; display:flex; flex-direction:row; align-items:center; justify-content:space-between; padding-top:4px;">
+            <label style="cursor:pointer;" for="cfgBranching">2-Branch Micro-Tree (Pillar 4)</label>
+            <input type="checkbox" id="cfgBranching" style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">
           </div>
         </div>
       </div>
@@ -1288,15 +1328,23 @@ function onSelectPreset(preset) {
   const scLen = document.getElementById('cfgSubCanvas');
   const scSteps = document.getElementById('cfgSubSteps');
   const scTemp = document.getElementById('cfgTemp');
+  const scTau = document.getElementById('cfgTau');
+  const scBranch = document.getElementById('cfgBranching');
 
   if (preset === 'balanced') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.3;
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.3; scTau.value = 0.8; scBranch.checked = false;
+  } else if (preset === 'snappy') {
+    cLen.value = 24; scLen.value = 8; scSteps.value = 2; scTemp.value = 0.2; scTau.value = 0.8; scBranch.checked = false;
+  } else if (preset === 'branching') {
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.2; scTau.value = 0.9; scBranch.checked = true;
+  } else if (preset === 'code') {
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0; scTau.value = 0.4; scBranch.checked = false;
+  } else if (preset === 'infill') {
+    cLen.value = 48; scLen.value = 16; scSteps.value = 4; scTemp.value = 0.1; scTau.value = 0.8; scBranch.checked = false;
   } else if (preset === 'creative') {
-    cLen.value = 48; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.7;
-  } else if (preset === 'fast') {
-    cLen.value = 32; scLen.value = 16; scSteps.value = 2; scTemp.value = 0.1;
+    cLen.value = 48; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.7; scTau.value = 1.0; scBranch.checked = false;
   } else if (preset === 'greedy') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0;
+    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0; scTau.value = 0.8; scBranch.checked = false;
   }
 }
 
@@ -1378,6 +1426,8 @@ async function transmitChatMessage() {
     sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value) || 8,
     sub_steps: parseInt(document.getElementById('cfgSubSteps').value) || 4,
     temp: parseFloat(document.getElementById('cfgTemp').value) || 0.3,
+    branching: document.getElementById('cfgBranching').checked,
+    tau: parseFloat(document.getElementById('cfgTau').value) || 0.8,
   };
 
   try {
@@ -1462,6 +1512,8 @@ async function runVisualizerComparison() {
     sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value),
     sub_steps: parseInt(document.getElementById('cfgSubSteps').value),
     temp: parseFloat(document.getElementById('cfgTemp').value),
+    branching: document.getElementById('cfgBranching').checked,
+    tau: parseFloat(document.getElementById('cfgTau').value) || 0.8,
   };
 
   const blockMap = {};
@@ -1596,6 +1648,8 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             sub_canvas_len = req.get("sub_canvas_len", 8)
             sub_steps = req.get("sub_steps", 4)
             temp = req.get("temp", 0.3)
+            branching = bool(req.get("branching", False))
+            tau = float(req.get("tau", 0.8))
 
             # Apply Jinja2/ChatML template if available, else format cleanly
             try:
@@ -1638,6 +1692,8 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 sub_steps=sub_steps,
                 temperature=temp,
                 stop_tokens=stop_tokens,
+                enable_branching=branching,
+                tau=tau,
                 step_callback=lambda evt: send_chat_sse({
                     "type": "chat_step",
                     "text": evt.get("text", ""),
@@ -1669,6 +1725,8 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             sub_canvas_len = req.get("sub_canvas_len", 8)
             sub_steps = req.get("sub_steps", 4)
             temp = req.get("temp", 0.0)
+            branching = bool(req.get("branching", False))
+            tau = float(req.get("tau", 0.8))
 
             if mode == "chat" and "<|im_start|>" not in prompt:
                 prompt = (
@@ -1709,6 +1767,8 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 sub_steps=sub_steps,
                 temperature=temp,
                 stop_tokens=stop_tokens,
+                enable_branching=branching,
+                tau=tau,
                 step_callback=lambda evt: send_sse(evt),
             )
             send_sse({"type": "bfg_done", "bfg": bfg_res})
