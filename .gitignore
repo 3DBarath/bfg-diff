@@ -1,4 +1,13 @@
-runs/
+# Ignore large model checkpoints and temporary run artifacts
+runs/*
+!runs/bfg-v2-base/
+!runs/bfg-v2-base/last.pt
+!runs/bfg-v2-instruct/
+!runs/bfg-v2-instruct/last.pt
+!runs/bfg-polished-v2/
+!runs/bfg-polished-v2/last.pt
+!runs/bfg-instruct-v2/
+!runs/bfg-instruct-v2/last.pt
 __pycache__/
 *.py[cod]
 *.zip
