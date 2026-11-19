@@ -17,9 +17,7 @@ from typing import List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+from benchmark_v3 import GEN_PROMPTS
 
 # Curated seed templates across 5 diverse domains with zero benchmark overlap
 PROMPT_DOMAINS = {
@@ -84,7 +82,6 @@ def build_prompts(num_prompts: int) -> List[str]:
     for i in range(num_prompts):
         base = next(cycle_seeds)
         if i >= len(all_seeds):
-            # Add diverse prefix context
             prefix_modifiers = [
                 "Detailed explanation:\n",
                 "Step-by-step implementation:\n",
@@ -99,6 +96,75 @@ def build_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
+def load_hf_prompts(num_prompts: int) -> List[str]:
+    """Load diverse unique prompts from HuggingFace datasets across code, math, chat, systems.
+    Filters out any prompt with substring overlap against benchmark_v3's GEN_PROMPTS.
+    """
+    from datasets import load_dataset
+
+    benchmark_low = [p.lower()[:32] for p in GEN_PROMPTS]
+
+    def has_overlap(text: str) -> bool:
+        t_low = text.lower()
+        return any(b in t_low for b in benchmark_low)
+
+    prompts = []
+    seen = set()
+
+    sources = [
+        ("HuggingFaceH4/ultrachat_200k", "default", "train_sft", lambda x: x["messages"][0]["content"]),
+        ("meta-math/MetaMathQA", None, "train", lambda x: x["query"]),
+        ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", lambda x: x["text"][:300].rsplit(".", 1)[0] + "."),
+    ]
+
+    for ds_name, config, split, extractor in sources:
+        if len(prompts) >= num_prompts:
+            break
+        try:
+            print(f"Loading diverse prompts from {ds_name}...")
+            kwargs = {"split": split, "streaming": True}
+            if config:
+                ds = load_dataset(ds_name, config, **kwargs)
+            else:
+                ds = load_dataset(ds_name, **kwargs)
+
+            for item in ds:
+                try:
+                    text = extractor(item).strip()
+                    if len(text) < 20 or len(text) > 1000:
+                        continue
+                    if has_overlap(text):
+                        continue
+                    if text not in seen:
+                        seen.add(text)
+                        prompts.append(text)
+                        if len(prompts) >= num_prompts:
+                            break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Warning: could not load {ds_name} ({e})")
+
+    return prompts
+
+
+def load_diverse_prompts(num_prompts: int, prompt_source: str = "hf", smoke_test: bool = False) -> List[str]:
+    """Load prompts either from HF or local seeds with zero benchmark overlap."""
+    if smoke_test or prompt_source == "local":
+        return build_prompts(num_prompts)
+
+    try:
+        prompts = load_hf_prompts(num_prompts)
+        if len(prompts) >= num_prompts:
+            return prompts[:num_prompts]
+        print(f"HF loaded {len(prompts)} prompts (< {num_prompts}); supplementing with local seeds...")
+        supplement = build_prompts(num_prompts - len(prompts))
+        return prompts + supplement
+    except Exception as e:
+        print(f"Falling back to local diverse prompt pool ({e})...")
+        return build_prompts(num_prompts)
+
+
 def generate_onpolicy_dataset(
     model_name: str = "Qwen/Qwen2.5-1.5B",
     out_path: str = "data/onpolicy_1.5b.pt",
@@ -108,10 +174,14 @@ def generate_onpolicy_dataset(
     temperature: float = 0.2,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     smoke_test: bool = False,
+    prompt_source: str = "hf",
 ):
     """Run batched generation using frozen target model and save token sequences."""
     print(f"Loading {model_name} for on-policy generation on {device}...")
-    tok = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except Exception:
+        tok = AutoTokenizer.from_pretrained(model_name)
     tok.padding_side = "left"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -121,7 +191,13 @@ def generate_onpolicy_dataset(
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, local_files_only=True, **kwargs)
     except Exception:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, local_files_only=True, **kwargs)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, local_files_only=True, **kwargs)
+        except Exception:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, **kwargs)
+            except Exception:
+                model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, **kwargs)
     model.to(device).eval()
 
     if smoke_test:
@@ -129,8 +205,8 @@ def generate_onpolicy_dataset(
         batch_size = min(batch_size, 2)
         max_new_tokens = 32
 
-    prompts = build_prompts(num_samples)
-    print(f"Generated {len(prompts)} prompts. Generating responses at batch_size={batch_size}...")
+    prompts = load_diverse_prompts(num_samples, prompt_source=prompt_source, smoke_test=smoke_test)
+    print(f"Loaded {len(prompts)} unique diverse prompts (source={prompt_source}). Generating responses at batch_size={batch_size}...")
 
     all_sequences = []
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +279,7 @@ def main():
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--device", default="auto")
+    p.add_argument("--prompt_source", default="hf", choices=["hf", "local"])
     p.add_argument("--smoke_test", action="store_true")
     args = p.parse_args()
 
@@ -216,6 +293,7 @@ def main():
         temperature=args.temperature,
         device=device,
         smoke_test=args.smoke_test,
+        prompt_source=args.prompt_source,
     )
 
 

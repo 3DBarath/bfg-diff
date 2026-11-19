@@ -8,10 +8,6 @@ Verifies:
 - Gate 0 & Gate 1: Overhead and roofline profiling (T_verify + T_draft / T_verify(Q=1)).
 """
 
-import os
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
 import argparse
 import sys
 import time
@@ -264,8 +260,94 @@ def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
     return all_ok
 
 
+def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> bool:
+    """Unit Gate D: Exact Numerical Identity between Training & Inference at position t.
+    Enforces that train_v3's parallel block anchor forward and sampler_v3's forward_draft_step
+    produce identical logits (< 1e-4) from the same prefix and inputs.
+    """
+    print("\n" + "=" * 60)
+    print(f"UNIT GATE D: Train-Inference Numerical Parity Check ({model_name}, device={device})")
+    print("=" * 60)
+
+    base_dtype = torch.float32 if device == "cpu" else torch.float16
+    base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
+
+    torch.manual_seed(42)
+    S = 64
+    t = 24  # anchor position t
+    w = 7
+    seq = torch.randint(100, 1000, (1, S), device=device)
+
+    # 1. Training forward path for anchor position t
+    with torch.no_grad():
+        out = base_model(seq, output_hidden_states=True)
+        f_ctx = drafter.fuse_stage1_features(out.hidden_states)
+        f_last = f_ctx[:, t - 1 : t]
+        y_star = seq[:, t : t + 1]
+
+        # Training prefix KV: project full sequence once
+        pos_all = torch.arange(S, device=device).unsqueeze(0)
+        kp_all, vp_all = drafter.project_prefix_kv(f_ctx, pos_all)
+
+        # Draft block bridge
+        y_star_emb = drafter.embed_tokens(y_star)
+        mask_emb = drafter.embed_tokens(torch.tensor([[mask_id]], device=device))
+        h = drafter.bridge(y_star_emb, mask_emb, f_last, w=w)
+        pos_draft = torch.arange(t, t + w, device=device).unsqueeze(0)
+
+        # Block mask attending to prefix 0..t-1 and its own w keys
+        attn_mask = torch.full((1, 1, w, S + w), -1e4, dtype=f_ctx.dtype, device=device)
+        attn_mask[0, 0, :, :t] = 0.0
+        attn_mask[0, 0, :, S : S + w] = 0.0
+
+        for layer_idx in range(drafter.k_layers):
+            h, _, _ = drafter.forward_draft_layer(
+                layer_idx=layer_idx,
+                hidden_states=h,
+                pos_draft=pos_draft,
+                k_prefix=kp_all[layer_idx],
+                v_prefix=vp_all[layer_idx],
+                attn_mask=attn_mask,
+            )
+        train_logits = drafter.lm_head(drafter.norm(h))  # (1, W, vocab)
+
+    # 2. Inference forward path using StaticDraftEngine at position t
+    from sampler_v3 import StaticDraftEngine
+    engine = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=128,
+        batch_size=1,
+        v_tokens=w,
+        device=device,
+        dtype=base_dtype,
+    )
+    # Prefill prompt of length t (tokens 0 .. t-1)
+    prompt = seq[:, :t]
+    _, f_ctx_last_infer = engine.prefill(prompt)
+
+    # Forward draft step at position t
+    with torch.no_grad():
+        _, infer_logits = engine.forward_draft_step(
+            y_star_ids=y_star,
+            mask_token_id=mask_id,
+            f_ctx_last=f_ctx_last_infer,
+            cur_pos_list=[t],
+            return_logits=True,
+        )
+
+    max_diff = (train_logits - infer_logits).abs().max().item()
+    mean_diff = (train_logits - infer_logits).abs().mean().item()
+    print(f"  Max |logits_train - logits_infer|:  {max_diff:.2e} (threshold: 1e-4)")
+    print(f"  Mean |logits_train - logits_infer|: {mean_diff:.2e}")
+
+    passed = max_diff < 1e-4
+    print(f"Unit Gate D Status: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> dict:
-    """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling."""
+    """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling with populated P=128 KV cache."""
     print("\n" + "=" * 60)
     print(f"GATE 0 & GATE 1: Overhead and Draft Cost Ratio Profile ({model_name}, device={device})")
     print("=" * 60)
@@ -273,57 +355,68 @@ def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str 
     base_dtype = torch.float32 if device == "cpu" else torch.float16
     base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
 
-    engine = generate_speculative_v3  # ensure imports valid
-    B = 1
+    from sampler_v3 import StaticDraftEngine
     P = 128
     Q_A = 8
     W = 7
+    iters = 10
 
-    # Measure T_verify(Q=1)
-    prompt_ids = torch.randint(100, 1000, (B, P), device=device)
+    def sync_cuda():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=W, device=device, dtype=base_dtype)
+    prompt_ids = torch.randint(100, 1000, (1, P), device=device)
+    _, f_last = eng.prefill(prompt_ids)
+    y_star = prompt_ids[:, -1:]
+    q8_ids = torch.randint(100, 1000, (1, Q_A), device=device)
+    q1_ids = prompt_ids[:, -1:]
+
+    # Measure T_verify(Q=1) on populated P=128 cache
     # Warmup
     for _ in range(3):
         with torch.no_grad():
-            base_model(prompt_ids[:, -1:])
+            base_model(q1_ids)
+    sync_cuda()
 
-    iters = 10
     t0 = time.perf_counter()
     for _ in range(iters):
         with torch.no_grad():
-            base_model(prompt_ids[:, -1:])
+            base_model(q1_ids)
+    sync_cuda()
     t_q1_ms = ((time.perf_counter() - t0) / iters) * 1000.0
 
-    # Measure T_verify(Q_A=8)
-    q8_ids = torch.randint(100, 1000, (B, Q_A), device=device)
+    # Measure T_verify(Q_A=8) on populated P=128 cache
     for _ in range(3):
         with torch.no_grad():
-            base_model(q8_ids)
+            eng.forward_verify_step(q8_ids, cur_pos_list=[P])
+    sync_cuda()
+
     t0 = time.perf_counter()
     for _ in range(iters):
         with torch.no_grad():
-            base_model(q8_ids)
+            eng.forward_verify_step(q8_ids, cur_pos_list=[P])
+    sync_cuda()
     t_q8_ms = ((time.perf_counter() - t0) / iters) * 1000.0
 
-    # Measure T_draft(4L, W=7)
-    from sampler_v3 import StaticDraftEngine
-    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=7, device=device, dtype=base_dtype)
-    _, f_last = eng.prefill(prompt_ids)
-    y_star = prompt_ids[:, -1:]
-
+    # Measure T_draft(4L, W=7) on populated P=128 cache
     for _ in range(3):
         with torch.no_grad():
-            eng.forward_draft_step(y_star, mask_id, f_last, cur_pos_list=[P + 1])
+            eng.forward_draft_step(y_star, mask_id, f_last, cur_pos_list=[P])
+    sync_cuda()
+
     t0 = time.perf_counter()
     for _ in range(iters):
         with torch.no_grad():
-            eng.forward_draft_step(y_star, mask_id, f_last, cur_pos_list=[P + 1])
+            eng.forward_draft_step(y_star, mask_id, f_last, cur_pos_list=[P])
+    sync_cuda()
     t_draft_ms = ((time.perf_counter() - t0) / iters) * 1000.0
 
     ratio = (t_q8_ms + t_draft_ms) / max(1e-4, t_q1_ms)
 
-    print(f"  T_verify(Q=1):    {t_q1_ms:6.2f} ms")
-    print(f"  T_verify(Q_A=8):  {t_q8_ms:6.2f} ms")
-    print(f"  T_draft(4L, W=7): {t_draft_ms:6.2f} ms")
+    print(f"  T_verify(Q=1, P=128):    {t_q1_ms:6.2f} ms")
+    print(f"  T_verify(Q_A=8, P=128):  {t_q8_ms:6.2f} ms")
+    print(f"  T_draft(4L, W=7, P=128): {t_draft_ms:6.2f} ms")
     print(f"  Draft Cost Ratio: (T_verify(8) + T_draft(7)) / T_verify(1) = {ratio:.2f}x")
     print("Gate 0 & Gate 1 profiling completed.")
     return {
@@ -351,17 +444,21 @@ def main():
     # 3. Unit Gate C (Gradient Flow)
     gate_c_pass = test_unit_gate_c(model_name=args.model, device=device)
 
-    # 4. Gate 0 & 1 Roofline Profiling
+    # 4. Unit Gate D (Train-Inference Parity)
+    gate_d_pass = test_unit_gate_d(model_name=args.model, device=device)
+
+    # 5. Gate 0 & 1 Roofline Profiling
     profile_stats = test_gate0_gate1_profile(model_name=args.model, device=device)
 
     print("\n" + "=" * 60)
     print("PHASE 1 SUMMARY:")
-    print(f"  Unit Gate A (Lossless Parity): {'PASS' if gate_a_pass else 'FAIL'}")
-    print(f"  Unit Gate B (Param Budget):    {'PASS' if gate_b_pass else 'FAIL'}")
-    print(f"  Unit Gate C (Gradient Flow):   {'PASS' if gate_c_pass else 'FAIL'}")
+    print(f"  Unit Gate A (Lossless Parity):        {'PASS' if gate_a_pass else 'FAIL'}")
+    print(f"  Unit Gate B (Param Budget):           {'PASS' if gate_b_pass else 'FAIL'}")
+    print(f"  Unit Gate C (Gradient Flow):          {'PASS' if gate_c_pass else 'FAIL'}")
+    print(f"  Unit Gate D (Train-Inference Parity): {'PASS' if gate_d_pass else 'FAIL'}")
     print("=" * 60)
 
-    if not (gate_a_pass and gate_b_pass and gate_c_pass):
+    if not (gate_a_pass and gate_b_pass and gate_c_pass and gate_d_pass):
         sys.exit(1)
 
 

@@ -1384,6 +1384,45 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   `Unit Gate B (Param Budget): PASS`
   `Unit Gate C (Gradient Flow): PASS`
 
+## 42. Pre-T4 Surgical Fixes Verification (2026-11-19)
+
+### Fix Verification Summary
+- **Fix 1 & Fix 6: Exact Train–Inference Invariant & Tapped Layer Norm Alignment**:
+  - Investigated root cause of train-vs-inference divergence: Transformers 5.x `@capture_outputs(tie_last_hidden_states=True)` replaces `out.hidden_states[-1]` with `outputs.last_hidden_state` (post-`RMSNorm`).
+  - Added explicit `self.base_model.model.norm(h)` for `l_idx == total_layers - 1` in `StaticDraftEngine.prefill` and `forward_verify_step`.
+  - Confirmed `F_ctx` difference across all positions dropped to `0.0`.
+  - **Unit Gate D (Train-Inference Numerical Parity)**:
+    - `Max |logits_train - logits_infer|: 2.77e-05` (strictly `< 1e-4`).
+    - `Mean |logits_train - logits_infer|: 3.83e-06`.
+    - `Unit Gate D Status: PASS`.
+- **Fix 2: Vectorized Parallel Random-Anchor Distillation**:
+  - `drafter.project_prefix_kv(f_ctx, pos_all)` evaluated once for the full sequence.
+  - Packed $N$ blocks ($M = N \times W$ tokens) with $(1, 1, M, S+M)$ block-diagonal attention mask.
+  - One 4-layer forward pass replaces sequential anchor loop.
+  - Smoke test execution (`train_v3.py --smoke_test`):
+    `smoke convergence: 12.1901 -> 5.4169 PASS` in ~10 seconds.
+- **Fix 3: Real 2-Graph Static Shape & In-Place Mask Engine**:
+  - Static pointer-indexed caches for target ($L$ layers) and draft ($4$ layers).
+  - Pre-allocated static buffers (`static_verify_tokens`, `static_pos_verify`, `static_mask_A`, `static_y_star`, `static_f_ctx_last`, `static_pos_draft`, `static_mask_B`).
+  - Safe CUDA graph capture routines with pure `fp16` execution and eager CPU fallback.
+- **Fix 4: Diverse Prompts Pipeline**:
+  - Added `load_diverse_prompts` streaming from `HuggingFaceH4/ultrachat_200k`, `meta-math/MetaMathQA`, and `HuggingFaceFW/fineweb-edu`.
+  - Strict substring overlap rejection against `benchmark_v3`'s 50 `GEN_PROMPTS`.
+  - Smoke test verified: `Saved 4 sequences to data/smoke_onpolicy.pt (shape: torch.Size([4, 56]))`.
+- **Fix 5: Benchmark Accurate GPU Timing & Populated Cache Profiling**:
+  - Synchronizations before/after `time.perf_counter()`.
+  - 2-prompt unmeasured warmup executed before baselines and v3 speculative engine.
+  - Isolated roofline profile on populated $P=128$ cache:
+    `T_verify(Q=1, P=128): 71.71 ms`
+    `T_verify(Q_A=8, P=128): 148.69 ms`
+    `T_draft(4L, W=7, P=128): 59.74 ms`
+    `Draft Cost Ratio: 2.91x` on CPU (Tensor Core fused GEMMs on T4 targeted to bring ratio `< 1.18x`).
+  - Added metrics: $A_{+1}$, $A_{+2}$, $A_{+3}$, $A_{+4}$, $\gamma_{\text{total}}$, $T_{\text{verify}}$, $T_{\text{draft}}$.
+  - `benchmark_v3.py --smoke_test`: `Exact Lossless Consistency %: 100.0% PASS`.
+- **Legacy Regression Checks**:
+  - `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+  - `python benchmark.py --smoke_test`: `bfg-diff k=2 recovery 31.6%`, `causal generate 13.2 TPS`, `bfg-diff 7.2 TPS`. All tests pass cleanly.
+
 
 
 

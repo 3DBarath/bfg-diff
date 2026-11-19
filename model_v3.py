@@ -19,10 +19,6 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, apply_rotary_pos_emb, repeat_kv
 
-# Ensure offline mode so cached weights load without hanging on missing internet
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
 MASK_TOKEN = "<|extra_0|>"
 MASK_TOKEN_ID = 151665  # Authoritative ID in Qwen2.5 tokenizer
 
@@ -336,17 +332,20 @@ class WeightTiedTopKDrafter(nn.Module):
         y_star_ids: torch.Tensor,           # (B, 1) concrete bonus token
         mask_token_id: int,                 # int [MASK] token id (151665)
         f_ctx_last: torch.Tensor,           # (B, 1, D) F_ctx of token at cur_pos - 1
-        cur_pos: int,                       # integer current position
+        cur_pos: int,                       # integer current position t (where y* = x_t)
         w: int = 7,                         # draft block length W
         k_prefix_list: Optional[List[torch.Tensor]] = None,  # list of 4 tensors (B, n_kv, S_p, head_dim)
         v_prefix_list: Optional[List[torch.Tensor]] = None,  # list of 4 tensors (B, n_kv, S_p, head_dim)
         attn_mask: Optional[torch.Tensor] = None,            # (B, 1, W, S_p + W)
+        pos_draft: Optional[torch.Tensor] = None,            # (B, W)
     ) -> torch.Tensor:
         """Run 4-layer bidirectional draft pass.
-        Under Qwen2's native shift, feeding W tokens [y*, MASK_1, ..., MASK_{W-1}] at RoPE positions
-        [cur_pos - 1, cur_pos, ..., cur_pos + W - 2] produces W output logits predicting
-        [x_{cur_pos}, x_{cur_pos+1}, ..., x_{cur_pos+W-1}].
-        Slot 0 predicts A_+1 directly from concrete bonus token y*.
+        When drafting from concrete bonus token y* at sequence position t (y* = x_t):
+        - y* has RoPE position t, and the W draft block tokens [y*, MASK_1, ..., MASK_{W-1}]
+          have RoPE positions [t, t+1, ..., t+W-1], predicting [x_{t+1}, x_{t+2}, ..., x_{t+W}].
+        - f_ctx_last MUST be f_ctx[t-1] (fused feature of token immediately preceding y*).
+        - Prefix KV contains positions 0 .. t-1 (length t).
+        Slot 0 predicts A_+1 (x_{t+1}) directly from concrete bonus token y*.
         Returns: logits (B, W, vocab_size)
         """
         B = y_star_ids.shape[0]
@@ -360,8 +359,9 @@ class WeightTiedTopKDrafter(nn.Module):
         # Manifold alignment
         h = self.bridge(y_star_emb, mask_emb, f_ctx_last, w=w)  # (B, W, D)
 
-        # RoPE positions for draft block: [cur_pos - 1, ..., cur_pos + W - 2]
-        pos_draft = torch.arange(cur_pos - 1, cur_pos + w - 1, device=device).unsqueeze(0).expand(B, w)
+        # RoPE positions for draft block: [cur_pos, cur_pos + 1, ..., cur_pos + W - 1]
+        if pos_draft is None:
+            pos_draft = torch.arange(cur_pos, cur_pos + w, device=device).unsqueeze(0).expand(B, w)
 
         # Execute 4 draft layers
         for layer_idx in range(self.k_layers):

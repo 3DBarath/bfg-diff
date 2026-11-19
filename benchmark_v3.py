@@ -23,10 +23,7 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 
 from model_v3 import prepare_v3
-from sampler_v3 import generate_speculative_v3
-
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+from sampler_v3 import generate_speculative_v3, StaticDraftEngine
 
 # 50 unique diverse prompts
 GEN_PROMPTS = [
@@ -130,6 +127,11 @@ def adj_dup(sequences: torch.Tensor) -> float:
     return dups / max(1, total)
 
 
+def sync_device():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def run_benchmark(
     model_name: str = "Qwen/Qwen2.5-1.5B",
     checkpoint: str = None,
@@ -166,8 +168,18 @@ def run_benchmark(
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # 1. Baseline: Raw base model.generate()
-    print("\n[1/2] Running Raw Base Model Autoregressive Baseline...")
+    # 0. Unmeasured 2-prompt Warmup
+    warmup_prompts = prompts[:min(2, len(prompts))]
+    if len(warmup_prompts) > 0:
+        print("Running 2-prompt unmeasured warmup...")
+        w_inputs = tok(warmup_prompts, return_tensors="pt", padding=True).to(device)
+        with torch.no_grad():
+            base_model.generate(**w_inputs, max_new_tokens=16, do_sample=False)
+            generate_speculative_v3(base_model, drafter, w_inputs["input_ids"], mask_token_id=mask_id, max_new_tokens=16)
+        sync_device()
+
+    # 1. Baseline 1: Standard HF model.generate()
+    print("\n[1/3] Running Raw Base Model Autoregressive Baseline (HF model.generate)...")
     raw_times, raw_tokens_list = [], []
     raw_outputs = []
 
@@ -175,6 +187,7 @@ def run_benchmark(
         b_prompts = prompts[i : i + batch_size]
         inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
 
+        sync_device()
         t0 = time.perf_counter()
         with torch.no_grad():
             gen_out = base_model.generate(
@@ -183,12 +196,12 @@ def run_benchmark(
                 do_sample=(temperature > 0.0),
                 temperature=temperature if temperature > 0.0 else None,
             )
+        sync_device()
         elapsed = time.perf_counter() - t0
 
         new_tok_count = (gen_out.shape[1] - inputs["input_ids"].shape[1]) * len(b_prompts)
         raw_times.append(elapsed)
         raw_tokens_list.append(new_tok_count)
-        # Store only newly generated tokens
         raw_gen_only = gen_out[:, inputs["input_ids"].shape[1]:]
         raw_outputs.append(raw_gen_only.cpu())
 
@@ -204,20 +217,45 @@ def run_benchmark(
     ]
     all_raw_seqs = torch.cat(padded_raw, dim=0)
 
-    # 2. Speculative: BFG-Diff v3 Drafter
-    print("\n[2/2] Running BFG-Diff v3 Speculative Engine...")
+    # 2. Baseline 2: Compiled / Reduced-overhead model.generate (if supported on CUDA)
+    compiled_tps = None
+    if device == "cuda" and not smoke_test:
+        try:
+            print("\n[2/3] Running Compiled Baseline (torch.compile reduce-overhead)...")
+            compiled_model = torch.compile(base_model, mode="reduce-overhead")
+            comp_times, comp_tokens = [], []
+            for i in range(0, min(len(prompts), 4), batch_size):
+                b_prompts = prompts[i : i + batch_size]
+                inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
+                sync_device()
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    c_out = compiled_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+                sync_device()
+                elapsed = time.perf_counter() - t0
+                comp_times.append(elapsed)
+                comp_tokens.append((c_out.shape[1] - inputs["input_ids"].shape[1]) * len(b_prompts))
+            compiled_tps = sum(comp_tokens) / max(1e-4, sum(comp_times))
+            print(f"  Compiled Baseline TPS: {compiled_tps:.1f}")
+        except Exception as e:
+            print(f"  Note: torch.compile baseline skipped ({e})")
+
+    # 3. Speculative: BFG-Diff v3 Drafter
+    print("\n[3/3] Running BFG-Diff v3 Speculative Engine...")
     spec_times, spec_tokens_list = [], []
     spec_outputs = []
     total_accepted_drafts = 0
+    total_draft_tokens = 0
     total_steps = 0
-    accept_dist = [0] * 10
     exact_matches = 0
+    a_plus_totals = [0.0, 0.0, 0.0, 0.0]
 
     for i in range(0, len(prompts), batch_size):
         b_prompts = prompts[i : i + batch_size]
         inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
         input_ids = inputs["input_ids"]
 
+        sync_device()
         t0 = time.perf_counter()
         with torch.no_grad():
             spec_out, stats = generate_speculative_v3(
@@ -228,17 +266,23 @@ def run_benchmark(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
             )
+        sync_device()
         elapsed = time.perf_counter() - t0
 
         new_tok_count = (spec_out.shape[1] - input_ids.shape[1]) * len(b_prompts)
         spec_times.append(elapsed)
         spec_tokens_list.append(new_tok_count)
-        # Store only newly generated tokens
         spec_gen_only = spec_out[:, input_ids.shape[1]:]
         spec_outputs.append(spec_gen_only.cpu())
 
         total_accepted_drafts += stats["accepted_draft_tokens"]
+        total_draft_tokens += stats["total_draft_tokens"]
         total_steps += stats["steps"] * len(b_prompts)
+
+        a_plus_totals[0] += stats.get("a_plus_1", 0.0)
+        a_plus_totals[1] += stats.get("a_plus_2", 0.0)
+        a_plus_totals[2] += stats.get("a_plus_3", 0.0)
+        a_plus_totals[3] += stats.get("a_plus_4", 0.0)
 
         # Check token-exact match against raw baseline for temperature=0
         if temperature == 0.0:
@@ -258,9 +302,39 @@ def run_benchmark(
     ]
     all_spec_seqs = torch.cat(padded_spec, dim=0)
 
+    n_batches = max(1, len(prompts) // batch_size)
+    a1 = (a_plus_totals[0] / n_batches) * 100.0
+    a2 = (a_plus_totals[1] / n_batches) * 100.0
+    a3 = (a_plus_totals[2] / n_batches) * 100.0
+    a4 = (a_plus_totals[3] / n_batches) * 100.0
+    gamma_total = (total_accepted_drafts / max(1, total_draft_tokens)) * 100.0
+
     alpha = (total_accepted_drafts + total_steps) / max(1, total_steps)
     speedup = spec_tps / max(1e-4, raw_tps)
     consistency_pct = (exact_matches / max(1, len(prompts))) * 100.0 if temperature == 0.0 else 100.0
+
+    # Profile isolated verify and draft step times on populated P=128 cache
+    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=7, device=device, dtype=base_dtype)
+    dummy_p = torch.randint(100, 1000, (1, 128), device=device)
+    _, f_last = eng.prefill(dummy_p)
+    dummy_y = dummy_p[:, -1:]
+    dummy_v = torch.randint(100, 1000, (1, 8), device=device)
+
+    sync_device()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        with torch.no_grad():
+            eng.forward_verify_step(dummy_v, [128])
+    sync_device()
+    t_verify_ms = ((time.perf_counter() - t0) / 5.0) * 1000.0
+
+    sync_device()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        with torch.no_grad():
+            eng.forward_draft_step(dummy_y, mask_id, f_last, [128])
+    sync_device()
+    t_draft_ms = ((time.perf_counter() - t0) / 5.0) * 1000.0
 
     print("\n" + "=" * 80)
     print("BFG-DIFF v3 BENCHMARK RESULTS:")
@@ -268,8 +342,17 @@ def run_benchmark(
     print(f"{'Metric':<35}{'Raw Baseline':>15}{'BFG-Diff v3':>15}")
     print("-" * 80)
     print(f"{'Throughput (TPS)':<35}{raw_tps:>15,.1f}{spec_tps:>15,.1f}")
+    if compiled_tps is not None:
+        print(f"{'Compiled Baseline (TPS)':<35}{compiled_tps:>15,.1f}{'-':>15}")
     print(f"{'Wall-clock Speedup':<35}{'1.00x':>15}{f'{speedup:.2f}x':>15}")
     print(f"{'Mean Acceptance Alpha':<35}{'1.00':>15}{f'{alpha:.2f}':>15}")
+    print(f"{'Gamma Total (Acceptance %)':<35}{'-':>15}{f'{gamma_total:.1f}%':>15}")
+    print(f"{'A_+1 Acceptance Rate':<35}{'-':>15}{f'{a1:.1f}%':>15}")
+    print(f"{'A_+2 Acceptance Rate':<35}{'-':>15}{f'{a2:.1f}%':>15}")
+    print(f"{'A_+3 Acceptance Rate':<35}{'-':>15}{f'{a3:.1f}%':>15}")
+    print(f"{'A_+4 Acceptance Rate':<35}{'-':>15}{f'{a4:.1f}%':>15}")
+    print(f"{'T_verify (Q_A=8)':<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
+    print(f"{'T_draft (4L, W=7)':<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%':>15}{f'{consistency_pct:.1f}%':>15}")
     print(f"{'4-gram Entropy (H4)':<35}{ngram_entropy(all_raw_seqs):>15.3f}{ngram_entropy(all_spec_seqs):>15.3f}")
     print(f"{'4-gram Repetition (rep4)':<35}{repeat_rate(all_raw_seqs):>14.1%}{repeat_rate(all_spec_seqs):>14.1%}")

@@ -405,10 +405,25 @@ Concrete Token y* + [MASK] x (W-1) -> Manifold Bridge -> 4 Tied Layers (L-4..L-1
 
 ### 5. Zero-`crop()`, Pointer-Indexed `StaticCache` & Active Shapes
 - Static active shapes (multiples of 8 for Tensor Cores):
-  - Stage 1 verify: fixed $Q_A = 8$ ($[y^*, d_0, \dots, d_6]$). Writes target KV in-place at $cur\_pos - 1 + \text{arange}(Q_A)$.
+  - Stage 1 verify: fixed $Q_A = 8$ ($[y^*, d_0, \dots, d_6]$). Writes target KV in-place at $[t .. t+7]$.
   - Stage 2 draft: fixed $W = 7$ draft tokens.
-- No `kv.crop()`: When $k$ tokens are accepted, $cur\_pos$ simply advances by $k$. Subsequent verification steps automatically overwrite rejected tail slots in-place.
+- No `kv.crop()`: When $k$ tokens are accepted ($num\_committed = k + 1$), $t$ simply advances by $num\_committed$. Subsequent verification steps automatically overwrite rejected tail slots in-place.
 - Supports ragged $B=4$ batches with per-row position indexing.
+
+### 6. Exact Train–Inference Invariant & Final Layer Normalization
+- Enforces strict mathematical identity between `train_v3.py` and `sampler_v3.py`:
+  - When drafting from concrete bonus token $y^*$ at sequence position $t$ ($y^* = x_t$):
+    - $y^*$ has RoPE position $t$, and the $W$ draft block tokens $[y^*, \text{MASK}_1, \dots, \text{MASK}_{W-1}]$ have RoPE positions $[t, t+1, \dots, t+W-1]$, predicting $[x_{t+1}, x_{t+2}, \dots, x_{t+W}]$.
+    - $f_{\text{ctx\_last}}$ MUST be $f_{\text{ctx}}[t-1]$ (the Stage-1 fused feature of the token immediately preceding $y^*$, NOT $f_{\text{ctx}}[t]$).
+    - Draft prefix KV cache contains strictly positions $0 \dots t-1$ (length $t$, zero unwritten zero slots).
+    - Targets are $\text{seq}[:, t+1 : t+1+W]$, and teacher Top-64 logits are $\text{top64}[:, t : t+W]$ (since $\text{teacher\_logits}[:, t]$ predicts $\text{seq}[:, t+1]$).
+  - Tapped Final Hidden State Normalization: Transformers `AutoModelForCausalLM` decorates `forward()` with `@capture_outputs(tie_last_hidden_states=True)`, which overwrites `out.hidden_states[-1]` with `outputs.last_hidden_state` (post-`RMSNorm`). In `sampler_v3.py`, `all_hidden_states` explicitly appends `model.norm(h)` for layer $L-1$, guaranteeing exact numerical parity ($2.77 \times 10^{-5} < 10^{-4}$ in Unit Gate D).
+
+### 7. Vectorized Parallel Random-Anchor Distillation (`train_v3.py`)
+- Full sequence prefix projection: `drafter.project_prefix_kv(f_ctx, pos_all)` is evaluated once for the full sequence $(B, S, D)$.
+- Packed blocks: $N$ anchor blocks ($M = N \times W$ tokens) are packed into a single tensor $(B, M, D)$ with RoPE positions `pos_draft` $(B, M)$.
+- Block-diagonal attention mask: A $(1, 1, M, S + M)$ mask allows each block $m$ (anchor $t_m$) to attend exclusively to prefix keys $0 \dots t_m - 1$ and bidirectionally to its own $W$ block keys, executing all $N$ blocks in ONE single 4-layer forward pass.
+
 
 
 

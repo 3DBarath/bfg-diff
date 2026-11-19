@@ -23,9 +23,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from model_v3 import WeightTiedTopKDrafter, prepare_v3
 
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
 
 class OnPolicySequenceDataset(Dataset):
     """Dataset of on-policy token sequences."""
@@ -59,11 +56,20 @@ def compute_anchor_distill_loss(
     lambda_kl: float = 0.5,
     d_pace_decay: float = 0.85,
 ) -> Tuple[torch.Tensor, dict]:
-    """DFlash-Style Random-Anchor Parallel Block Training:
+    """Parallelized DFlash-Style Random-Anchor Block Training (Fix 1 & Fix 2):
     1. Base model no_grad forward pass: extracts Top-64 teacher logits and tapped hidden states.
-    2. Sample n_anchors clean anchor positions.
-    3. Construct length-W draft blocks [x_a, MASK, ..., MASK].
-    4. Compute loss = 0.5 * Top64_KL + 0.5 * CE weighted by D-PACE.
+    2. Full prefix projection: drafter.project_prefix_kv(f_ctx, pos_all) called ONCE for full sequence (B, S, D).
+    3. Sample n_anchors clean anchor positions t_1 .. t_N (where y* = batch_seqs[:, t:t+1]).
+    4. Pack all n_anchors blocks (M = n_anchors * W tokens) into a single tensor (B, M, D) with pos_draft (B, M)
+       and a (1, 1, M, S + M) block-diagonal mask where block m (anchor t_m) attends to prefix keys 0 .. t_m - 1
+       and bidirectionally to its own W block keys only.
+    5. Run ONE 4-layer forward pass for all n_anchors blocks simultaneously.
+    6. Mathematical Train-Inference Invariant:
+       - y* has RoPE position t; draft tokens have RoPE positions [t, t+1, ..., t+W-1].
+       - f_last = f_ctx[:, t-1:t] (Stage-1 fused feature immediately preceding y*).
+       - Prefix KV seen by anchor t is strictly 0 .. t-1 (length t).
+       - Targets are batch_seqs[:, t+1 : t+1+W].
+       - Teacher Top-64 logits are top64[:, t : t+W].
     """
     B, S = batch_seqs.shape
     device = batch_seqs.device
@@ -71,85 +77,118 @@ def compute_anchor_distill_loss(
     # 1. Base model teacher forward pass
     with torch.no_grad():
         out = base_model(batch_seqs, output_hidden_states=True)
-        # Teacher logits for predicting positions [1 .. S-1]: out.logits[:, :S-1]
         teacher_logits = out.logits  # (B, S, vocab)
-        # Top-64 extraction to save VRAM
         top64_vals, top64_idx = torch.topk(teacher_logits, k=64, dim=-1)  # (B, S, 64)
         top64_probs = F.softmax(top64_vals.float(), dim=-1)
 
-    # Multi-layer target feature fusion (with grad enabled for fusion parameters!)
+    # Multi-layer target feature fusion (with grad enabled for fusion parameters)
     f_ctx = drafter.fuse_stage1_features(out.hidden_states)  # (B, S, D)
 
-    # 2. Sample random clean anchors
-    # Each anchor must have at least 1 prefix token and W target tokens
-    min_anchor = 2
-    max_anchor = S - w - 2
+    # 2. Project full prefix KV ONCE for the entire sequence (B, S, D)
+    pos_all = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+    kp_all, vp_all = drafter.project_prefix_kv(f_ctx, pos_all)
+
+    # 3. Sample random clean anchors
+    # Each anchor t needs prefix of length >= 1 (so t >= 1, meaning token t-1 exists)
+    # and targets up to t + w (so t + w <= S - 1, meaning targets t+1..t+w exist in batch_seqs)
+    min_anchor = 1
+    max_anchor = max(2, S - w - 1)
     if max_anchor <= min_anchor:
         min_anchor = 1
-        max_anchor = max(2, S - w - 1)
+        max_anchor = 2
 
-    anchors = torch.randint(min_anchor, max_anchor, (n_anchors,), device=device).tolist()
+    avail = max_anchor - min_anchor
+    actual_anchors_count = min(n_anchors, avail) if avail > 0 else 1
+    if avail > 0:
+        anchors = torch.randperm(avail, device=device)[:actual_anchors_count] + min_anchor
+        anchors = anchors.tolist()
+    else:
+        anchors = [min_anchor]
 
-    total_kl_loss = 0.0
-    total_ce_loss = 0.0
-    acc_per_offset = [0.0] * w
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    N = len(anchors)
+    M = N * w
 
-    # D-PACE position weighting: [1.0, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20]
+    # 4. Pack all N anchor blocks into single input tensor (B, M, D)
+    # For anchor t: y* = batch_seqs[:, t:t+1], f_last = f_ctx[:, t-1:t]
+    y_star_list = [batch_seqs[:, t : t + 1] for t in anchors]  # each (B, 1)
+    f_last_list = [f_ctx[:, t - 1 : t] for t in anchors]        # each (B, 1, D)
+
+    y_star_packed = torch.cat(y_star_list, dim=0)  # (B * N, 1)
+    f_last_packed = torch.cat(f_last_list, dim=0)  # (B * N, 1, D)
+
+    mask_tensor = torch.tensor([[mask_token_id]], dtype=torch.long, device=device)
+    mask_emb = drafter.embed_tokens(mask_tensor)   # (1, 1, D)
+    y_star_emb = drafter.embed_tokens(y_star_packed)  # (B * N, 1, D)
+
+    # Construct bridge output: (B * N, W, D)
+    h_packed = drafter.bridge(y_star_emb, mask_emb, f_last_packed, w=w)
+    # Reshape to (B, M, D) with M = N * W
+    h = h_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+
+    # RoPE positions for all packed tokens: (B, M)
+    pos_draft_list = [
+        torch.arange(t, t + w, device=device).unsqueeze(0).expand(B, w)
+        for t in anchors
+    ]
+    pos_draft = torch.cat(pos_draft_list, dim=1)  # (B, M)
+
+    # 5. Construct block-diagonal attention mask (1, 1, M, S + M)
+    attn_mask = torch.full((1, 1, M, S + M), -1e4, dtype=f_ctx.dtype, device=device)
+    for m, t in enumerate(anchors):
+        r_start = m * w
+        r_end = (m + 1) * w
+        if t > 0:
+            attn_mask[0, 0, r_start : r_end, :t] = 0.0
+        k_start = S + m * w
+        k_end = S + (m + 1) * w
+        attn_mask[0, 0, r_start : r_end, k_start : k_end] = 0.0
+
+    # 6. Execute 4 draft layers in ONE parallel forward pass
+    for layer_idx in range(drafter.k_layers):
+        h, _, _ = drafter.forward_draft_layer(
+            layer_idx=layer_idx,
+            hidden_states=h,
+            pos_draft=pos_draft,
+            k_prefix=kp_all[layer_idx],
+            v_prefix=vp_all[layer_idx],
+            attn_mask=attn_mask,
+        )
+
+    h_norm = drafter.norm(h)
+    student_logits = drafter.lm_head(h_norm)  # (B, M, vocab)
+    student_logits = student_logits.view(B, N, w, -1)  # (B, N, W, vocab)
+
+    # 7. Targets and teacher distributions for all anchors
+    targets = torch.stack([batch_seqs[:, t + 1 : t + 1 + w] for t in anchors], dim=1)  # (B, N, W)
+    t_top64_idx = torch.stack([top64_idx[:, t : t + w] for t in anchors], dim=1)        # (B, N, W, 64)
+    t_top64_probs = torch.stack([top64_probs[:, t : t + w] for t in anchors], dim=1)    # (B, N, W, 64)
+
+    # Gather student logits on teacher Top-64
+    s_gathered = torch.gather(student_logits.float(), dim=-1, index=t_top64_idx)  # (B, N, W, 64)
+    s_log_probs = F.log_softmax(s_gathered, dim=-1)
+
+    kl = F.kl_div(s_log_probs, t_top64_probs, reduction="none").sum(dim=-1)  # (B, N, W)
+    ce = F.cross_entropy(student_logits.reshape(-1, student_logits.shape[-1]), targets.reshape(-1), reduction="none").view(B, N, w)
+
+    # D-PACE position weighting
     d_pace = torch.tensor([d_pace_decay ** j for j in range(w)], device=device, dtype=torch.float32)
     d_pace = d_pace / d_pace.sum()
 
-    for a in anchors:
-        y_star = batch_seqs[:, a - 1 : a]  # concrete token at a - 1
-        f_last = f_ctx[:, a - 1 : a]
-        targets = batch_seqs[:, a : a + w]  # targets for predicting positions a .. a+w-1
+    anchor_loss = lambda_kl * kl + (1.0 - lambda_kl) * ce  # (B, N, W)
+    loss = (anchor_loss * d_pace.view(1, 1, w)).sum(dim=-1).mean()
 
-        # Prefix KV
-        pos_prefix = torch.arange(a, device=device).unsqueeze(0).expand(B, a)
-        kp_list, vp_list = drafter.project_prefix_kv(f_ctx[:, :a], pos_prefix)
+    # Track offset accuracy
+    with torch.no_grad():
+        preds = torch.argmax(student_logits, dim=-1)  # (B, N, W)
+        correct = (preds == targets).float().mean(dim=(0, 1))  # (W,)
+        acc_per_offset = [correct[j].item() for j in range(w)]
 
-        # Draft forward pass
-        attn_mask = torch.zeros(B, 1, w, a + w, dtype=drafter.fusion.norm.weight.dtype, device=device)
-        student_logits = drafter.forward_draft(
-            y_star_ids=y_star,
-            mask_token_id=mask_token_id,
-            f_ctx_last=f_last,
-            cur_pos=a,
-            w=w,
-            k_prefix_list=kp_list,
-            v_prefix_list=vp_list,
-            attn_mask=attn_mask,
-        )  # (B, W, vocab)
-
-        # Teacher targets at positions a-1 .. a+w-2 predict tokens at a .. a+w-1
-        t_top64_idx = top64_idx[:, a - 1 : a + w - 1]  # (B, W, 64)
-        t_top64_probs = top64_probs[:, a - 1 : a + w - 1]  # (B, W, 64)
-
-        # Student gathered on teacher Top-64
-        s_gathered = torch.gather(student_logits.float(), dim=-1, index=t_top64_idx)  # (B, W, 64)
-        s_log_probs = F.log_softmax(s_gathered, dim=-1)
-
-        kl = F.kl_div(s_log_probs, t_top64_probs, reduction="none").sum(dim=-1)  # (B, W)
-        ce = F.cross_entropy(student_logits.view(-1, student_logits.shape[-1]), targets.reshape(-1), reduction="none").view(B, w)
-
-        anchor_loss = lambda_kl * kl + (1.0 - lambda_kl) * ce  # (B, W)
-        weighted_anchor_loss = (anchor_loss * d_pace.unsqueeze(0)).sum(dim=-1).mean()
-        total_loss = total_loss + weighted_anchor_loss
-
-        # Track offset accuracy
-        with torch.no_grad():
-            preds = torch.argmax(student_logits, dim=-1)  # (B, W)
-            correct = (preds == targets).float().mean(dim=0)  # (W,)
-            for j in range(w):
-                acc_per_offset[j] += correct[j].item()
-
-    loss = total_loss / max(1, len(anchors))
     stats = {
         "loss": loss.item(),
-        "acc_offset1": acc_per_offset[0] / max(1, len(anchors)),
-        "acc_offset2": acc_per_offset[1] / max(1, len(anchors)) if w > 1 else 0.0,
-        "acc_offset3": acc_per_offset[2] / max(1, len(anchors)) if w > 2 else 0.0,
-        "acc_offset4": acc_per_offset[3] / max(1, len(anchors)) if w > 3 else 0.0,
+        "acc_offset1": acc_per_offset[0],
+        "acc_offset2": acc_per_offset[1] if w > 1 else 0.0,
+        "acc_offset3": acc_per_offset[2] if w > 2 else 0.0,
+        "acc_offset4": acc_per_offset[3] if w > 3 else 0.0,
     }
     return loss, stats
 
