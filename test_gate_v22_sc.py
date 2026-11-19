@@ -9,19 +9,20 @@ def test_gate_v22_sc():
     model, tok, mask_id = prepare("Qwen/Qwen2.5-0.5B", device=device, dtype=dtype)
     adapter = setup_bfg_adapter(model, max_w=16, lora_r=16)
 
-    # 1. Zero-init step-0 parity check
-    print("1. Checking step-0 parity with zero init...")
+    # 1. Zero-init step-0 parity check & non-zero frontier (m > 0) alignment
+    print("1. Checking step-0 parity with zero init and non-zero frontier (m=3)...")
     P = 16
     prefix = torch.randint(100, 1000, (1, P), device=device)
     target = torch.randint(100, 1000, (1, 8), device=device)
     mask = torch.zeros_like(target, dtype=torch.bool)
-    mask[:, 2:] = True
+    m_frontier = 3
+    mask[:, m_frontier:] = True
     noisy = target.masked_fill(mask, mask_id)
 
     # Logits without adapter modifications (step-0 base output)
     logits_base = canvas_forward(model, prefix, noisy, mask=mask)
 
-    # Now verify with dummy prev_latents and prev_pred_embeds (since weights are 0, should be identical)
+    # Full canvas shape (B, C, H) for prev_latents and prev_pred_embeds
     dummy_latents = torch.randn(1, 8, model.config.hidden_size)
     dummy_pred_embeds = torch.randn(1, 8, model.config.hidden_size)
     logits_sc = canvas_forward(
@@ -32,6 +33,24 @@ def test_gate_v22_sc():
     print(f"   Delta parity: {diff:.8e}")
     assert diff < 1e-6, f"Parity failed: diff {diff} >= 1e-6"
     print("   [PASS] Parity verified.")
+
+    # Explicitly test that self-conditioning vectors align with masked_idx (m > 0)
+    print("1b. Checking non-zero frontier (m > 0) self-conditioning vector alignment...")
+    base_embeds = model.get_input_embeddings()(torch.cat([prefix, noisy], dim=1))
+    adapter.pred_emb_scale.data.fill_(1.0)
+    adapter.pred_emb_norm.weight.data.fill_(1.0)
+    sc_embeds = adapter.apply_to_embeds(
+        base_embeds, mask=mask, prefix_len=P, prev_pred_embeds=dummy_pred_embeds
+    )
+    # Positions 0..P+m-1 must be completely untouched
+    clean_diff = (sc_embeds[:, : P + m_frontier] - base_embeds[:, : P + m_frontier]).abs().max().item()
+    assert clean_diff == 0.0, f"Clean context corrupted! clean_diff = {clean_diff}"
+    # Masked positions P+m..P+C-1 must be modified by dummy_pred_embeds[masked_idx]
+    mask_diff = (sc_embeds[:, P + m_frontier :] - base_embeds[:, P + m_frontier :]).abs().min().item()
+    assert mask_diff > 0.0, "Masked positions were not updated with self-conditioning!"
+    # Reset pred_emb_scale
+    adapter.pred_emb_scale.data.zero_()
+    print("   [PASS] Non-zero frontier alignment verified.")
 
     # 2. Check SVD initialization
     print("2. Checking iWSP SVD initialization...")

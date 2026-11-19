@@ -250,45 +250,50 @@ def sample_staircase_sliding(
             new_last_id = y_0.view(B, 1)
             k = 1
         else:
-            accepted_all = True
             curr_prev = int(cur_last_id[0, 0])
-            for j in range(V_cur):
-                draft_tok = int(draft_ids[0, j])
-                top_tok = int(z[0, j].argmax())
-                draft_z = z[0, j, draft_tok].item()
-                top_z = z[0, j, top_tok].item()
+            # Vectorized evaluation for Zone A drafts
+            d_toks = draft_ids[0, :V_cur]
+            z_eval = z[0, :V_cur]  # (V_cur, vocab)
+            top_toks = z_eval.argmax(dim=-1)  # (V_cur,)
+            top_z = z_eval.gather(1, top_toks.unsqueeze(1)).squeeze(1)
+            draft_z = z_eval.gather(1, d_toks.unsqueeze(1)).squeeze(1)
 
-                accept = False
-                if draft_tok == top_tok:
-                    accept = True
-                elif (top_z - draft_z) <= tau and (not suppress_adjacent or draft_tok != curr_prev):
-                    accept = True
+            exact_match = (d_toks == top_toks)
+            margin_ok = (top_z - draft_z) <= tau
+            if suppress_adjacent:
+                prev_check = torch.cat([cur_last_id[0], d_toks[:-1]])
+                no_stutter = (d_toks != prev_check)
+                accept_mask = exact_match | (margin_ok & no_stutter)
+            else:
+                accept_mask = exact_match | margin_ok
 
-                if accept:
-                    accepted_drafts.append(draft_tok)
-                    curr_prev = draft_tok
-                    r += 1
-                else:
-                    override_tok = top_tok
-                    if suppress_adjacent and override_tok == curr_prev:
-                        cz = z[0, j].clone()
-                        cz[curr_prev] = -float("inf")
-                        override_tok = int(cz.argmax())
-                    accepted_all = False
-                    new_tokens = accepted_drafts + [override_tok]
-                    new_last_id = torch.full((B, 1), override_tok, dtype=torch.long, device=device)
-                    k = r + 1
-                    break
-
-            if accepted_all:
+            # First false index is the rejection point
+            rejection_indices = torch.where(~accept_mask)[0]
+            if len(rejection_indices) == 0:
+                # All accepted
+                accepted_drafts = d_toks.tolist()
+                r = V_cur
                 top_bonus = int(z[0, V_cur].argmax())
-                if suppress_adjacent and top_bonus == curr_prev:
+                if suppress_adjacent and top_bonus == (accepted_drafts[-1] if accepted_drafts else curr_prev):
                     cz = z[0, V_cur].clone()
-                    cz[curr_prev] = -float("inf")
+                    cz[accepted_drafts[-1] if accepted_drafts else curr_prev] = -float("inf")
                     top_bonus = int(cz.argmax())
                 new_tokens = accepted_drafts + [top_bonus]
                 new_last_id = torch.full((B, 1), top_bonus, dtype=torch.long, device=device)
                 k = V_cur + 1
+            else:
+                rej_j = rejection_indices[0].item()
+                accepted_drafts = d_toks[:rej_j].tolist()
+                r = rej_j
+                override_tok = int(top_toks[rej_j].item())
+                prev_tok_here = accepted_drafts[-1] if accepted_drafts else curr_prev
+                if suppress_adjacent and override_tok == prev_tok_here:
+                    cz = z[0, rej_j].clone()
+                    cz[prev_tok_here] = -float("inf")
+                    override_tok = int(cz.argmax())
+                new_tokens = accepted_drafts + [override_tok]
+                new_last_id = torch.full((B, 1), override_tok, dtype=torch.long, device=device)
+                k = r + 1
 
         if k > rem_tokens:
             k = rem_tokens
@@ -344,16 +349,22 @@ def sample_staircase_sliding(
                 else:
                     candidate_drafts = []
                     c_prev = int(cur_last_id[0, 0])
-                    # Confidence-gated adaptive Zone A drafting (Task 1.1)
-                    for jb in range(min(V_max, W)):
-                        top2_b = zone_b_z[jb].topk(2)
-                        margin_b = (top2_b.values[0] - top2_b.values[1]).item()
-                        tok_b = int(top2_b.indices[0])
+                    # Vectorized extraction of top-2 tokens and margins for Zone B lookahead
+                    W_eval = min(V_max, W)
+                    top2_all = zone_b_z[:W_eval].topk(2, dim=-1)  # values: (W_eval, 2), indices: (W_eval, 2)
+                    top_vals = top2_all.values
+                    top_inds = top2_all.indices
+                    margins = top_vals[:, 0] - top_vals[:, 1]
+                    best_toks = top_inds[:, 0]
+                    alt_toks = top_inds[:, 1]
+
+                    for jb in range(W_eval):
+                        tok_b = int(best_toks[jb].item())
                         if suppress_adjacent and tok_b == c_prev:
-                            tok_b = int(top2_b.indices[1])
+                            tok_b = int(alt_toks[jb].item())
                         thresh = offset_thresholds[jb] if jb < len(offset_thresholds) else 0.75
                         eff_thresh = max(draft_margin_thresh, thresh) if draft_margin_thresh > 0.0 else thresh
-                        if jb == 0 or margin_b >= eff_thresh:
+                        if jb == 0 or margins[jb].item() >= eff_thresh:
                             candidate_drafts.append(tok_b)
                             c_prev = tok_b
                         else:

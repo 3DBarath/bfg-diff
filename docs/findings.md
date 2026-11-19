@@ -1175,6 +1175,12 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
    - **Predicted Delta:** Provides concrete lexical conditioning vectors to Zone B mask slots $+2 \dots +W$, resolving multi-token semantic ambiguity without breaking Zone A isolation.
    - **Observed Held-Out Outcome:** `test_gate_v22_sc.py` verified exact zero-init parity ($\Delta = 0.00000000e+00$), non-zero finite parameter gradients, and strict causal isolation ($\Delta_{\text{leak}} = 0.00000000e+00$). Gate 1 PASS.
 
+3. **[Problem ID: SC-INDEX-SHIFT-AT-FRONTIER]**
+   - **Code Diff:** Updated `apply_to_embeds` in `model.py` to index `prev_latents` and `prev_pred_embeds` directly at `masked_idx` when matching canvas dimension $C$.
+   - **Predicted Delta:** Fixes lookahead self-conditioning coordinate shift at arbitrary mask frontiers $m > 0$.
+   - **Observed Held-Out Outcome:** `test_gate_v22_sc.py` verified non-zero frontier ($m=3$) alignment with zero distortion to clean prefix context.
+
+
 
 
 

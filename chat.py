@@ -65,7 +65,7 @@ def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B", device=None)
         from model import setup_bfg_adapter
         if getattr(model, "bfg_adapter", None) is None:
             setup_bfg_adapter(model)
-        model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
+        model.bfg_adapter.load_state_dict(ck["bfg_adapter"], strict=False)
     model.eval()
     return model, tok, mask_id
 

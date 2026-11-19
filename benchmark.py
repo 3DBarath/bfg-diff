@@ -578,7 +578,7 @@ def main():
             from model import setup_bfg_adapter
             if getattr(model, "bfg_adapter", None) is None:
                 setup_bfg_adapter(model)
-            model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
+            model.bfg_adapter.load_state_dict(ck["bfg_adapter"], strict=False)
         mask_id = ck.get("mask_id", mask_id)
     else:
         print(f"warning: checkpoint {args.checkpoint!r} not found; benchmarking base model")

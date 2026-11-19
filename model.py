@@ -199,6 +199,7 @@ class BFGDiffAdapter(torch.nn.Module):
 
         # Training / full sequence mode with explicit mask (B, C)
         if mask is not None and prefix_len is not None:
+            C_mask = mask.shape[1]
             for b in range(B):
                 masked_idx = torch.where(mask[b])[0]
                 if len(masked_idx) > 0:
@@ -206,15 +207,23 @@ class BFGDiffAdapter(torch.nn.Module):
                     seq_pos = prefix_len + masked_idx
                     out_embeds[b, seq_pos] = out_embeds[b, seq_pos] + self.slot_emb(j_idx)
                     if prev_latents is not None:
-                        w_use = min(len(masked_idx), prev_latents.shape[1])
-                        if w_use > 0:
-                            rec = self.forward_latent(prev_latents[b : b + 1, :w_use])
-                            out_embeds[b, seq_pos[:w_use]] = out_embeds[b, seq_pos[:w_use]] + rec[0]
+                        if prev_latents.shape[1] == C_mask:
+                            rec_in = prev_latents[b : b + 1, masked_idx]
+                        else:
+                            w_use = min(len(masked_idx), prev_latents.shape[1])
+                            rec_in = prev_latents[b : b + 1, :w_use]
+                        if rec_in.shape[1] > 0:
+                            rec = self.forward_latent(rec_in)
+                            out_embeds[b, seq_pos[: rec.shape[1]]] = out_embeds[b, seq_pos[: rec.shape[1]]] + rec[0]
                     if prev_pred_embeds is not None:
-                        w_sc = min(len(masked_idx), prev_pred_embeds.shape[1])
-                        if w_sc > 0:
-                            sc = self.forward_pred_embeds(prev_pred_embeds[b : b + 1, :w_sc])
-                            out_embeds[b, seq_pos[:w_sc]] = out_embeds[b, seq_pos[:w_sc]] + sc[0]
+                        if prev_pred_embeds.shape[1] == C_mask:
+                            sc_in = prev_pred_embeds[b : b + 1, masked_idx]
+                        else:
+                            w_sc = min(len(masked_idx), prev_pred_embeds.shape[1])
+                            sc_in = prev_pred_embeds[b : b + 1, :w_sc]
+                        if sc_in.shape[1] > 0:
+                            sc = self.forward_pred_embeds(sc_in)
+                            out_embeds[b, seq_pos[: sc.shape[1]]] = out_embeds[b, seq_pos[: sc.shape[1]]] + sc[0]
             return out_embeds
 
         if zone_b_len <= 0:

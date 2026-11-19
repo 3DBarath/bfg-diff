@@ -556,6 +556,25 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - **Train Smoke Test (`train.py --smoke_test`):** `smoke convergence: 11.8025 -> 4.5754 PASS` with stratified logging: `acc_offset1 75.0% acc_offset2 50.0% acc_offset3 75.0% acc_offset4 37.5% (acc_offset2_4 54.2%)`.
    - **Benchmark Smoke Test (`benchmark.py --smoke_test`):** Generation and reconstruction benchmark suite passed with clean output and zero regressions.
 
+## 33. BFG-Diff v2.2 Four Surgical Fixes & Verification (2026-11-19)
+
+1. **Fix 1 (Self-Conditioning Index Alignment in `model.py`):**
+   - Corrected indexing in `BFGDiffAdapter.apply_to_embeds` when `prev_latents` / `prev_pred_embeds` have full canvas shape `(B, C, H)`.
+   - Now indexes directly at `masked_idx` (`prev_latents[b : b + 1, masked_idx]`), eliminating frontier offset shift.
+   - Updated `test_gate_v22_sc.py` with assertion verifying non-zero frontier ($m=3$) alignment and clean prefix preservation.
+2. **Fix 2 (Resume Compatibility from v2.1 in `train.py`, `benchmark.py`, `chat.py`):**
+   - Added `strict=False` to `model.bfg_adapter.load_state_dict(...)` across all entry points, allowing seamless loading of v2.1 checkpoints.
+3. **Fix 3 (Analytical SVD Init Wiring in `train.py`):**
+   - Wired `model.bfg_adapter.init_svd_from_embeddings(..., scale=0.0)` immediately after `setup_bfg_adapter` and before `--resume`, ensuring proper initialization while maintaining step-0 numerical parity ($\Delta = 0.0$).
+4. **Fix 4 (Removed Inner-Loop GPU-CPU Synchronizations in `sampler.py`):**
+   - Vectorized Zone A draft verification (`z_eval.gather`, `accept_mask = exact_match | margin_ok`) and Zone B top-2 lookahead extraction (`top2_all = zone_b_z[:W_eval].topk(2)`), eliminating per-token `.item()` synchronization calls in the inner loop.
+5. **Verification:**
+   - `python test_gate_v22_sc.py`: Parity $\Delta = 0.00000000e+00$, non-zero frontier alignment PASS, SVD init PASS, gradient flow PASS, Zone A isolation $\Delta_{\text{leak}} = 0.00000000e+00$ PASS.
+   - `python train.py --smoke_test`: `smoke convergence: 11.3403 -> 4.4013 PASS`, `acc_offset1 87.5% acc_offset2 50.0% acc_offset3 87.5% acc_offset4 75.0% (acc_offset2_4 70.8%)`.
+   - `python train.py --resume runs/bfg-v2-base/last.pt --steps 2 ...`: Resumed and completed 2 steps with zero errors.
+   - `python benchmark.py --smoke_test`: `bfg-diff k=2` achieved 21.1% recovery and 1.23 alpha cleanly.
+
+
 
 
 

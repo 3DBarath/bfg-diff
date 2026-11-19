@@ -322,6 +322,8 @@ def main():
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     from model import setup_bfg_adapter
     setup_bfg_adapter(model, lora_r=args.lora_r if args.lora else 16)
+    # Task 3: Wire Analytical SVD Init before loading checkpoint weights (scale=0.0 preserves Delta=0.0 parity)
+    model.bfg_adapter.init_svd_from_embeddings(model.get_input_embeddings().weight, scale=0.0)
 
     if args.lora:
         targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
@@ -336,7 +338,7 @@ def main():
                 with torch.no_grad():
                     model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
             if "bfg_adapter" in ck and getattr(model, "bfg_adapter", None) is not None:
-                model.bfg_adapter.load_state_dict(ck["bfg_adapter"])
+                model.bfg_adapter.load_state_dict(ck["bfg_adapter"], strict=False)
             print(f"resumed from {args.resume} (source step {ck.get('step', '?')})")
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
