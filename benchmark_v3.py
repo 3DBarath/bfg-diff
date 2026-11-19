@@ -250,6 +250,22 @@ def run_benchmark(
     exact_matches = 0
     a_plus_totals = [0.0, 0.0, 0.0, 0.0]
 
+    # Pre-allocate shared engine for CUDA Graph reuse across benchmark prompts
+    max_p_len = max(len(tok.encode(p)) for p in prompts)
+    engine_max_len = max_p_len + max_new_tokens + 64
+    shared_engine = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=engine_max_len,
+        batch_size=batch_size,
+        v_tokens=7,
+        device=device,
+        dtype=base_dtype,
+        use_cuda_graph=(batch_size == 1),
+    )
+    if shared_engine.device.type == "cuda" and batch_size == 1:
+        shared_engine.capture_cuda_graphs(mask_id)
+
     for i in range(0, len(prompts), batch_size):
         b_prompts = prompts[i : i + batch_size]
         inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
@@ -265,6 +281,7 @@ def run_benchmark(
                 mask_token_id=mask_id,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                engine=shared_engine,
             )
         sync_device()
         elapsed = time.perf_counter() - t0

@@ -1413,8 +1413,16 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
     - Draft Cost Ratio: $(146.55 + 59.05) / 72.02 = 2.85\times$
 - **Smoke Tests**:
   - `benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: Exact Lossless Consistency 100.0%, `PASS`.
-  - `train_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: probe loss convergence 9.2184 -> 4.9368, `PASS`.
+  - `train_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: probe loss convergence 8.4008 -> 4.8904, `PASS`.
   - `train.py --smoke_test`: probe loss convergence 4.8838 -> 4.7517, `PASS`.
+
+### CUDA Graph Capture Order & Engine Reuse Fix (2026-11-19)
+- **Order-of-Operations Bug Fixed**:
+  - Moving `engine.capture_cuda_graphs(mask_token_id)` before `engine.prefill(input_ids)` in `generate_speculative_v3`.
+  - Prior order executed graph warmup/capture on all-zero `static_pos_verify`, scattering dummy states into slot 0 of `target_cache` after prefill, corrupting token 0 of prompt KV.
+  - New order captures graphs first, followed by `engine.prefill()` which executes `target_cache.reset()` and cleanly writes real prompt token KV states `0 .. P-1`.
+  - Added `engine: Optional[StaticDraftEngine] = None` parameter to `generate_speculative_v3` and pre-allocated `shared_engine` in `benchmark_v3.py` across the 50-prompt loop, eliminating redundant captures and ensuring lossless parity on CUDA.
+
 
 
 

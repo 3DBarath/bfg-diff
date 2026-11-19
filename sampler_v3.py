@@ -179,6 +179,8 @@ class StaticDraftEngine:
             return
         if not hasattr(torch.cuda, "CUDAGraph"):
             return
+        if self.cuda_graph_verify is not None and self.cuda_graph_draft is not None:
+            return
 
         self.static_mask_token = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
         self.drafter.to(dtype=self.dtype)
@@ -576,6 +578,7 @@ def generate_speculative_v3(
     temperature: float = 0.0,
     eos_token_id: Optional[int] = None,
     use_cuda_graph: bool = True,
+    engine: Optional[StaticDraftEngine] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """100% Lossless Speculative Sampling with BFG-Diff v3 Drafter.
     Guarantees exact mathematical match to base_model greedy autoregressive decoding at T=0.
@@ -584,28 +587,30 @@ def generate_speculative_v3(
     device = input_ids.device
     dtype = next(base_model.parameters()).dtype
 
-    engine = StaticDraftEngine(
-        base_model=base_model,
-        drafter=drafter,
-        max_len=P + max_new_tokens + 32,
-        batch_size=B,
-        v_tokens=v_tokens,
-        device=device,
-        dtype=dtype,
-        use_cuda_graph=use_cuda_graph,
-    )
+    if engine is None or getattr(engine, "max_len", 0) < (P + max_new_tokens + 16) or getattr(engine, "batch_size", 0) != B:
+        engine = StaticDraftEngine(
+            base_model=base_model,
+            drafter=drafter,
+            max_len=P + max_new_tokens + 32,
+            batch_size=B,
+            v_tokens=v_tokens,
+            device=device,
+            dtype=dtype,
+            use_cuda_graph=use_cuda_graph,
+        )
 
-    # 1. Prefill prompt
+    # 1. Warm up & capture CUDA graphs BEFORE prefill if not yet captured
+    # (prevents dummy warmup scatter from overwriting slot 0 of prefilled target_cache)
+    if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
+        engine.capture_cuda_graphs(mask_token_id)
+
+    # 2. Prefill prompt (prefill resets target_cache and draft_cache cleanly)
     logits_0, f_ctx_last = engine.prefill(input_ids)
     if temperature == 0.0:
         next_token = torch.argmax(logits_0[:, -1:], dim=-1)  # (B, 1) token at position P
     else:
         probs = F.softmax(logits_0[:, -1:] / temperature, dim=-1)
         next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
-
-    # Capture CUDA graphs on CUDA for B=1 after prefill
-    if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
-        engine.capture_cuda_graphs(mask_token_id)
 
     generated_per_row = [[input_ids[b], next_token[b]] for b in range(B)]
     # verified_len tracks current sequence position t (starts at P)

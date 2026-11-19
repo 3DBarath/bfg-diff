@@ -743,8 +743,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - Gate 0 & Gate 1 Profile: $T_{\text{verify}}(Q=1, P=128) = 72.02$ ms, $T_{\text{verify}}(Q_A=8, P=128) = 146.55$ ms, $T_{\text{draft}}(4L, W=7, P=128) = 59.05$ ms, draft cost ratio = $2.85\times$.
 4. **Smoke Suite Passing:**
    - `benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: PASS (100.0% exact consistency).
-   - `train_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: PASS (9.2184 -> 4.9368).
+   - `train_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: PASS (8.4008 -> 4.8904).
    - `train.py --smoke_test`: PASS (4.8838 -> 4.7517).
+5. **CUDA Graph Capture Order & Engine Reuse Fix (`sampler_v3.py`, `benchmark_v3.py`):**
+   - Moved `engine.capture_cuda_graphs(mask_token_id)` before `engine.prefill(input_ids)` in `generate_speculative_v3` so warmup scatter doesn't corrupt token 0 of prefilled `target_cache`.
+   - Added `engine: Optional[StaticDraftEngine] = None` parameter to `generate_speculative_v3` and wired `shared_engine` pre-allocation across 50 prompts in `benchmark_v3.py`.
+   - Re-verified `benchmark_v3.py --smoke_test`, `test_v3_gates.py`, and `train_v3.py --smoke_test` (ALL PASS).
+
 
 
 
