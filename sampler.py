@@ -19,6 +19,7 @@ def sample_staircase_sliding(
     tau=0.8,
     settle_margin=2.0,
     draft_margin_thresh=0.0,
+    offset_thresholds=(0.0, 0.35, 0.75),
     W_max=4,
     V_max=3,
     kv=None,
@@ -316,42 +317,66 @@ def sample_staircase_sliding(
                 step_callback(step, disp)
             break
 
-        # 7. Extract new drafts from Zone B
+        # 7. Extract new drafts from Zone B (Multi-Exit Lookahead Drafting)
         draft_ids = None
         tree_branches = None
-        if V_cur == r and not stop_hit:
-            zone_b_z = z[0, zone_a_len : zone_a_len + W]
-            top2_0 = zone_b_z[0].topk(2)
-            margin_0 = (top2_0.values[0] - top2_0.values[1]).item()
+        if not stop_hit and (canvas_len - len(committed_tokens)) >= 1:
+            if V_cur == r:
+                # Primary Zone B lookahead: full Zone A was accepted
+                zone_b_z = z[0, zone_a_len : zone_a_len + W]
+                top2_0 = zone_b_z[0].topk(2)
+                margin_0 = (top2_0.values[0] - top2_0.values[1]).item()
 
-            if enable_branching and margin_0 < branch_thresh and W >= 2 and (canvas_len - len(committed_tokens)) >= 2:
-                # Fork 2-Branch Zone A for next step
-                b1_tok0 = int(top2_0.indices[0])
-                b2_tok0 = int(top2_0.indices[1])
-                top2_1 = zone_b_z[1].topk(2)
-                b1_tok1 = int(top2_1.indices[0])
-                b2_tok1 = int(top2_1.indices[1])
-                b1_t = torch.tensor([[b1_tok0, b1_tok1]], dtype=torch.long, device=device).expand(B, -1)
-                b2_t = torch.tensor([[b2_tok0, b2_tok1]], dtype=torch.long, device=device).expand(B, -1)
-                tree_branches = (b1_t, b2_t)
-            else:
-                candidate_drafts = []
-                c_prev = int(cur_last_id[0, 0])
-                for jb in range(min(V_max, W)):
-                    top2_b = zone_b_z[jb].topk(2)
-                    margin_b = (top2_b.values[0] - top2_b.values[1]).item()
-                    tok_b = int(top2_b.indices[0])
-                    if suppress_adjacent and tok_b == c_prev:
-                        tok_b = int(top2_b.indices[1])
-                    if draft_margin_thresh <= 0.0 or margin_b >= draft_margin_thresh:
-                        candidate_drafts.append(tok_b)
-                        c_prev = tok_b
+                if enable_branching and margin_0 < branch_thresh and W >= 2 and (canvas_len - len(committed_tokens)) >= 2:
+                    # Fork 2-Branch Zone A for next step
+                    b1_tok0 = int(top2_0.indices[0])
+                    b2_tok0 = int(top2_0.indices[1])
+                    top2_1 = zone_b_z[1].topk(2)
+                    b1_tok1 = int(top2_1.indices[0])
+                    b2_tok1 = int(top2_1.indices[1])
+                    b1_t = torch.tensor([[b1_tok0, b1_tok1]], dtype=torch.long, device=device).expand(B, -1)
+                    b2_t = torch.tensor([[b2_tok0, b2_tok1]], dtype=torch.long, device=device).expand(B, -1)
+                    tree_branches = (b1_t, b2_t)
+                else:
+                    candidate_drafts = []
+                    c_prev = int(cur_last_id[0, 0])
+                    # Confidence-gated adaptive Zone A drafting (Task 1.1)
+                    for jb in range(min(V_max, W)):
+                        top2_b = zone_b_z[jb].topk(2)
+                        margin_b = (top2_b.values[0] - top2_b.values[1]).item()
+                        tok_b = int(top2_b.indices[0])
+                        if suppress_adjacent and tok_b == c_prev:
+                            tok_b = int(top2_b.indices[1])
+                        thresh = offset_thresholds[jb] if jb < len(offset_thresholds) else 0.75
+                        eff_thresh = max(draft_margin_thresh, thresh) if draft_margin_thresh > 0.0 else thresh
+                        if jb == 0 or margin_b >= eff_thresh:
+                            candidate_drafts.append(tok_b)
+                            c_prev = tok_b
+                        else:
+                            break
+                    if candidate_drafts:
+                        draft_ids = torch.tensor([candidate_drafts], dtype=torch.long, device=device).expand(B, -1)
+                        if latents is not None:
+                            prev_latents = latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]
                     else:
-                        break
-                if candidate_drafts:
-                    draft_ids = torch.tensor([candidate_drafts], dtype=torch.long, device=device).expand(B, -1)
-                    if latents is not None:
-                        prev_latents = latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]
+                        prev_latents = None
+            else:
+                # Partial rejection fallback: r < V_cur.
+                # Avoid resetting V_cur = 0 by extracting lookahead draft from Zone B slot 0
+                zone_b_z = z[0, zone_a_len : zone_a_len + W]
+                top2_0 = zone_b_z[0].topk(2)
+                margin_0 = (top2_0.values[0] - top2_0.values[1]).item()
+                c_prev = int(cur_last_id[0, 0])
+                fb_tok = int(top2_0.indices[0])
+                if suppress_adjacent and fb_tok == c_prev:
+                    fb_tok = int(top2_0.indices[1])
+                # Always draft at least 1 token if margin >= 0.25 (or if margin >= 0.0 to prevent ping-pong reset)
+                if margin_0 >= 0.20 or W > 0:
+                    draft_ids = torch.tensor([[fb_tok]], dtype=torch.long, device=device).expand(B, -1)
+                    if latents is not None and latents.shape[1] > zone_a_len:
+                        prev_latents = latents[:, zone_a_len : zone_a_len + 1]
+                    else:
+                        prev_latents = None
                 else:
                     prev_latents = None
         else:

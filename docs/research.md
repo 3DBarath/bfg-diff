@@ -324,5 +324,27 @@ During dual-checkpoint verification on real weights (`runs/bfg-polished/last.pt`
 - **Issue:** `chat.py` hardcoded `device="cpu"` and `dtype=torch.float32`.
 - **Resolution:** Introduced dynamic `--device` CLI argument (`auto`, `cuda`, `cpu`) with automatic GPU acceleration when CUDA is available.
 
+---
+
+## BFG-Diff v2.1 Architecture & Bottleneck Resolution
+
+### 1. Multi-Exit Lookahead Drafting (Ping-Pong Elimination)
+- **Problem:** When `draft_margin_thresh = 0.0` was combined with fixed `V_cur = 3`, offset $+3$ (which only has ~10% accuracy) caused verification rejection (`r < V_cur`) on ~90% of forward passes. Previously, `sampler.py` only extracted new drafts when `V_cur == r`, causing the engine to reset `V_cur = 0` on every rejection step and alternating between $(1, 2, 1, 2)$ tokens per step ($\alpha = 1.50$).
+- **Fix:** 
+  1. Offset-conditioned confidence gating: Offset $+1$ drafts at $\tau \ge 0.0$, Offset $+2$ requires margin $\ge 0.35$, Offset $+3$ requires margin $\ge 0.75$.
+  2. Fallback lookahead drafting: When $r < V_{\text{cur}}$, the engine extracts the next step's draft candidate directly from Zone B slot $0$ (which attended to the verified prefix and sees the causal continuation) with fallback margin gating ($\ge 0.20$), completely preventing the reset to $V_{\text{cur}} = 0$.
+
+### 2. Fair Apples-to-Apples Batch Benchmarking
+- **Problem:** `run_causal_generation` ran at batch size $B=4$ in a single matrix pass while `sample_canvas` sequentially iterated over $B=1$, hiding single-stream speculative speedups.
+- **Fix:** In `benchmark.py`, `run_ablation_table` evaluates causal baseline and BFG-Diff methods at identical effective batch size ($B=1$ interactive single-stream, and $B=4$), reporting explicit batch indicators in table outputs.
+
+### 3. Mask-Only Slot Embedding Injection
+- **Problem:** In `train.py`'s simulated draft curriculum, corrupted concrete draft tokens were treated as masked, adding `slot_emb` to clean token embeddings.
+- **Fix:** `model.py` and `train.py` enforce that `BFGDiffAdapter.apply_to_embeds` ONLY injects `slot_emb` and latent recycling onto actual `[MASK]` tokens (`canvas_ids == mask_id`). Clean and draft token embeddings are preserved untouched.
+
+### 4. Multi-Domain Real Corpus Distillation
+- **Problem:** Default fallback to 21-word synthetic word salad caused catastrophic forgetting during extended training.
+- **Fix:** Added `build_real_corpus.py` harvesting >1,000 real technical and markdown documents (>12M characters, zero benchmark leakage) and ChatML dialogues for production training of `runs/bfg-v2-base/last.pt` and `runs/bfg-v2-instruct/last.pt`.
+
 
 

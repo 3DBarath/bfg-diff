@@ -402,7 +402,9 @@ def canvas_forward(
 
     if getattr(model, "bfg_adapter", None) is not None:
         base_embeds = model.get_input_embeddings()(input_ids)
-        mask_to_use = mask if mask is not None else (canvas_ids == getattr(model, "mask_id", 151665))
+        # BFGDiffAdapter must only apply slot_emb and prev_latents to actual [MASK] tokens (canvas_ids == mask_id)
+        effective_mask_id = getattr(model, "mask_id", 151665)
+        mask_to_use = (canvas_ids == effective_mask_id)
         inputs_embeds = model.bfg_adapter.apply_to_embeds(
             base_embeds, mask=mask_to_use, prefix_len=P, prev_latents=prev_latents
         )

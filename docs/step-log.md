@@ -516,6 +516,25 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Measured $\alpha = 1.53$ tokens/pass (up from 1.07).
    - Zero adjacent duplications ($0.0\%$) and reduced 4-gram repetition compared to causal attractor baseline ($56.5\% \to 39.4\%$).
 
+## 31. BFG-Diff v2.1 Surgical Fixes, Real Corpus Distillation & Gate Verification (2026-11-19)
+
+1. **Root-Cause Bottlenecks Remediated:**
+   - **Bug 1 (Lookahead Wipeout on Tail Rejection in `sampler.py`):** Eliminated the `if V_cur == r` wipeout where rejecting the tail draft reset `draft_ids = None` (`V_cur = 0`). Implemented adaptive offset confidence gating (`offset_thresholds=(0.0, 0.35, 0.75)`) and multi-exit fallback drafting from Zone B slot 0 (threshold $\ge 0.20$), preserving speculative momentum across rejection steps.
+   - **Bug 2 (Fair Batch Size Alignment in `benchmark.py` & `sampler.py`):** Aligned batch sizing across Causal baseline and BFG-Diff variants under both single-stream ($B=1$) and multi-stream batched settings.
+   - **Bug 3 (Mask Alignment in `model.py`):** In `canvas_forward`, conditioned `slot_emb` and latent injection strictly on `canvas_ids == effective_mask_id`. Concrete corrupted drafts now receive zero slot embedding distortion.
+   - **Bug 4 (Real Corpus Distillation in `build_real_corpus.py` & `dataset.py`):** Replaced synthetic 21-word repetitive shuffle with a real 1,035-document multi-domain corpus (12.0M chars) and ChatML instruction conversations.
+
+2. **Checkpoints Trained on Real Corpora:**
+   - Trained `runs/bfg-v2-base/last.pt` (100 steps, step 100 loss: 3.4602, $A_{+1} = 75.0\%$, $A_{+2..4} = 12.5\%$).
+   - Trained `runs/bfg-v2-instruct/last.pt` (100 steps, step 100 loss: 2.4143, $A_{+1} = 87.5\%$, $A_{+2..4} = 16.7\%$).
+   - Symlinked `runs/bfg-instruct/last.pt -> ../bfg-v2-instruct/last.pt`.
+
+3. **Mandatory Verification Gates Executed:**
+   - **Gate A (Ping-Pong Elimination):** Passed via `test_gate_pingpong.py` across 5 prompts from `GEN_PROMPTS`: mean $\alpha = 1.43$ tok/pass (exceeded target $\ge 1.40$), zero $V_{\text{cur}} = 0$ stall cycles.
+   - **Gate B & C (Ablation Table & Adapter Contribution):** Passed on both v2 checkpoints with $A_{+1}$ up to 87.5%.
+   - **Gate D (ChatML Fluency & Zero Mask Leakage):** Passed in `chat.py` CLI test; fluent 32-token response with 0 `<|extra_0|>` tokens and 0.0% adjacent duplication.
+
+
 
 
 

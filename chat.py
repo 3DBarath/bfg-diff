@@ -179,6 +179,8 @@ def generate_bfg_traced(
     temperature=0.0,
     carrier_priority=True,
     stop_tokens=None,
+    enable_branching=False,
+    tau=0.8,
 ):
     """Generate tokens using unified sampler.py while capturing step-by-step traces."""
     torch.set_num_threads(10)

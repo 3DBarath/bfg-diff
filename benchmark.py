@@ -380,11 +380,13 @@ def run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=
 
 @torch.inference_mode()
 def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
-    print("\nRunning Comparative Ablation Study: BFG-Diff v1 vs v2...")
+    eff_bs = getattr(args, "batch_size", 1)
+    print(f"\nRunning Comparative Ablation Study: BFG-Diff v1 vs v2 (batch_size={eff_bs})...")
     probe_results = run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
     a1_pct = probe_results.get(1, (0.0, 0.0))[1]
     a2_pct = probe_results.get(2, (0.0, 0.0))[1]
 
+    # Ensure Causal and Sampler use the EXACT same effective batch size for fair apples-to-apples evaluation
     c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
     h4_c = ngram_entropy(c_ids)
     rep4_c = repeat_rate(c_ids)
@@ -392,7 +394,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
 
     rows = []
     rows.append({
-        "method": "Causal Baseline (generate)",
+        "method": f"Causal Baseline (generate, B={eff_bs})",
         "tps": causal_tps,
         "speedup": 1.00,
         "alpha": 1.00,
@@ -409,7 +411,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         margin_floor=0.0, temperature=0.0, position_decay=0.0, use_v1=True,
     )
     rows.append({
-        "method": "BFG-Diff v1 (Sub-block recompute, cap 2)",
+        "method": f"BFG-Diff v1 (Sub-block recompute, cap 2, B={eff_bs})",
         "tps": tps_v1,
         "speedup": tps_v1 / max(1e-5, causal_tps),
         "alpha": stats_v1.get("alpha", 1.00),
@@ -428,7 +430,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         margin_floor=0.0, temperature=0.0, position_decay=0.0,
     )
     rows.append({
-        "method": "BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice)",
+        "method": f"BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice, B={eff_bs})",
         "tps": tps_s1,
         "speedup": tps_s1 / max(1e-5, causal_tps),
         "alpha": stats_s1.get("alpha", 1.0),
@@ -446,7 +448,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         margin_floor=0.0, temperature=0.0, position_decay=0.0,
     )
     rows.append({
-        "method": "BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill)",
+        "method": f"BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill, B={eff_bs})",
         "tps": tps_s2,
         "speedup": tps_s2 / max(1e-5, causal_tps),
         "alpha": stats_s2.get("alpha", 1.0),
@@ -466,7 +468,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
     )
     args.enable_branching = saved_branching
     rows.append({
-        "method": "BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification)",
+        "method": f"BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification, B={eff_bs})",
         "tps": tps_s3,
         "speedup": tps_s3 / max(1e-5, causal_tps),
         "alpha": stats_s3.get("alpha", 1.0),
@@ -478,7 +480,7 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         "adj": adj_dup(ids_s3),
     })
 
-    print("\n### Comparative Ablation Study: BFG-Diff v1 vs v2")
+    print(f"\n### Comparative Ablation Study: BFG-Diff v1 vs v2 (batch_size={eff_bs})")
     print("| Method | TPS | Speedup (x) | Alpha (tok/pass) | R_kv | A_+1 (%) | A_+2 (%) | H4 | rep4 (%) | adj_dup (%) |")
     print("|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:

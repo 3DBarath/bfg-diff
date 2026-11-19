@@ -165,7 +165,7 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0)
     kl_per_token = F.kl_div(log_p_student, p_teacher, reduction="none").sum(dim=-1) * (T_distill ** 2)
 
     # Cross-Entropy against true target
-    ce_per_token = F.cross_entropy(Z_student.view(-1, Z_student.shape[-1]), target.view(-1), reduction="none").view(B, C)
+    ce_per_token = F.cross_entropy(Z_student.reshape(-1, Z_student.shape[-1]), target.reshape(-1), reduction="none").reshape(B, C)
 
     loss_per_token = lambda_kl * kl_per_token + (1.0 - lambda_kl) * ce_per_token
 
