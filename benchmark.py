@@ -679,7 +679,9 @@ def main():
         if "bfg_adapter" in ck:
             from model import setup_bfg_adapter
             if getattr(model, "bfg_adapter", None) is None:
-                setup_bfg_adapter(model)
+                adapter_cfg = ck.get("lora_config", {})
+                adapter_r = adapter_cfg.get("r", 16)
+                setup_bfg_adapter(model, lora_r=adapter_r)
             model.bfg_adapter.load_state_dict(ck["bfg_adapter"], strict=False)
         mask_id = ck.get("mask_id", mask_id)
     else:

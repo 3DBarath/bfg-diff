@@ -1267,10 +1267,13 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
    - **Statistically Valid Benchmark Suite:** Expanded `GEN_PROMPTS` to 50 diverse prompts and probe to `min(50, len(prompt_ids))` to lower variance from ±10% to ±2%. Added unmeasured warmup pass before measuring baseline generation.
    - **`slot_emb` Indexing Corrected:** Uses relative offset from the frontier `(masked_idx - frontier).clamp(0, self.max_w - 1)` rather than arbitrary `torch.arange(len(masked_idx))`.
    - **Inner-Loop Latency Reduced:** Full-vocab 152k bincounts and redundant fp32 conversions eliminated from `sampler.py`.
-   - **Untrained Baseline Overhead Ratio:** Evaluated `benchmark.py --checkpoint /nonexistent --num_prompts 2 --canvas_len 32 --batch_size 1 --ablation` on base model:
-     - `Causal Baseline (generate, B=1)`: 13.3 TPS
+   - **Untrained Baseline Overhead Ratio (CPU check):** Evaluated `benchmark.py --checkpoint /nonexistent --num_prompts 2 --canvas_len 32 --batch_size 1 --ablation` on base model:
+     - `Causal Baseline (generate, B=1)`: 13.8 TPS
      - `BFG-Diff v2 - Stage 1 (alpha=1.00)`: 7.3 TPS (0.53x vs generate on CPU due to multi-layer KV slicing without GPU batching)
      - Probe accuracy confirms untrained lookahead is completely uninformative: $A_{+0} = 100\%$, $A_{+1..4} = 0.0\%$.
+   - **Stage 3 Self-Conditioning Leak & Dynamic `lora_r` Fix:**
+     - Fixed `benchmark.py` to read `lora_r = ck.get("lora_config", {}).get("r", 16)` when initializing `setup_bfg_adapter`, preventing shape mismatches on `latent_down` / `latent_up` when testing capacity ablations (e.g. `r=64`).
+     - Cleared `prev_latents = None` and `prev_pred_embeds = None` in `sampler.py` when 2-branch micro-tree forks in Stage 3 to avoid injecting stale single-branch state. Sliced Zone B self-conditioning through `zone_a_len + W` to preserve all overlapping lookahead slots.
 
 
 

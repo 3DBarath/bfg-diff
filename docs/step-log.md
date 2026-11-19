@@ -646,6 +646,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - BFG-Diff v2 - Stage 1 (alpha=1.00): 7.3 TPS (0.53x vs generate on CPU)
      - Untrained probe: $A_{+0} = 100\%$, $A_{+1..4} = 0.0\%$.
 
+## 38. Dynamic Adapter Rank and Branching Self-Conditioning Reset (2026-11-19)
+
+1. **`benchmark.py` Dynamic `lora_r` Loading:**
+   - Updated adapter instantiation to inspect `ck.get("lora_config", {}).get("r", 16)` and pass `lora_r=adapter_r` into `setup_bfg_adapter(model, lora_r=adapter_r)`.
+   - Prevents `RuntimeError: Error(s) in loading state_dict for BFGDiffAdapter` size mismatch on `latent_down` / `latent_up` during capacity ablations (e.g. `--lora_r 64`).
+2. **`sampler.py` Stage 3 Latent Reset & Lookahead Slicing:**
+   - Cleared `prev_latents = None` and `prev_pred_embeds = None` when entering 2-branch micro-tree generation (`tree_branches = (b1_t, b2_t)`) to ensure stale single-branch states do not leak into Zone B during Stage 3.
+   - Sliced lookahead latents and predicted embeddings up to `zone_a_len + W` (`latents[:, zone_a_len + num_cand : zone_a_len + W]`) so overlapping slots are retained when `num_cand = 1`.
+3. **Verification:**
+   - Unit test `test_delta_leak.py`: `PASS` ($\Delta_{\text{leak}} = 1.81 \times 10^{-5}$).
+   - `python train.py --smoke_test`: `PASS`.
+   - `python benchmark.py --smoke_test`: `PASS`.
+
 
 
 

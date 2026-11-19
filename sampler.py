@@ -345,6 +345,9 @@ def sample_staircase_sliding(
                     b1_t = torch.tensor([[b1_tok0, b1_tok1]], dtype=torch.long, device=device).expand(B, -1)
                     b2_t = torch.tensor([[b2_tok0, b2_tok1]], dtype=torch.long, device=device).expand(B, -1)
                     tree_branches = (b1_t, b2_t)
+                    # Clear self-conditioning latents/embeds so stale states are not injected into Zone B
+                    prev_latents = None
+                    prev_pred_embeds = None
                 else:
                     candidate_drafts = []
                     c_prev = int(cur_last_id[0, 0])
@@ -373,12 +376,12 @@ def sample_staircase_sliding(
                         num_cand = len(candidate_drafts)
                         if latents is not None and latents.shape[1] >= (zone_a_len + num_cand):
                             # Zone B next step begins at offset num_cand from current Zone B start
-                            prev_latents = latents[:, zone_a_len + num_cand : zone_a_len + 2 * num_cand]
+                            prev_latents = latents[:, zone_a_len + num_cand : zone_a_len + W]
                         else:
                             prev_latents = None
                         # Sigma SC: extract predicted embeddings for Zone B next-step slots
                         if zone_b_z.shape[0] > num_cand:
-                            zone_b_next_ids = zone_b_z[num_cand : 2 * num_cand].argmax(dim=-1).unsqueeze(0).expand(B, -1)
+                            zone_b_next_ids = zone_b_z[num_cand : W].argmax(dim=-1).unsqueeze(0).expand(B, -1)
                             emb_fn = model.get_input_embeddings()
                             prev_pred_embeds = emb_fn(zone_b_next_ids).detach()
                         else:
