@@ -387,31 +387,12 @@ def sample_staircase_sliding(
                         prev_latents = None
                         prev_pred_embeds = None
             else:
-                # Partial rejection fallback: r < V_cur.
-                # Avoid resetting V_cur = 0 by extracting lookahead draft from Zone B slot 0
-                zone_b_z = z[0, zone_a_len : zone_a_len + W]
-                top2_0 = zone_b_z[0].topk(2)
-                margin_0 = (top2_0.values[0] - top2_0.values[1]).item()
-                c_prev = int(cur_last_id[0, 0])
-                fb_tok = int(top2_0.indices[0])
-                if suppress_adjacent and fb_tok == c_prev:
-                    fb_tok = int(top2_0.indices[1])
-                # Always draft at least 1 token if margin >= 0.25 (or if margin >= 0.0 to prevent ping-pong reset)
-                if margin_0 >= 0.20 or W > 0:
-                    draft_ids = torch.tensor([[fb_tok]], dtype=torch.long, device=device).expand(B, -1)
-                    if latents is not None and latents.shape[1] > (zone_a_len + 1):
-                        prev_latents = latents[:, zone_a_len + 1 : zone_a_len + 2]
-                    else:
-                        prev_latents = None
-                    if zone_b_z.shape[0] > 1:
-                        next_slot_id = zone_b_z[1:2].argmax(dim=-1).unsqueeze(0).expand(B, -1)
-                        emb_fn = model.get_input_embeddings()
-                        prev_pred_embeds = emb_fn(next_slot_id).detach()
-                    else:
-                        prev_pred_embeds = None
-                else:
-                    prev_latents = None
-                    prev_pred_embeds = None
+                # Partial rejection: r < V_cur.
+                # Zone B positions at current step were conditioned on rejected drafts at positions P+r+1..P+V_cur.
+                # Do NOT extract misaligned drafts from zone_b_z[0]; cleanly reset drafts for next step.
+                draft_ids = None
+                prev_latents = None
+                prev_pred_embeds = None
         else:
             prev_latents = None
             prev_pred_embeds = None

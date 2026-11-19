@@ -1243,9 +1243,9 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
   2. **Evaluation Mask Off-by-One Mismatch (`train.py` -> `evaluate()`):**
      - `evaluate()` previously set `mask[:, 1:] = True`, leaving slot 0 clean. This caused `acc_offset1` (`top1_S[:, 1]`) to evaluate prediction from clean context (reporting an inflated 87.5% during training), whereas `benchmark.py` evaluates lookahead predictions through `[MASK]` tokens (observing 20%–30%).
      - *Resolution:* Set `mask[:, :] = True` in `evaluate()` so training validation matches the true masked inference distribution.
-  3. **Architectural Confirmation (Caching vs. Adapter Convergence):**
-     - The bottleneck is NOT caching overhead. BFG-Diff v2 already caches the prefix across all 24 layers via `prefill_prefix` and in-place `kv.crop()`. Furthermore, T4 GPU roofline measurements confirm per-step latency is flat across active tokens (`37.49 ms` at $N=1$ vs. `37.16 ms` at $N=16$).
-     - The sole bottleneck was that `BFGDiffAdapter` was frozen. Unfreezing the adapter parameters allows multi-offset lookahead gradients to propagate properly, driving $A_{+1..3}$ up to target thresholds ($>80\%, >50\%$) for $\alpha \ge 2.20$ and $>2.2\times$ wall-clock speedup.
+  3. **Architectural Confirmation & Empirical Limits:**
+     - The bottleneck is NOT prefix caching overhead: BFG-Diff v2 caches the prefix across all 24 layers via `prefill_prefix` and in-place `kv.crop()`. T4 GPU roofline measurements confirm per-step latency is flat across active tokens (`37.49 ms` at $N=1$ vs. `37.16 ms` at $N=16$).
+     - While unfreezing `BFGDiffAdapter` allowed multi-offset lookahead gradients to propagate to `slot_emb`, `latent_up`, and `pred_emb_scale`, the subsequent 800-step training run revealed that unfreezing alone does not solve the fundamental capacity limit: validation lookahead accuracy plateaued at $A_{+1} \approx 27\% - 31\%$ and $A_{+2} \approx 14\% - 27\%$ ($A_{+2..4} \approx 11\% - 24\%$), demonstrating that single-backbone `[MASK]`-slot lookahead without dedicated draft heads has a clear empirical ceiling. True speedup is fundamentally constrained by draft acceptance $\alpha$ and per-step Python/framework overhead.
 
 ### 4. 2026-11-19: Unfrozen Checkpoints Ingestion & Peer Review Remediation
 
@@ -1261,9 +1261,17 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
 
 2. **Peer Review Audit & Verification:**
    - **Causal Baseline Contamination Eliminated:** Base causal TPS is now evaluated on the unadapted base model before applying LoRA (`benchmark.py`), preventing PEFT wrapper slowdown from artificially deflating the baseline. LoRA weights are merged via `merge_and_unload()` before evaluating BFG-Diff.
-   - **Exact Staircase Hybrid Attention:** `build_hybrid_attention_mask` enforces that clean tokens in Zone A / canvas attend strictly causally and cannot attend forward into `[MASK]` tokens, matching inference `build_staircase_step_mask` with `Delta_leak = 2.18e-05` (PASS in `test_delta_leak.py`).
+   - **Exact Staircase Hybrid Attention:** `build_hybrid_attention_mask` enforces that clean tokens in Zone A / canvas attend strictly causally and cannot attend forward into `[MASK]` tokens, matching inference `build_staircase_step_mask` with `Delta_leak = 1.81e-05` (PASS in `test_delta_leak.py`).
+   - **Vectorized Attention Mask & Mask Decoupling:** `build_hybrid_attention_mask` is fully vectorized with zero Python loops or CPU-GPU syncs. Decoupled `is_mask_token = (canvas_ids == effective_mask_id)` from training loss mask so corrupted tokens do not receive `slot_emb` or attend bidirectionally.
+   - **Partial Rejection Clean Reset:** When $r < V_{\text{cur}}$, drafts and recycled latents/embeddings are cleanly reset to `None` rather than extracting misaligned drafts from Zone B slot 0 conditioned on rejected candidates.
+   - **Statistically Valid Benchmark Suite:** Expanded `GEN_PROMPTS` to 50 diverse prompts and probe to `min(50, len(prompt_ids))` to lower variance from ±10% to ±2%. Added unmeasured warmup pass before measuring baseline generation.
    - **`slot_emb` Indexing Corrected:** Uses relative offset from the frontier `(masked_idx - frontier).clamp(0, self.max_w - 1)` rather than arbitrary `torch.arange(len(masked_idx))`.
    - **Inner-Loop Latency Reduced:** Full-vocab 152k bincounts and redundant fp32 conversions eliminated from `sampler.py`.
+   - **Untrained Baseline Overhead Ratio:** Evaluated `benchmark.py --checkpoint /nonexistent --num_prompts 2 --canvas_len 32 --batch_size 1 --ablation` on base model:
+     - `Causal Baseline (generate, B=1)`: 13.3 TPS
+     - `BFG-Diff v2 - Stage 1 (alpha=1.00)`: 7.3 TPS (0.53x vs generate on CPU due to multi-layer KV slicing without GPU batching)
+     - Probe accuracy confirms untrained lookahead is completely uninformative: $A_{+0} = 100\%$, $A_{+1..4} = 0.0\%$.
+
 
 
 

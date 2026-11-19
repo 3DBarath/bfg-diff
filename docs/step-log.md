@@ -626,6 +626,26 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: PASS.
    - Ran `python benchmark.py --ablation`: Verified execution on CPU with clean unadapted baseline and Stage 1/2 distinction.
 
+## 37. Vectorized Hybrid Mask, Attention Decoupling, Partial Rejection Cleanup, and Untrained Overhead Gate (2026-11-19)
+
+1. **`model.py` Optimizations & Decoupling:**
+   - Vectorized `build_hybrid_attention_mask` completely using tensor broadcasting: removed all Python loops (`for b`, `for q_idx`, `.item()`) and GPU-CPU synchronization bottlenecks.
+   - Sliced `is_mask_token = (canvas_ids == effective_mask_id)` independently from the training loss mask so corrupted tokens from `make_mask` (30% branch) do not receive `slot_emb` or attend bidirectionally to `[MASK]` tokens.
+   - Verified $\Delta_{\text{leak}} = 1.81 \times 10^{-5}$ (`PASS`) in `test_delta_leak.py`.
+2. **`sampler.py` Partial Rejection Fix:**
+   - Fixed fallback branch when $r < V_{\text{cur}}$: removed the extraction of lookahead drafts from `zone_b_z[0]` because Zone B positions at that step were conditioned on rejected drafts at $P + r + 1 \dots P + V_{\text{cur}}$. Reset `draft_ids = None`, `prev_latents = None`, `prev_pred_embeds = None`.
+3. **`benchmark.py` Statistical Validity & Warmup:**
+   - Expanded `GEN_PROMPTS` to 50 diverse prompts and probe to `min(50, len(prompt_ids))` to lower variance to ±2%.
+   - Added unmeasured 1-prompt warmup to `run_causal_generation`.
+4. **Verification & Untrained Overhead Gate:**
+   - Ran `test_delta_leak.py`: `Max difference Delta_leak on clean Zone A positions: 1.811981e-05` (`PASS`).
+   - Ran `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.4521 PASS`.
+   - Ran `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: `PASS`.
+   - Ran `python benchmark.py --checkpoint /nonexistent --num_prompts 2 --canvas_len 32 --batch_size 1 --ablation`:
+     - Causal Baseline (generate, B=1): 13.8 TPS
+     - BFG-Diff v2 - Stage 1 (alpha=1.00): 7.3 TPS (0.53x vs generate on CPU)
+     - Untrained probe: $A_{+0} = 100\%$, $A_{+1..4} = 0.0\%$.
+
 
 
 

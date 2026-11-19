@@ -62,18 +62,67 @@ REFERENCE_TEXTS = [
     "- Updated the bundled tokenizer to revision 2024-11.\n",
 ]
 
-# Short openers spanning prose, docs, markdown, JSON and code.
+# 50 unique, diverse openers spanning prose, technical docs, code, JSON, reasoning, mathematics.
 GEN_PROMPTS = [
+    # Prose & Literature
     "Once upon a time, in a small coastal village, the fishermen noticed that",
+    "The old lighthouse keeper climbed the spiral staircase as the storm began to",
+    "Through the dense morning fog, the outline of the abandoned fortress slowly",
+    "She opened the dusty leather journal and read the very first entry, which stated that",
+    "Beneath the roots of the ancient oak tree lay an iron chest containing",
+    "The autumn wind scattered dry leaves across the stone courtyard while the travelers",
+    "Deep in the desert canyon, archaeologists discovered carved symbols indicating",
+    "The astronomer adjusted the brass telescope and observed a strange flare emanating from",
+    "Across the silent frozen lake, the wolves howled under the pale green light of",
+    "Every year during the spring equinox, the villagers gathered at the summit to",
+
+    # Technical Docs & Systems
     "To configure the proxy, edit the settings file and set",
     "## Quick start\n\nInstall the package, then run",
-    "{\n  \"task\": \"summarise\",\n  \"input\": \"Quarterly revenue rose",
     "- first, collect the measurements\n- second, clean the outliers\n- third,",
-    "The committee reviewed the proposal and concluded that",
+    "The primary bottleneck in distributed key-value storage occurs when",
+    "### Authentication Architecture\n\nAll incoming client requests must include a valid bearer token in the",
+    "To scale database write throughput across multiple read replicas, implement",
+    "During memory compaction, the garbage collector pauses application worker threads to",
+    "The network load balancer distributes inbound TCP connections evenly by using",
+    "When a worker node experiences a kernel panic or loses heartbeat contact with the coordinator,",
+    "To ensure zero downtime deployments, traffic is gradually shifted from the blue cluster to",
+
+    # Software Engineering & Code
     "def merge_intervals(intervals):\n    \"\"\"Merge overlapping intervals.\"\"\"\n",
+    "async def fetch_user_profile(user_id: str, db_pool) -> dict:\n    \"\"\"Query user metadata from database.\"\"\"\n",
+    "class LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n",
+    "def binary_search(arr, target):\n    \"\"\"Find target index in sorted array.\"\"\"\n    left, right = 0, len(arr) - 1\n",
+    "import torch\nimport torch.nn as nn\n\nclass SelfAttentionBlock(nn.Module):\n    def __init__(self, d_model, n_heads):\n",
+    "const handleFormSubmission = async (event: React.FormEvent) => {\n    event.preventDefault();\n",
+    "fn parse_http_headers(raw_request: &[u8]) -> Result<HeaderMap, ParseError> {\n",
+    "SELECT users.id, users.email, COUNT(orders.id) AS total_orders FROM users JOIN orders ON",
+    "def dijkstra_shortest_path(graph, start_node):\n    \"\"\"Compute shortest distance to all reachable nodes.\"\"\"\n",
+    "docker-compose build --parallel && docker-compose up -d && echo \"Services started successfully on",
+
+    # JSON & Structured Data
+    "{\n  \"task\": \"summarise\",\n  \"input\": \"Quarterly revenue rose",
+    "{\n  \"status\": 200,\n  \"data\": {\n    \"cluster_name\": \"us-east-prod-4\",\n    \"healthy_nodes\":",
+    "[\n  {\"id\": 101, \"title\": \"Database Migration\", \"priority\": \"critical\", \"assigned_to\":",
+    "{\n  \"model\": \"qwen-2.5-0.5b\",\n  \"temperature\": 0.7,\n  \"messages\": [\n    {\"role\": \"user\", \"content\":",
+    "{\n  \"event_type\": \"payment_completed\",\n  \"transaction\": {\n    \"amount_cents\": 4999,\n    \"currency\": \"USD\",\n",
+    "{\n  \"query\": \"SELECT name, price FROM inventory WHERE in_stock = true\",\n  \"execution_time_ms\":",
+    "{\n  \"error\": null,\n  \"result\": {\n    \"embeddings\": [0.0412, -0.1983, 0.8841,\n",
+    "{\n  \"device\": \"cuda:0\",\n  \"total_memory_mb\": 15360,\n  \"allocated_memory_mb\":",
+    "[\n  {\"epoch\": 1, \"train_loss\": 4.120, \"val_loss\": 3.891},\n  {\"epoch\": 2, \"train_loss\":",
+    "{\n  \"service\": \"auth-gateway\",\n  \"uptime_seconds\": 864000,\n  \"p99_latency_ms\":",
+
+    # Reasoning, Analysis & Mathematics
+    "The committee reviewed the proposal and concluded that",
     "In 1969, engineers at the laboratory succeeded in",
     "Recipe: heat the pan, add the onions, and cook until",
     "The report argues that remote work changes urban economies because",
+    "To prove that the square root of 2 is irrational, assume by contradiction that",
+    "Analyzing the economic impact of tariffs on consumer electronics indicates that",
+    "The central limit theorem states that the arithmetic mean of a large number of independent random variables",
+    "Comparing transformer attention complexity with recurrent neural networks reveals that",
+    "In quantum mechanics, Heisenberg's uncertainty principle sets a fundamental limit on",
+    "The historical consensus regarding the decline of the Western Roman Empire emphasizes",
 ]
 
 
@@ -327,7 +376,7 @@ def run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=
     tau_matches = {k: 0 for k in range(W + 1)}
     total_prompts = 0
 
-    eval_prompts = prompt_ids[:min(10, len(prompt_ids))]
+    eval_prompts = prompt_ids[:min(50, len(prompt_ids))]
     for p_ids in eval_prompts:
         if len(p_ids) < 4:
             continue
@@ -511,6 +560,19 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
 
 @torch.inference_mode()
 def run_causal_generation(model, tok, prompt_ids, args, device):
+    # Run a 1-prompt unmeasured warmup pass before timing so kernel/allocator init does not bias baseline
+    if len(prompt_ids) > 0:
+        w_ids, w_keep = left_pad(prompt_ids[:1], tok.pad_token_id, device)
+        model.generate(
+            input_ids=w_ids,
+            attention_mask=w_keep.long(),
+            max_new_tokens=min(16, args.canvas_len),
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tok.pad_token_id,
+        )
+        sync(device)
+
     token_ids = []
     sync(device)
     start = time.perf_counter()
