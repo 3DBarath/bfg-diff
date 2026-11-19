@@ -4,7 +4,7 @@ Core Features:
 1. Zero-crop(), Pointer-Indexed StaticCache:
    - Target cache across all L layers: (B, n_kv_heads, MAX_LEN, head_dim)
    - Draft cache across top 4 layers: (B, n_kv_heads, MAX_LEN, head_dim)
-   - cur_pos maintained on device; cache_position = cur_pos + arange(Q_A) overwrites rejected tail in-place.
+   - In-place pointer indexing overwrites rejected tail in-place.
 2. Fixed Active Shapes:
    - Stage 1 (verify): fixed Q_A = 8 ([y*, d_0, ..., d_6], V=7).
    - Stage 2 (draft): fixed W = 7 draft tokens.
@@ -13,7 +13,7 @@ Core Features:
      - y* has RoPE position t, and draft tokens have RoPE positions [t, t+1, ..., t+W-1],
        predicting [x_{t+1}, x_{t+2}, ..., x_{t+W}].
      - f_ctx_last MUST be f_ctx[t-1] (feature of token immediately preceding y*).
-     - Draft prefix KV cache contains exactly positions 0 .. t-1 (length t).
+     - Draft prefix KV cache contains strictly positions 0 .. t-1 (length t).
    - Verified length t starts at P (prompt length) after prefill.
 4. Support for both CUDA-Graph captured execution (on CUDA B=1) and eager static fallback (CPU/B=4).
 5. Batched ragged B=1 and B=4 support.
@@ -87,7 +87,7 @@ class StaticKVCache:
 
 
 class StaticDraftEngine:
-    """Encapsulates static-shape Stage 1 verification and Stage 2 drafting."""
+    """Encapsulates static-shape Stage 1 verification and Stage 2 drafting with CUDA Graph capture."""
 
     def __init__(
         self,
@@ -113,8 +113,13 @@ class StaticDraftEngine:
             device = next(base_model.parameters()).device
         if dtype is None:
             dtype = next(base_model.parameters()).dtype
-        self.device = device
+        self.device = torch.device(device)
         self.dtype = dtype
+
+        # In inference mode on CUDA (or when dtype is fp16), ensure drafter is cast to self.dtype
+        # so apply_linear_with_delta runs purely in fp16 with zero fp32 casts
+        if self.device.type == "cuda" or self.dtype == torch.float16:
+            self.drafter.to(dtype=self.dtype)
 
         config = base_model.config
         self.total_layers = config.num_hidden_layers
@@ -150,12 +155,13 @@ class StaticDraftEngine:
         self.static_y_star = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.static_f_ctx_last = torch.zeros(batch_size, 1, self.dim, dtype=dtype, device=device)
         self.static_pos_draft = torch.zeros(batch_size, self.w, dtype=torch.long, device=device)
+        self.static_mask_token = torch.tensor([[151665]], dtype=torch.long, device=device)
 
         # Pre-allocate static attention masks
         # static_mask_A: (B, 1, Q_A, MAX_LEN)
         self.static_mask_A = torch.full((batch_size, 1, self.q_a, max_len), -1e4, dtype=dtype, device=device)
-        # static_mask_B: (B, 1, W, MAX_LEN)
-        self.static_mask_B = torch.full((batch_size, 1, self.w, max_len), -1e4, dtype=dtype, device=device)
+        # static_mask_B: (B, 1, W, MAX_LEN + W)
+        self.static_mask_B = torch.full((batch_size, 1, self.w, max_len + self.w), -1e4, dtype=dtype, device=device)
 
         # Pre-allocate static output buffers
         vocab_size = config.vocab_size
@@ -167,35 +173,123 @@ class StaticDraftEngine:
         self.cuda_graph_verify = None
         self.cuda_graph_draft = None
 
-    def build_verify_mask(self, cur_pos_list: List[int]) -> torch.Tensor:
-        """Construct static mask for Stage 1 verification of length Q_A = 8.
-        Queries at [t .. t + Q_A - 1] attend causally to all past prefix 0 .. t-1
-        and causally among the Q_A tokens.
-        """
-        B = self.batch_size
-        mask = torch.full((B, 1, self.q_a, self.max_len), -1e4, dtype=self.dtype, device=self.device)
-        for b in range(B):
-            t = cur_pos_list[b]
-            if t > 0:
-                mask[b, 0, :, :t] = 0.0
-            causal_diag = torch.tril(torch.zeros(self.q_a, self.q_a, dtype=self.dtype, device=self.device))
-            mask[b, 0, :, t : t + self.q_a] = causal_diag
-        return mask
+    def capture_cuda_graphs(self, mask_token_id: int):
+        """Warmup and capture CUDA graphs on CUDA for B=1."""
+        if self.device.type != "cuda" or self.batch_size != 1 or not self.use_cuda_graph:
+            return
+        if not hasattr(torch.cuda, "CUDAGraph"):
+            return
 
-    def build_draft_mask(self, cur_pos_list: List[int]) -> torch.Tensor:
-        """Construct static mask for Stage 2 drafting of length W = 7.
-        All W draft queries at [t .. t + W - 1] attend bidirectionally to:
-        1. All valid prefix positions 0 .. t - 1
-        2. All W draft positions t .. t + W - 1
-        """
-        B = self.batch_size
-        mask = torch.full((B, 1, self.w, self.max_len), -1e4, dtype=self.dtype, device=self.device)
-        for b in range(B):
-            t = cur_pos_list[b]
-            if t > 0:
-                mask[b, 0, :, :t] = 0.0
-            mask[b, 0, :, t : t + self.w] = 0.0
-        return mask
+        self.static_mask_token = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
+        self.drafter.to(dtype=self.dtype)
+
+        try:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    self._step_verify_kernel()
+                    self._step_draft_kernel()
+            torch.cuda.current_stream().wait_stream(s)
+
+            # Capture Stage 1 verify graph
+            self.cuda_graph_verify = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.cuda_graph_verify):
+                self._step_verify_kernel()
+
+            # Capture Stage 2 draft graph
+            self.cuda_graph_draft = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.cuda_graph_draft):
+                self._step_draft_kernel()
+        except Exception as e:
+            # Fall back to eager static execution if CUDA graph capture fails on host
+            self.cuda_graph_verify = None
+            self.cuda_graph_draft = None
+
+    def _step_verify_kernel(self):
+        """Execution kernel for Stage 1 verify with fixed static shapes."""
+        h = self.base_model.model.embed_tokens(self.static_verify_input_ids)
+        cos, sin = self.base_model.model.rotary_emb(h, self.static_pos_verify)
+
+        all_hidden_states = [h]
+        for l_idx, layer in enumerate(self.base_model.model.layers):
+            norm_h = layer.input_layernorm(h)
+            q = layer.self_attn.q_proj(norm_h).view(1, self.q_a, self.num_heads, self.head_dim).transpose(1, 2)
+            k = layer.self_attn.k_proj(norm_h).view(1, self.q_a, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = layer.self_attn.v_proj(norm_h).view(1, self.q_a, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+            idx = self.static_pos_verify.view(1, 1, self.q_a, 1).expand(1, self.num_kv_heads, self.q_a, self.head_dim)
+            self.target_cache.k[l_idx].scatter_(2, idx, k)
+            self.target_cache.v[l_idx].scatter_(2, idx, v)
+
+            if self.num_heads != self.num_kv_heads:
+                k_attn = repeat_kv(self.target_cache.k[l_idx], self.num_heads // self.num_kv_heads)
+                v_attn = repeat_kv(self.target_cache.v[l_idx], self.num_heads // self.num_kv_heads)
+            else:
+                k_attn, v_attn = self.target_cache.k[l_idx], self.target_cache.v[l_idx]
+
+            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=self.static_mask_A)
+            attn_out = attn_out.transpose(1, 2).reshape(1, self.q_a, self.dim)
+            h = h + layer.self_attn.o_proj(attn_out)
+            norm_post = layer.post_attention_layernorm(h)
+            h = h + layer.mlp(norm_post)
+
+            if l_idx == self.total_layers - 1:
+                all_hidden_states.append(self.base_model.model.norm(h))
+            else:
+                all_hidden_states.append(h)
+
+        h_norm = self.base_model.model.norm(h)
+        logits = self.base_model.lm_head(h_norm)
+        self.static_verify_logits.copy_(logits)
+        f_ctx = self.drafter.fuse_stage1_features(tuple(all_hidden_states))
+        self.static_f_ctx_verify.copy_(f_ctx)
+
+    def _step_draft_kernel(self):
+        """Execution kernel for Stage 2 draft with fixed static shapes."""
+        y_star_emb = self.drafter.embed_tokens(self.static_y_star)
+        mask_emb = self.drafter.embed_tokens(self.static_mask_token)
+        h = self.drafter.bridge(y_star_emb, mask_emb, self.static_f_ctx_last, w=self.w)
+
+        for layer_idx in range(self.k_layers):
+            base_layer = self.drafter.draft_layers[layer_idx]
+            deltas = self.drafter.layer_deltas[layer_idx]
+
+            norm_h = base_layer.input_layernorm(h)
+            q = apply_linear_with_delta(base_layer.self_attn.q_proj, norm_h, deltas.q_proj)
+            q = q.view(1, self.w, self.num_heads, self.head_dim).transpose(1, 2)
+            k_d = apply_linear_with_delta(base_layer.self_attn.k_proj, norm_h, deltas.k_proj)
+            k_d = k_d.view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_d = apply_linear_with_delta(base_layer.self_attn.v_proj, norm_h, deltas.v_proj)
+            v_d = v_d.view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            cos_d, sin_d = self.drafter.rotary_emb(norm_h, self.static_pos_draft)
+            q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
+
+            k_total = torch.cat([self.draft_cache.k[layer_idx], k_d], dim=2)
+            v_total = torch.cat([self.draft_cache.v[layer_idx], v_d], dim=2)
+
+            if self.num_heads != self.num_kv_heads:
+                k_attn = repeat_kv(k_total, self.num_heads // self.num_kv_heads)
+                v_attn = repeat_kv(v_total, self.num_heads // self.num_kv_heads)
+            else:
+                k_attn, v_attn = k_total, v_total
+
+            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=self.static_mask_B)
+            attn_out = attn_out.transpose(1, 2).reshape(1, self.w, self.dim)
+            h = h + apply_linear_with_delta(base_layer.self_attn.o_proj, attn_out, deltas.o_proj)
+
+            norm_post = base_layer.post_attention_layernorm(h)
+            gate = apply_linear_with_delta(base_layer.mlp.gate_proj, norm_post, deltas.gate_proj)
+            up = apply_linear_with_delta(base_layer.mlp.up_proj, norm_post, deltas.up_proj)
+            mlp_act = base_layer.mlp.act_fn(gate) * up
+            h = h + apply_linear_with_delta(base_layer.mlp.down_proj, mlp_act, deltas.down_proj)
+
+        h_norm = self.drafter.norm(h)
+        logits = self.drafter.lm_head(h_norm)
+        self.static_draft_logits.copy_(logits)
+        self.static_draft_ids.copy_(torch.argmax(logits, dim=-1))
 
     def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Stage 1 prefill on prompt tokens (length P).
@@ -257,6 +351,48 @@ class StaticDraftEngine:
 
         return logits, f_ctx_last
 
+    def forward_verify_single_token(
+        self,
+        token: torch.Tensor,  # (B, 1)
+        cur_pos: int,
+    ) -> torch.Tensor:
+        """Measure single-token verification on populated target_cache at position cur_pos."""
+        B = token.shape[0]
+        pos_id = torch.tensor([[cur_pos]], device=self.device)
+        max_total_len = cur_pos + 1
+        mask = torch.full((B, 1, 1, max_total_len), -1e4, dtype=self.dtype, device=self.device)
+        mask[:, :, :, :max_total_len] = 0.0
+
+        h = self.base_model.model.embed_tokens(token)
+        cos, sin = self.base_model.model.rotary_emb(h, pos_id)
+
+        for l_idx, layer in enumerate(self.base_model.model.layers):
+            norm_h = layer.input_layernorm(h)
+            q = layer.self_attn.q_proj(norm_h).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = layer.self_attn.k_proj(norm_h).view(B, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = layer.self_attn.v_proj(norm_h).view(B, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+            self.target_cache.k[l_idx][:, :, cur_pos : cur_pos + 1] = k
+            self.target_cache.v[l_idx][:, :, cur_pos : cur_pos + 1] = v
+
+            k_active = self.target_cache.k[l_idx][:, :, :max_total_len]
+            v_active = self.target_cache.v[l_idx][:, :, :max_total_len]
+            if self.num_heads != self.num_kv_heads:
+                k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
+                v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+            else:
+                k_attn, v_attn = k_active, v_active
+
+            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask)
+            attn_out = attn_out.transpose(1, 2).reshape(B, 1, self.dim)
+            h = h + layer.self_attn.o_proj(attn_out)
+            norm_post = layer.post_attention_layernorm(h)
+            h = h + layer.mlp(norm_post)
+
+        logits = self.base_model.lm_head(self.base_model.model.norm(h))
+        return logits
+
     def forward_verify_step(
         self,
         verify_tokens: torch.Tensor,       # (B, Q_A=8) [y*, d_0, ..., d_6]
@@ -264,20 +400,36 @@ class StaticDraftEngine:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Stage 1 verify pass over Q_A = 8 tokens at positions [t .. t+7].
         Writes target KV into target_cache at [t .. t+7].
-        Returns: (logits (B, Q_A, vocab), f_ctx_verify (B, Q_A, D))
+        Uses CUDA Graph replay on CUDA when B=1, otherwise runs eager static step.
         """
         B, Q_A = verify_tokens.shape
+        t = cur_pos_list[0]
+
+        # CUDA Graph replay path for B=1
+        if self.cuda_graph_verify is not None and B == 1:
+            self.static_verify_input_ids.copy_(verify_tokens)
+            self.static_pos_verify.copy_(torch.arange(t, t + Q_A, device=self.device).unsqueeze(0))
+            self.static_mask_A.fill_(-1e4)
+            if t > 0:
+                self.static_mask_A[0, 0, :, :t] = 0.0
+            causal_block = torch.triu(torch.full((Q_A, Q_A), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
+            self.static_mask_A[0, 0, :, t : t + Q_A] = causal_block
+
+            self.cuda_graph_verify.replay()
+            return self.static_verify_logits, self.static_f_ctx_verify
+
+        # Eager static execution path (CPU or B > 1)
         max_total_len = max(cur_pos_list) + Q_A
         pos_ids = torch.zeros(B, Q_A, dtype=torch.long, device=self.device)
         mask = torch.full((B, 1, Q_A, max_total_len), -1e4, dtype=self.dtype, device=self.device)
 
         for b in range(B):
-            t = cur_pos_list[b]
-            pos_ids[b] = torch.arange(t, t + Q_A, device=self.device)
-            if t > 0:
-                mask[b, 0, :, :t] = 0.0
+            cp = cur_pos_list[b]
+            pos_ids[b] = torch.arange(cp, cp + Q_A, device=self.device)
+            if cp > 0:
+                mask[b, 0, :, :cp] = 0.0
             causal_block = torch.triu(torch.full((Q_A, Q_A), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-            mask[b, 0, :, t : t + Q_A] = causal_block
+            mask[b, 0, :, cp : cp + Q_A] = causal_block
 
         h = self.base_model.model.embed_tokens(verify_tokens)
         cos, sin = self.base_model.model.rotary_emb(h, pos_ids)
@@ -291,7 +443,6 @@ class StaticDraftEngine:
 
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-            # In-place write to target_cache per row at [t .. t+7]
             for b in range(B):
                 cache_positions = pos_ids[b]
                 self.target_cache.k[l_idx][b, :, cache_positions] = k[b]
@@ -319,9 +470,8 @@ class StaticDraftEngine:
                 all_hidden_states.append(h)
 
         h_norm = self.base_model.model.norm(h)
-        logits = self.base_model.lm_head(h_norm)  # (B, Q_A, vocab)
-
-        f_ctx = self.drafter.fuse_stage1_features(tuple(all_hidden_states))  # (B, Q_A, D)
+        logits = self.base_model.lm_head(h_norm)
+        f_ctx = self.drafter.fuse_stage1_features(tuple(all_hidden_states))
         return logits, f_ctx
 
     def forward_draft_step(
@@ -334,26 +484,40 @@ class StaticDraftEngine:
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Stage 2 draft pass: produces W = 7 draft tokens predicting [t+1 .. t+7].
         Prefix KV cache sliced to length t (positions 0 .. t-1, zero garbage slots).
-        Draft tokens have RoPE positions [t .. t + W - 1].
-        Slot 0 predicts A_+1 (x_{t+1}) directly from concrete bonus token y*.
+        Uses CUDA Graph replay on CUDA when B=1, otherwise runs eager static step.
         """
         B = y_star_ids.shape[0]
         W = self.w
-        max_prefix_len = max(cur_pos_list)
+        t = cur_pos_list[0]
 
-        # Slice prefix KV: strictly positions 0 .. t-1 (length max_prefix_len)
+        # CUDA Graph replay path for B=1
+        if self.cuda_graph_draft is not None and B == 1:
+            self.static_y_star.copy_(y_star_ids)
+            self.static_f_ctx_last.copy_(f_ctx_last)
+            self.static_pos_draft.copy_(torch.arange(t, t + W, device=self.device).unsqueeze(0))
+            self.static_mask_B.fill_(-1e4)
+            if t > 0:
+                self.static_mask_B[0, 0, :, :t] = 0.0
+            self.static_mask_B[0, 0, :, self.max_len : self.max_len + W] = 0.0
+
+            self.cuda_graph_draft.replay()
+            if return_logits:
+                return self.static_draft_ids, self.static_draft_logits
+            return self.static_draft_ids
+
+        # Eager static execution path (CPU or B > 1)
+        max_prefix_len = max(cur_pos_list)
         kp_list = [self.draft_cache.k[i][:, :, :max_prefix_len] for i in range(self.k_layers)]
         vp_list = [self.draft_cache.v[i][:, :, :max_prefix_len] for i in range(self.k_layers)]
 
-        # Mask: row b attends to valid prefix [:t] and draft positions [max_prefix_len .. max_prefix_len + W]
         attn_mask = torch.full((B, 1, W, max_prefix_len + W), -1e4, dtype=self.dtype, device=self.device)
         pos_draft = torch.zeros(B, W, dtype=torch.long, device=self.device)
         for b in range(B):
-            t = cur_pos_list[b]
-            if t > 0:
-                attn_mask[b, 0, :, :t] = 0.0
+            cp = cur_pos_list[b]
+            if cp > 0:
+                attn_mask[b, 0, :, :cp] = 0.0
             attn_mask[b, 0, :, max_prefix_len : max_prefix_len + W] = 0.0
-            pos_draft[b] = torch.arange(t, t + W, device=self.device)
+            pos_draft[b] = torch.arange(cp, cp + W, device=self.device)
 
         y_star_emb = self.drafter.embed_tokens(y_star_ids)
         mask_tensor = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
@@ -372,8 +536,8 @@ class StaticDraftEngine:
             )
 
         h_norm = self.drafter.norm(h)
-        logits = self.drafter.lm_head(h_norm)  # (B, W, vocab)
-        draft_ids = torch.argmax(logits, dim=-1)  # (B, W)
+        logits = self.drafter.lm_head(h_norm)
+        draft_ids = torch.argmax(logits, dim=-1)
 
         if return_logits:
             return draft_ids, logits
@@ -411,6 +575,7 @@ def generate_speculative_v3(
     v_tokens: int = 7,  # Q_A = 8
     temperature: float = 0.0,
     eos_token_id: Optional[int] = None,
+    use_cuda_graph: bool = True,
 ) -> Tuple[torch.Tensor, dict]:
     """100% Lossless Speculative Sampling with BFG-Diff v3 Drafter.
     Guarantees exact mathematical match to base_model greedy autoregressive decoding at T=0.
@@ -427,6 +592,7 @@ def generate_speculative_v3(
         v_tokens=v_tokens,
         device=device,
         dtype=dtype,
+        use_cuda_graph=use_cuda_graph,
     )
 
     # 1. Prefill prompt
@@ -436,6 +602,10 @@ def generate_speculative_v3(
     else:
         probs = F.softmax(logits_0[:, -1:] / temperature, dim=-1)
         next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
+
+    # Capture CUDA graphs on CUDA for B=1 after prefill
+    if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
+        engine.capture_cuda_graphs(mask_token_id)
 
     generated_per_row = [[input_ids[b], next_token[b]] for b in range(B)]
     # verified_len tracks current sequence position t (starts at P)
@@ -479,7 +649,6 @@ def generate_speculative_v3(
                 f_ctx_last_list.append(f_ctx_last[b : b + 1])
                 continue
 
-            # Compare draft predictions with target tokens
             k = 0
             for j in range(v_tokens):
                 if draft_ids[b, j] == target_tokens[b, j]:
@@ -495,7 +664,6 @@ def generate_speculative_v3(
             total_draft_tokens += v_tokens
             accepted_draft_tokens += k
 
-            # Newly accepted draft tokens + next target bonus token
             if k > 0:
                 committed_tokens = torch.cat([draft_ids[b, :k], target_tokens[b, k : k + 1]], dim=0)
             else:

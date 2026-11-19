@@ -376,13 +376,13 @@ def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str 
     # Warmup
     for _ in range(3):
         with torch.no_grad():
-            base_model(q1_ids)
+            eng.forward_verify_single_token(q1_ids, cur_pos=P)
     sync_cuda()
 
     t0 = time.perf_counter()
     for _ in range(iters):
         with torch.no_grad():
-            base_model(q1_ids)
+            eng.forward_verify_single_token(q1_ids, cur_pos=P)
     sync_cuda()
     t_q1_ms = ((time.perf_counter() - t0) / iters) * 1000.0
 

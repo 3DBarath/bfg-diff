@@ -10,6 +10,7 @@ Features:
 import argparse
 import itertools
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -117,11 +118,14 @@ def load_hf_prompts(num_prompts: int) -> List[str]:
         ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", lambda x: x["text"][:300].rsplit(".", 1)[0] + "."),
     ]
 
+    per_source = math.ceil(num_prompts / len(sources))
+
     for ds_name, config, split, extractor in sources:
         if len(prompts) >= num_prompts:
             break
+        source_count = 0
         try:
-            print(f"Loading diverse prompts from {ds_name}...")
+            print(f"Loading diverse prompts from {ds_name} (cap={per_source})...")
             kwargs = {"split": split, "streaming": True}
             if config:
                 ds = load_dataset(ds_name, config, **kwargs)
@@ -138,7 +142,8 @@ def load_hf_prompts(num_prompts: int) -> List[str]:
                     if text not in seen:
                         seen.add(text)
                         prompts.append(text)
-                        if len(prompts) >= num_prompts:
+                        source_count += 1
+                        if source_count >= per_source or len(prompts) >= num_prompts:
                             break
                 except Exception:
                     continue
