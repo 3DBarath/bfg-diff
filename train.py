@@ -190,17 +190,26 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0,
 
     loss_per_token = lambda_kl * kl_per_token + (1.0 - lambda_kl) * ce_per_token
 
-    # Offset position weighting: Task 1.1 Flat Frontier Plateau Weighting across offsets 0..4
-    # j_rel <= 4 -> weight = 1.0; j_rel > 4 -> exp(-0.10 * (j_rel - 4))
+    # Offset position weighting: +1-front-loaded loss weighting (the speculative gatekeeper)
+    # offset 0 -> 1.0, offset 1 -> 3.0, offset 2 -> 1.5, offset 3 -> 0.75, offset >= 4 -> 0.5 * exp(-0.15 * (j_rel - 4))
     weights = torch.ones_like(loss_per_token)
     for i, front in enumerate(frontiers):
         if front < C:
             j_rel = torch.arange(C - front, device=device).float()
-            weights[i, front:] = torch.where(
-                j_rel <= 4,
-                torch.ones_like(j_rel),
-                torch.exp(-0.10 * (j_rel - 4.0)),
+            ramp = torch.where(
+                j_rel == 0, torch.full_like(j_rel, 1.0),
+                torch.where(
+                    j_rel == 1, torch.full_like(j_rel, 3.0),
+                    torch.where(
+                        j_rel == 2, torch.full_like(j_rel, 1.5),
+                        torch.where(
+                            j_rel == 3, torch.full_like(j_rel, 0.75),
+                            0.5 * torch.exp(-0.15 * (j_rel - 4.0).clamp_min(0.0)),
+                        ),
+                    ),
+                ),
             )
+            weights[i, front:] = ramp
 
     return (loss_per_token[mask] * weights[mask]).sum() / weights[mask].sum().clamp_min(1.0)
 

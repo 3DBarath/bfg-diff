@@ -1274,6 +1274,10 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
    - **Stage 3 Self-Conditioning Leak & Dynamic `lora_r` Fix:**
      - Fixed `benchmark.py` to read `lora_r = ck.get("lora_config", {}).get("r", 16)` when initializing `setup_bfg_adapter`, preventing shape mismatches on `latent_down` / `latent_up` when testing capacity ablations (e.g. `r=64`).
      - Cleared `prev_latents = None` and `prev_pred_embeds = None` in `sampler.py` when 2-branch micro-tree forks in Stage 3 to avoid injecting stale single-branch state. Sliced Zone B self-conditioning through `zone_a_len + W` to preserve all overlapping lookahead slots.
+   - **Front-Loaded +1 Loss Weighting (`train.py`):**
+     - Replaced flat plateau loss weighting across offsets `0..4` with speculative gatekeeper ramp:
+       `j_rel == 0 -> 1.0`, `j_rel == 1 -> 3.0` (3× front-loaded penalty), `j_rel == 2 -> 1.5`, `j_rel == 3 -> 0.75`, `j_rel >= 4 -> 0.5 * exp(-0.15 * (j_rel - 4))`.
+     - Confirmed smoke convergence: `smoke convergence: 4.8838 -> 4.7517 PASS`.
 
 
 

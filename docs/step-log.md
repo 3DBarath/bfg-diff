@@ -659,6 +659,20 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python train.py --smoke_test`: `PASS`.
    - `python benchmark.py --smoke_test`: `PASS`.
 
+## 39. Front-Loaded +1 Speculative Loss Weighting (2026-11-19)
+
+1. **`train.py` Loss Ramp:**
+   - Replaced flat plateau loss weighting across offsets `0..4` with a +1-front-loaded ramp:
+     - `j_rel == 0`: 1.0
+     - `j_rel == 1`: 3.0 (3× gatekeeper emphasis on the critical speculative token)
+     - `j_rel == 2`: 1.5
+     - `j_rel == 3`: 0.75
+     - `j_rel >= 4`: `0.5 * exp(-0.15 * (j_rel - 4))`
+2. **Verification:**
+   - `python test_delta_leak.py`: `Max difference Delta_leak on clean Zone A positions: 2.527237e-05` (`PASS`).
+   - `python train.py --smoke_test --lr 2e-5`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+   - `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: `PASS` (Reconstruction 31.6%, Causal generate 13.4 TPS).
+
 
 
 
