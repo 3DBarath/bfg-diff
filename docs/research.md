@@ -362,6 +362,54 @@ During dual-checkpoint verification on real weights (`runs/bfg-polished/last.pt`
 - **Training Unroll:** On 25% of training steps, an unroll pass generates $\hat{y}$ predictions under `torch.no_grad()`, passing token embeddings into pass 2.
 - **Inference Recycling:** In `sample_staircase_sliding`, both top-layer hidden states `latents` and predicted token embeddings `prev_pred_embeds` are recycled into Zone B for the subsequent step.
 
+---
+
+## BFG-Diff v3: Weight-Tied Top-4-Layer Block-Diffusion Drafter (<1% PEFT)
+
+BFG-Diff v3 upgrades the speculative architecture to break the "blind skip-1" ceiling and eliminate draft model deployment overhead by weight-tying the speculative drafter directly to the frozen backbone's own top 4 transformer layers ($L-4 \dots L-1$).
+
+```
+Stage 1 (Frozen Backbone):
+Raw Causal Forward -> Tap 4 Evenly Spaced Layers -> Multi-Layer Feature Fusion (F_ctx)
+                                                            |
+Stage 2 (Weight-Tied Drafter):                              v
+Concrete Token y* + [MASK] x (W-1) -> Manifold Bridge -> 4 Tied Layers (L-4..L-1) + LoRA -> Draft Tokens [d_0..d_6]
+                                                            ^
+                                           Draft StaticCache (Prefix KV from F_ctx)
+```
+
+### 1. Minimal `DraftLoRADelta` (Zero `peft` Wrappers)
+- Base `Qwen2DecoderLayer` modules are never wrapped, patched, or mutated.
+- Stage 1 (`forward_verify`) invokes the raw frozen base model untouched with zero LoRA dispatch overhead.
+- Stage 2 (`forward_draft`) explicitly calls the frozen layers `model.model.layers[L-4 : L]` with lightweight `DraftLoRADelta(in_features, out_features, r=32, alpha=64)` applied to `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`.
+- Helper `apply_linear_with_delta(base_linear, x, delta)` evaluates `base_linear(x) + delta(x.to(delta.lora_A.dtype)).to(x.dtype)`. Parameters remain in `fp32` during training and cast to `fp16` during inference, guaranteeing 100% CUDA-Graph safety.
+
+### 2. Multi-Layer Target Feature Fusion (`F_ctx`)
+- Taps 4 evenly spaced target layers from Stage 1:
+  - For $L=28$ (`Qwen2.5-1.5B`): $\{6, 13, 20, 27\}$
+  - For $L=36$ (`Qwen2.5-3B`): $\{8, 17, 26, 35\}$
+  - General formula: `[(L // 4) * i - 1 for i in range(1, 5)]`
+- Fused via bottleneck MLP + RMSNorm:
+  $$\text{Linear}(4D \to 512, \text{bias}=\text{False}) \to \text{SiLU} \to \text{Linear}(512 \to D, \text{bias}=\text{False}) \to \text{Qwen2RMSNorm}(D)$$
+
+### 3. Manifold Alignment Bridge (Fixing Layer-0 vs. Layer-`L-4` Mismatch)
+- Raw token embeddings $\text{Emb}(y^*)$ live in Layer-0 embedding space, whereas Layer $L-4$ expects Layer $L-4$'s residual stream.
+- The draft block of length $W$ (`[y*, MASK_1, ..., MASK_{W-1}]`) is aligned as:
+  - Slot 0 (concrete bonus token $y^*$): `bridge(cat([RMSNorm(Emb(y*)), F_ctx_last])) + F_ctx_last`
+  - Slots $1 \dots W-1$ (`[MASK]`): `RMSNorm(Emb(MASK)) + SlotEmb[1..W-1] + F_ctx_last` projected through the bottleneck bridge.
+  - Bridge up-projection is initialized near zero (`std=1e-3`), ensuring Step 0 starts cleanly in the Layer-($L-4$) manifold while allowing gradient backpropagation to all bridge and slot embedding parameters.
+
+### 4. Exact Right-Shift Alignment ($k \to k+1$)
+- Under Qwen2's native shift, feeding $W$ tokens $[y^*, \text{MASK}_1, \dots, \text{MASK}_{W-1}]$ at RoPE positions $[cur\_pos - 1, cur\_pos, \dots, cur\_pos + W - 2]$ produces $W$ output logits predicting $[x_{cur\_pos}, x_{cur\_pos+1}, \dots, x_{cur\_pos+W-1}]$.
+- Slot 0 predicts $A_{+1}$ directly from concrete bonus token $y^*$, eliminating the blind skip-1 penalty.
+
+### 5. Zero-`crop()`, Pointer-Indexed `StaticCache` & Active Shapes
+- Static active shapes (multiples of 8 for Tensor Cores):
+  - Stage 1 verify: fixed $Q_A = 8$ ($[y^*, d_0, \dots, d_6]$). Writes target KV in-place at $cur\_pos - 1 + \text{arange}(Q_A)$.
+  - Stage 2 draft: fixed $W = 7$ draft tokens.
+- No `kv.crop()`: When $k$ tokens are accepted, $cur\_pos$ simply advances by $k$. Subsequent verification steps automatically overwrite rejected tail slots in-place.
+- Supports ragged $B=4$ batches with per-row position indexing.
+
 
 
 

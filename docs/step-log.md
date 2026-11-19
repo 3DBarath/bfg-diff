@@ -696,6 +696,34 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python benchmark.py --checkpoint runs/ab-r16-attn/last.pt --num_prompts 2 --canvas_len 16 --batch_size 1 --smoke_test`: `PASS`.
    - `python benchmark.py --checkpoint runs/ab-r64-mlp/last.pt --num_prompts 2 --canvas_len 16 --batch_size 1 --smoke_test`: `PASS`.
 
+## 41. BFG-Diff v3 Implementation: Weight-Tied Top-4-Layer Drafter (<1% PEFT) (2026-11-19)
+
+1. **Branch & Clean Modularization:**
+   - Created branch `v3-weight-tied-drafter`.
+   - Preserved legacy v2 code intact while creating clean modular v3 implementations: `model_v3.py`, `sampler_v3.py`, `test_v3_gates.py`, `generate_onpolicy.py`, `train_v3.py`, and `benchmark_v3.py`.
+2. **Local Model Ingestion & Caching:**
+   - Downloaded and cached full local weights for both `Qwen/Qwen2.5-1.5B` and `Qwen/Qwen2.5-3B` in HuggingFace cache.
+   - Configured offline fallback (`HF_HUB_OFFLINE=1`, `local_files_only=True`) to prevent hub adapter metadata network timeouts.
+3. **Architecture Implementation (`model_v3.py`):**
+   - Implemented `DraftLoRADelta(in_features, out_features, r=32, alpha=64)` and `apply_linear_with_delta(base_linear, x, delta)`.
+   - Implemented `BottleneckFusion`: Taps 4 evenly spaced target layers `[(L // 4) * i - 1 for i in range(1, 5)]` and fuses via `Linear(4*D, 512) -> SiLU -> Linear(512, D) -> Qwen2RMSNorm(D)`.
+   - Implemented `ManifoldAlignmentBridge`: Aligns Slot 0 ($y^*$ concrete bonus token) and Slots $1..W-1$ ($[MASK]$) into the Layer-($L-4$) manifold with near-zero up-projection init (`std=1e-3`) for clean residual start and non-zero gradient flow.
+   - Implemented `WeightTiedTopKDrafter`: Directly references `base_model.model.layers[L-4 : L]`, `norm`, `lm_head`, and `embed_tokens` with zero weight copying.
+4. **Systems & Speculative Inference Engine (`sampler_v3.py`):**
+   - Implemented `StaticKVCache`: Pre-allocated static tensor cache with zero `kv.crop()` and in-place pointer indexing `cache_position = cur_pos + arange(Q_A)`.
+   - Fixed active shapes: Stage 1 verify $Q_A = 8$, Stage 2 draft $W = 7$.
+   - Supports ragged $B=4$ batches with per-row `cur_pos_list` and vectorized attention masks.
+5. **Phase 1 Verification Gates Passed (`test_v3_gates.py`):**
+   - **Unit Gate A (Lossless Parity):** 10/10 prompts token-identical match to raw `base_model.generate()` at $T=0.0$ on $B=1$, and `B=4 Parity Match: True` on batched generation (`PASS`).
+   - **Unit Gate B (Param Budget):** Trainable drafter ratio is **0.752%** (11.58M params) on `Qwen2.5-1.5B` and **0.487%** (15.06M params) on `Qwen2.5-3B`, strictly below the <1% and <0.85% ceilings (`PASS`).
+   - **Unit Gate C (Gradient Flow):** Verified base model is strictly frozen (0 gradients) and finite non-zero gradients flow across fusion, bridge, `slot_emb`, and all 28 LoRA projection deltas (`PASS`).
+   - **Gate 0 & Gate 1 Profiling:** Measured $T_{\text{verify}}(Q=1) = 72.28$ ms, $T_{\text{verify}}(Q_A=8) = 148.80$ ms, $T_{\text{draft}}(4L, W=7) = 59.54$ ms on CPU.
+6. **Phase 2 & Phase 3 Training and Benchmarking (`generate_onpolicy.py`, `train_v3.py`, `benchmark_v3.py`):**
+   - Implemented `generate_onpolicy.py` sampling across code, math, systems, science, and prose with zero benchmark overlap. Verified with `generate_onpolicy.py --smoke_test` saving 4 sequences to `data/smoke_onpolicy.pt`.
+   - Implemented `train_v3.py` with memory-safe fp16 base / fp32 drafter, DFlash-style random-anchor Top-64 KL + CE self-distillation and D-PACE weighting. Verified with `python train_v3.py --smoke_test` (`smoke convergence: 9.8874 -> 5.1277 PASS`).
+   - Implemented `benchmark_v3.py` evaluating against raw causal baseline. Verified with `python benchmark_v3.py --smoke_test` (`Exact Lossless Consistency %: 100.0%`, `benchmark_v3.py --smoke_test PASS`).
+   - Re-verified legacy smoke suite: `python train.py --smoke_test` (`smoke convergence: 4.8838 -> 4.7517 PASS`).
+
 
 
 

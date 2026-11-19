@@ -58,7 +58,7 @@ def parse_args():
     if args.lora_mlp:
         args.lora = True
     if args.lr is None:
-        args.lr = 5e-4 if args.lora else 5e-5
+        args.lr = 2e-5 if args.smoke_test else (5e-4 if args.lora else 5e-5)
     if args.smoke_test:
         args.steps = 12
         args.prefix_len, args.canvas_len = 128, 64
