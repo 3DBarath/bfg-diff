@@ -1247,6 +1247,24 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
      - The bottleneck is NOT caching overhead. BFG-Diff v2 already caches the prefix across all 24 layers via `prefill_prefix` and in-place `kv.crop()`. Furthermore, T4 GPU roofline measurements confirm per-step latency is flat across active tokens (`37.49 ms` at $N=1$ vs. `37.16 ms` at $N=16$).
      - The sole bottleneck was that `BFGDiffAdapter` was frozen. Unfreezing the adapter parameters allows multi-offset lookahead gradients to propagate properly, driving $A_{+1..3}$ up to target thresholds ($>80\%, >50\%$) for $\alpha \ge 2.20$ and $>2.2\times$ wall-clock speedup.
 
+### 4. 2026-11-19: Unfrozen Checkpoints Ingestion & Peer Review Remediation
+
+1. **Ingested 800-Step Unfrozen Dual Checkpoints (`runs/bfg-v2.2-*-unfrozen`):**
+   - **Base Checkpoint (`runs/bfg-v2.2-base-unfrozen/last.pt`):**
+     - Step 800 final loss: `2.4206` (lr 0.0)
+     - Stratified Validation at step 800:
+       `val_loss 6.1833 acc_offset1 27.1% acc_offset2 27.1% acc_offset3 20.8% acc_offset4 22.9% (acc_offset2_4 23.6%)`
+   - **Instruct Checkpoint (`runs/bfg-v2.2-instruct-unfrozen/last.pt`):**
+     - Step 800 final loss: `3.4990` (lr 0.0)
+     - Stratified Validation at step 800:
+       `val_loss 6.5496 acc_offset1 31.2% acc_offset2 14.6% acc_offset3 4.2% acc_offset4 14.6% (acc_offset2_4 11.1%)`
+
+2. **Peer Review Audit & Verification:**
+   - **Causal Baseline Contamination Eliminated:** Base causal TPS is now evaluated on the unadapted base model before applying LoRA (`benchmark.py`), preventing PEFT wrapper slowdown from artificially deflating the baseline. LoRA weights are merged via `merge_and_unload()` before evaluating BFG-Diff.
+   - **Exact Staircase Hybrid Attention:** `build_hybrid_attention_mask` enforces that clean tokens in Zone A / canvas attend strictly causally and cannot attend forward into `[MASK]` tokens, matching inference `build_staircase_step_mask` with `Delta_leak = 2.18e-05` (PASS in `test_delta_leak.py`).
+   - **`slot_emb` Indexing Corrected:** Uses relative offset from the frontier `(masked_idx - frontier).clamp(0, self.max_w - 1)` rather than arbitrary `torch.arange(len(masked_idx))`.
+   - **Inner-Loop Latency Reduced:** Full-vocab 152k bincounts and redundant fp32 conversions eliminated from `sampler.py`.
+
 
 
 

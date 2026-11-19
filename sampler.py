@@ -143,7 +143,7 @@ def sample_staircase_sliding(
             logits = out_step
             latents = None
 
-        z = logits.float()
+        z = logits
 
         # Repetition penalty over recent context
         if suppress_adjacent and (cur_prefix_len > 0 or len(committed_tokens) > 0):
@@ -155,17 +155,16 @@ def sample_staircase_sliding(
             if hist:
                 recent = torch.cat(hist)
                 valid_recent = recent[recent != mask_id]
-                counts = torch.bincount(valid_recent, minlength=z.shape[-1])
-                repeated = counts > 0
-                if repeated.any():
-                    pen = counts[repeated].float() * 0.35
+                if len(valid_recent) > 0:
+                    uniq_toks, counts = torch.unique(valid_recent, return_counts=True)
+                    pen = counts.to(dtype=z.dtype) * 0.35
                     for qa in range(zone_a_len):
-                        z[:, qa, repeated] -= pen
+                        z[:, qa, uniq_toks] -= pen
 
         # Anti-stutter for slot 0 against cur_last_id
         if suppress_adjacent:
             prev_tok = int(cur_last_id[0, 0])
-            z[:, 0, prev_tok] = -float("inf")
+            z[:, 0, prev_tok] = -1e4
 
         # 5. Verify Zone A
         accepted_drafts = []
@@ -371,13 +370,19 @@ def sample_staircase_sliding(
                             break
                     if candidate_drafts:
                         draft_ids = torch.tensor([candidate_drafts], dtype=torch.long, device=device).expand(B, -1)
-                        if latents is not None:
-                            prev_latents = latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]
+                        num_cand = len(candidate_drafts)
+                        if latents is not None and latents.shape[1] >= (zone_a_len + num_cand):
+                            # Zone B next step begins at offset num_cand from current Zone B start
+                            prev_latents = latents[:, zone_a_len + num_cand : zone_a_len + 2 * num_cand]
                         else:
                             prev_latents = None
-                        # Sigma SC: extract predicted embeddings for Zone B candidate drafts
-                        emb_fn = model.get_input_embeddings()
-                        prev_pred_embeds = emb_fn(draft_ids).detach()
+                        # Sigma SC: extract predicted embeddings for Zone B next-step slots
+                        if zone_b_z.shape[0] > num_cand:
+                            zone_b_next_ids = zone_b_z[num_cand : 2 * num_cand].argmax(dim=-1).unsqueeze(0).expand(B, -1)
+                            emb_fn = model.get_input_embeddings()
+                            prev_pred_embeds = emb_fn(zone_b_next_ids).detach()
+                        else:
+                            prev_pred_embeds = None
                     else:
                         prev_latents = None
                         prev_pred_embeds = None
@@ -394,12 +399,16 @@ def sample_staircase_sliding(
                 # Always draft at least 1 token if margin >= 0.25 (or if margin >= 0.0 to prevent ping-pong reset)
                 if margin_0 >= 0.20 or W > 0:
                     draft_ids = torch.tensor([[fb_tok]], dtype=torch.long, device=device).expand(B, -1)
-                    if latents is not None and latents.shape[1] > zone_a_len:
-                        prev_latents = latents[:, zone_a_len : zone_a_len + 1]
+                    if latents is not None and latents.shape[1] > (zone_a_len + 1):
+                        prev_latents = latents[:, zone_a_len + 1 : zone_a_len + 2]
                     else:
                         prev_latents = None
-                    emb_fn = model.get_input_embeddings()
-                    prev_pred_embeds = emb_fn(draft_ids).detach()
+                    if zone_b_z.shape[0] > 1:
+                        next_slot_id = zone_b_z[1:2].argmax(dim=-1).unsqueeze(0).expand(B, -1)
+                        emb_fn = model.get_input_embeddings()
+                        prev_pred_embeds = emb_fn(next_slot_id).detach()
+                    else:
+                        prev_pred_embeds = None
                 else:
                     prev_latents = None
                     prev_pred_embeds = None

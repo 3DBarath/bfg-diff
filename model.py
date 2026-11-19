@@ -79,20 +79,69 @@ LORA_TARGETS_MLP = LORA_TARGETS + ("gate_proj", "up_proj", "down_proj")
 
 
 def build_hybrid_attention_mask(
-    prefix_len, canvas_len, batch_size=1, dtype=torch.bfloat16, device="cuda", prefix_keep=None
+    prefix_len, canvas_len, batch_size=1, dtype=torch.bfloat16, device="cuda", prefix_keep=None, canvas_mask=None
 ):
-    """Additive mask (B, 1, P+C, P+C): prefix queries 0..P-2 see only past prefix;
-    prefix query P-1 and canvas queries P..P+C-1 see all past prefix and all canvas.
-    `prefix_keep` (B, P) bool hides left-padding keys."""
+    """Additive mask (B, 1, P+C, P+C) strictly matching staircase attention rules:
+    - Prefix tokens 0..P-1 (including P-1): strictly causal, ZERO attention to [MASK] canvas tokens.
+    - Clean canvas tokens (~canvas_mask): strictly causal (attend only to past prefix and past clean canvas tokens),
+      ZERO attention to [MASK] canvas tokens.
+    - Masked canvas tokens (canvas_mask): attend to all prefix, all clean canvas tokens, and all [MASK] canvas tokens.
+    `prefix_keep` (B, P) bool hides left-padding keys.
+    `canvas_mask` (B, C) bool indicates which canvas positions are [MASK].
+    """
     T = prefix_len + canvas_len
     allow = torch.zeros(batch_size, T, T, dtype=torch.bool, device=device)
-    causal = torch.tril(torch.ones(prefix_len, prefix_len, dtype=torch.bool, device=device))
-    allow[:, :prefix_len, :prefix_len] = causal
-    allow[:, prefix_len - 1 :, :] = True
+
+    # 1. Prefix queries 0..P-1: strictly causal within prefix
+    causal_p = torch.tril(torch.ones(prefix_len, prefix_len, dtype=torch.bool, device=device))
+    allow[:, :prefix_len, :prefix_len] = causal_p
+    # prefix queries have allow[:, :prefix_len, prefix_len:] = False (ZERO attention to canvas)
+
+    # 2. Canvas queries
+    if canvas_mask is None:
+        # Fallback / legacy mode: prefix sees prefix, canvas sees all past prefix and all canvas
+        allow[:, prefix_len - 1 :, :] = True
+        allow[:, :prefix_len, :prefix_len] = causal_p
+    else:
+        # Exact staircase training mask:
+        # canvas_mask is (B, C) bool: True = [MASK], False = clean token
+        for b in range(batch_size):
+            c_mask_b = canvas_mask[b].to(device=device, dtype=torch.bool)
+            # Full sequence mask status: prefix is all clean (False)
+            # seq_is_mask of length T
+            seq_is_mask = torch.cat([torch.zeros(prefix_len, dtype=torch.bool, device=device), c_mask_b])
+
+            for q_idx in range(T):
+                if q_idx < prefix_len:
+                    # Prefix query: already causal over prefix, sees no canvas
+                    pass
+                else:
+                    c_idx = q_idx - prefix_len
+                    is_mask_q = c_mask_b[c_idx].item()
+                    if not is_mask_q:
+                        # Clean canvas token:
+                        # Attends causally to all prefix keys (0..P-1) and strictly causal to past clean canvas keys
+                        # CANNOT attend to any [MASK] keys
+                        allow[b, q_idx, :prefix_len] = True
+                        if c_idx > 0:
+                            # strictly causal: only past keys up to q_idx - 1 (or causal diagonal up to q_idx)
+                            # for self-attention, query q_idx attends to key q_idx as well
+                            # only unmasked keys up to q_idx
+                            allow[b, q_idx, prefix_len : q_idx + 1] = ~c_mask_b[: c_idx + 1]
+                            # but causal tril means it can only see past tokens <= q_idx:
+                            # query c_idx can see keys 0..c_idx if not masked
+                        else:
+                            allow[b, q_idx, prefix_len] = True
+                    else:
+                        # Masked canvas token:
+                        # Attends to all prefix keys, all clean canvas keys, and all [MASK] canvas keys
+                        allow[b, q_idx, :prefix_len] = True
+                        allow[b, q_idx, prefix_len:] = True
+
     if prefix_keep is not None:
         keep = prefix_keep.to(device=device, dtype=torch.bool).view(batch_size, 1, prefix_len)
-        allow[:, :prefix_len, :prefix_len] &= keep
-        allow[:, prefix_len - 1 :, :prefix_len] &= keep
+        allow[:, :, :prefix_len] &= keep
+
     return torch.zeros(batch_size, 1, T, T, dtype=dtype, device=device).masked_fill_(
         ~allow.unsqueeze(1), torch.finfo(dtype).min
     )
@@ -191,7 +240,7 @@ class BFGDiffAdapter(torch.nn.Module):
         return self.pred_emb_scale * normed
 
     def apply_to_embeds(
-        self, embeds, zone_a_len=0, zone_b_len=0, prev_latents=None, prev_pred_embeds=None, mask=None, prefix_len=None
+        self, embeds, zone_a_len=0, zone_b_len=0, prev_latents=None, prev_pred_embeds=None, mask=None, prefix_len=None, frontiers=None
     ):
         out_embeds = embeds.clone()
         B = embeds.shape[0]
@@ -203,7 +252,11 @@ class BFGDiffAdapter(torch.nn.Module):
             for b in range(B):
                 masked_idx = torch.where(mask[b])[0]
                 if len(masked_idx) > 0:
-                    j_idx = torch.arange(len(masked_idx), device=device).clamp_max(self.max_w - 1)
+                    if frontiers is not None and b < len(frontiers):
+                        frontier = frontiers[b]
+                        j_idx = (masked_idx - frontier).clamp(0, self.max_w - 1)
+                    else:
+                        j_idx = torch.arange(len(masked_idx), device=device).clamp_max(self.max_w - 1)
                     seq_pos = prefix_len + masked_idx
                     out_embeds[b, seq_pos] = out_embeds[b, seq_pos] + self.slot_emb(j_idx)
                     if prev_latents is not None:
@@ -435,7 +488,7 @@ def canvas_step_with_cache(
 
 
 def canvas_forward(
-    model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, prev_pred_embeds=None, return_hidden=False, mask=None
+    model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, prev_pred_embeds=None, return_hidden=False, mask=None, frontiers=None
 ):
     """Logits for the canvas block only: (B, C, vocab), aligned with Qwen's k -> k+1 prediction."""
     B, P = prefix_ids.shape
@@ -443,7 +496,10 @@ def canvas_forward(
     device = prefix_ids.device
     input_ids = torch.cat([prefix_ids, canvas_ids], dim=1)
     dtype = model.get_input_embeddings().weight.dtype
-    attn = build_hybrid_attention_mask(P, C, B, dtype, device, prefix_keep)
+
+    effective_mask_id = getattr(model, "mask_id", 151665)
+    canvas_mask = (canvas_ids == effective_mask_id) if mask is None else mask
+    attn = build_hybrid_attention_mask(P, C, B, dtype, device, prefix_keep, canvas_mask=canvas_mask)
     pos = (
         torch.arange(P + C, device=device).unsqueeze(0).expand(B, P + C)
         if prefix_keep is None
@@ -455,11 +511,8 @@ def canvas_forward(
 
     if getattr(model, "bfg_adapter", None) is not None:
         base_embeds = model.get_input_embeddings()(input_ids)
-        # BFGDiffAdapter must only apply slot_emb, prev_latents, and prev_pred_embeds to actual [MASK] tokens (canvas_ids == mask_id)
-        effective_mask_id = getattr(model, "mask_id", 151665)
-        mask_to_use = (canvas_ids == effective_mask_id)
         inputs_embeds = model.bfg_adapter.apply_to_embeds(
-            base_embeds, mask=mask_to_use, prefix_len=P, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds
+            base_embeds, mask=canvas_mask, prefix_len=P, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds, frontiers=frontiers
         )
         kwargs["inputs_embeds"] = inputs_embeds
     else:

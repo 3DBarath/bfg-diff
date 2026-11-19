@@ -144,7 +144,7 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0,
     if force_sc or u_sc < 0.25:
         # Pass 1: generate logits_1 and latents_1 under no_grad
         with torch.no_grad():
-            logits_1, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
+            logits_1, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask, frontiers=frontiers)
             latents_1 = latents_1.detach()
             prev_pred_ids = logits_1.argmax(dim=-1)
             # Lookup predicted token embeddings from model's input embeddings
@@ -158,18 +158,19 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0,
             prev_pred_embeds=prev_pred_embeds,
             return_hidden=False,
             mask=mask,
+            frontiers=frontiers,
         )
     elif u_sc < 0.50:
         # Standard latent recycling unroll without self-conditioning
         with torch.no_grad():
-            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
+            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask, frontiers=frontiers)
             latents_1 = latents_1.detach()
         student_logits = canvas_forward(
-            model, prefix, noisy, prev_latents=latents_1, return_hidden=False, mask=mask
+            model, prefix, noisy, prev_latents=latents_1, return_hidden=False, mask=mask, frontiers=frontiers
         )
     else:
         student_logits = canvas_forward(
-            model, prefix, noisy, prev_latents=None, return_hidden=False, mask=mask
+            model, prefix, noisy, prev_latents=None, return_hidden=False, mask=mask, frontiers=frontiers
         )
 
     Z_student = student_logits.float()
@@ -413,7 +414,7 @@ def main():
         def probe_loss():
             with torch.no_grad():
                 logits = canvas_forward(
-                    model, probe_prefix, probe_target.masked_fill(probe_mask, mask_id)
+                    model, probe_prefix, probe_target.masked_fill(probe_mask, mask_id), mask=probe_mask
                 )
                 return F.cross_entropy(logits[probe_mask], probe_target[probe_mask]).item()
 

@@ -382,15 +382,35 @@ def run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=
 def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
     eff_bs = getattr(args, "batch_size", 1)
     print(f"\nRunning Comparative Ablation Study: BFG-Diff v1 vs v2 (batch_size={eff_bs})...")
-    probe_results = run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
-    a1_pct = probe_results.get(1, (0.0, 0.0))[1]
-    a2_pct = probe_results.get(2, (0.0, 0.0))[1]
+
+    orig_adapter = getattr(model, "bfg_adapter", None)
+
+    # 1. Run probe for Stage 1 (adapter OFF)
+    model.bfg_adapter = None
+    probe_results_s1 = run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
+    a1_s1 = probe_results_s1.get(1, (0.0, 0.0))[1]
+    a2_s1 = probe_results_s1.get(2, (0.0, 0.0))[1]
+
+    # 2. Run probe for Stage 2 (adapter ON)
+    model.bfg_adapter = orig_adapter
+    if orig_adapter is not None:
+        probe_results_s2 = run_offset_accuracy_probe(model, tok, prompt_ids, mask_id, device, W=4, tau=0.8)
+        a1_s2 = probe_results_s2.get(1, (0.0, 0.0))[1]
+        a2_s2 = probe_results_s2.get(2, (0.0, 0.0))[1]
+    else:
+        a1_s2, a2_s2 = a1_s1, a2_s1
 
     # Ensure Causal and Sampler use the EXACT same effective batch size for fair apples-to-apples evaluation
-    c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
-    h4_c = ngram_entropy(c_ids)
-    rep4_c = repeat_rate(c_ids)
-    adj_c = adj_dup(c_ids)
+    causal_tps = getattr(args, "baseline_causal_tps", None)
+    if causal_tps is None:
+        c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
+        h4_c = ngram_entropy(c_ids)
+        rep4_c = repeat_rate(c_ids)
+        adj_c = adj_dup(c_ids)
+    else:
+        h4_c = getattr(args, "baseline_h4", 0.9)
+        rep4_c = getattr(args, "baseline_rep4", 0.0)
+        adj_c = getattr(args, "baseline_adj", 0.0)
 
     rows = []
     rows.append({
@@ -416,14 +436,13 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         "speedup": tps_v1 / max(1e-5, causal_tps),
         "alpha": stats_v1.get("alpha", 1.00),
         "r_kv": stats_v1.get("r_kv", 4.00),
-        "a1": f"{a1_pct:.1f}%",
-        "a2": f"{a2_pct:.1f}%",
+        "a1": f"{a1_s1:.1f}%",
+        "a2": f"{a2_s1:.1f}%",
         "h4": ngram_entropy(ids_v1),
         "rep4": repeat_rate(ids_v1),
         "adj": adj_dup(ids_v1),
     })
 
-    orig_adapter = getattr(model, "bfg_adapter", None)
     model.bfg_adapter = None
     ids_s1, texts_s1, tps_s1, stats_s1 = run_sampler_generation(
         model, tok, prompt_ids, args, mask_id, device, steps=args.steps[0],
@@ -435,8 +454,8 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         "speedup": tps_s1 / max(1e-5, causal_tps),
         "alpha": stats_s1.get("alpha", 1.0),
         "r_kv": stats_s1.get("r_kv", 1.2),
-        "a1": f"{a1_pct:.1f}%",
-        "a2": f"{a2_pct:.1f}%",
+        "a1": f"{a1_s1:.1f}%",
+        "a2": f"{a2_s1:.1f}%",
         "h4": ngram_entropy(ids_s1),
         "rep4": repeat_rate(ids_s1),
         "adj": adj_dup(ids_s1),
@@ -453,8 +472,8 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         "speedup": tps_s2 / max(1e-5, causal_tps),
         "alpha": stats_s2.get("alpha", 1.0),
         "r_kv": stats_s2.get("r_kv", 1.1),
-        "a1": f"{a1_pct:.1f}%",
-        "a2": f"{a2_pct:.1f}%",
+        "a1": f"{a1_s2:.1f}%",
+        "a2": f"{a2_s2:.1f}%",
         "h4": ngram_entropy(ids_s2),
         "rep4": repeat_rate(ids_s2),
         "adj": adj_dup(ids_s2),
@@ -473,8 +492,8 @@ def run_ablation_table(model, tok, prompt_ids, mask_id, device, args):
         "speedup": tps_s3 / max(1e-5, causal_tps),
         "alpha": stats_s3.get("alpha", 1.0),
         "r_kv": stats_s3.get("r_kv", 1.1),
-        "a1": f"{a1_pct:.1f}%",
-        "a2": f"{a2_pct:.1f}%",
+        "a1": f"{a1_s2:.1f}%",
+        "a2": f"{a2_s2:.1f}%",
         "h4": ngram_entropy(ids_s3),
         "rep4": repeat_rate(ids_s3),
         "adj": adj_dup(ids_s3),
@@ -557,6 +576,25 @@ def main():
     model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
+    # Determine if running with an Instruct model to use ChatML prompts if applicable
+    is_instruct = "instruct" in args.model.lower() or (args.checkpoint and "instruct" in args.checkpoint.lower())
+    if is_instruct:
+        chatml_prompts = [
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            for p in GEN_PROMPTS
+        ]
+        prompts = [chatml_prompts[i % len(chatml_prompts)] for i in range(args.num_prompts)]
+    else:
+        prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
+    prompt_ids = [tokenize(tok, p) for p in prompts]
+
+    # Constraint 1: Measure Causal Baseline on RAW unadapted base model BEFORE applying LoRA
+    c_ids_base, c_texts_base, causal_tps_base = run_causal_generation(model, tok, prompt_ids, args, device)
+    args.baseline_causal_tps = causal_tps_base
+    args.baseline_h4 = ngram_entropy(c_ids_base)
+    args.baseline_rep4 = repeat_rate(c_ids_base)
+    args.baseline_adj = adj_dup(c_ids_base)
+
     if Path(args.checkpoint).exists():
         ck = torch.load(args.checkpoint, map_location="cpu")
         if ck.get("lora") is not None:
@@ -568,6 +606,8 @@ def main():
                 cfg.get("targets", LORA_TARGETS),
             )
             set_peft_model_state_dict(model, ck["lora"])
+            # Merge LoRA back into base model
+            model = model.merge_and_unload()
             if "mask_emb" in ck:
                 with torch.no_grad():
                     model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
@@ -583,9 +623,6 @@ def main():
     else:
         print(f"warning: checkpoint {args.checkpoint!r} not found; benchmarking base model")
     model.eval()
-
-    prompts = [GEN_PROMPTS[i % len(GEN_PROMPTS)] for i in range(args.num_prompts)]
-    prompt_ids = [tokenize(tok, p) for p in prompts]
 
     if args.prefix_sweep:
         run_prefix_sweep(model, tok, args, mask_id, device)
@@ -617,12 +654,12 @@ def main():
         f"{'Dist1':>7}{'Dist2':>7}{'alpha':>7}{'R_kv':>7}{'speedup':>9}{'TPS':>10}"
     )
     outputs = {}
-    c_ids, c_texts, causal_tps = run_causal_generation(model, tok, prompt_ids, args, device)
-    outputs["causal generate"] = c_texts
+    causal_tps = args.baseline_causal_tps
+    outputs["causal generate"] = c_texts_base
     print(
-        f"{'causal generate':<34}{ngram_entropy(c_ids):>7.3f}{repeat_rate(c_ids):>7.1%}"
-        f"{repeat_rate(c_ids, 2):>7.1%}{adj_dup(c_ids):>7.1%}"
-        f"{distinct(c_ids, 1):>7.3f}{distinct(c_ids, 2):>7.3f}"
+        f"{'causal generate (unadapted)':<34}{args.baseline_h4:>7.3f}{args.baseline_rep4:>7.1%}"
+        f"{repeat_rate(c_ids_base, 2):>7.1%}{args.baseline_adj:>7.1%}"
+        f"{distinct(c_ids_base, 1):>7.3f}{distinct(c_ids_base, 2):>7.3f}"
         f"{1.00:>7.2f}{0.00:>7.2f}{'1.00x':>9}{causal_tps:>10,.1f}"
     )
 

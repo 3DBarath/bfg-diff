@@ -600,6 +600,32 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `python train.py --smoke_test`: `smoke convergence: 11.3403 -> 4.4013 PASS`, `acc_offset1 62.5% acc_offset2 50.0% acc_offset3 87.5% acc_offset4 75.0% (acc_offset2_4 70.8%)`.
    - Ran `python benchmark.py --smoke_test`: Verified clean execution without errors.
 
+## 36. Rigorous Benchmark Alignment, Exact Staircase Attention, and Self-Conditioning Fixes (2026-11-19)
+
+1. **Unfrozen Checkpoints Ingested:**
+   - Ingested 800-step unfrozen checkpoints from `bfg-v2.2-unfrozen-checkpoints.zip`:
+     - `runs/bfg-v2.2-base-unfrozen/last.pt` (val loss 6.1833, acc_offset1 27.1%, acc_offset2 27.1%)
+     - `runs/bfg-v2.2-instruct-unfrozen/last.pt` (val loss 6.5496, acc_offset1 31.2%, acc_offset2 14.6%)
+2. **Four Strict Constraints Implemented:**
+   - **LoRA Merging & Baseline Order (`benchmark.py`):**
+     - Base causal baseline measured on raw unadapted `Qwen2.5-0.5B` before LoRA application.
+     - When loading checkpoints, LoRA weights are applied and merged via `model.merge_and_unload()`, with `setup_bfg_adapter` attached after merge.
+     - Offset accuracy probes run independently for Stage 1 (adapter off) and Stage 2 (adapter on).
+     - Added ChatML prompt formatting when benchmarking `-Instruct` models.
+   - **Exact Staircase Training Mask (`model.py` / `train.py`):**
+     - `build_hybrid_attention_mask` updated with `canvas_mask`: clean prefix and clean canvas tokens are strictly causal and have zero attention to `[MASK]` tokens; `[MASK]` positions attend to all prefix and clean canvas tokens.
+     - Passed `frontiers` from `make_mask` into `canvas_forward`.
+   - **`slot_emb` Indexing (`model.py` / `train.py`):**
+     - Updated `slot_emb` indexing to use relative distance to frontier: `(masked_idx - frontier).clamp(0, self.max_w - 1)`.
+   - **Overhead Stripping & Latent Recycling Shift Fix (`sampler.py`):**
+     - Removed full-vocab 152k `bincount` and `float32` casts from inner loop, replacing with active unique token penalty.
+     - Shifted `prev_latents` and `prev_pred_embeds` in `sampler.py` so Zone B lookahead targets future Zone B positions rather than overlapping with Zone A.
+3. **Verification:**
+   - Ran `test_delta_leak.py`: Verified `Delta_leak = 2.18e-05` (~0.0 within fp32 precision) between `canvas_forward` and `canvas_step_with_cache`.
+   - Ran `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.2314 PASS`.
+   - Ran `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: PASS.
+   - Ran `python benchmark.py --ablation`: Verified execution on CPU with clean unadapted baseline and Stage 1/2 distinction.
+
 
 
 
