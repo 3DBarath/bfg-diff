@@ -346,5 +346,22 @@ During dual-checkpoint verification on real weights (`runs/bfg-polished/last.pt`
 - **Problem:** Default fallback to 21-word synthetic word salad caused catastrophic forgetting during extended training.
 - **Fix:** Added `build_real_corpus.py` harvesting >1,000 real technical and markdown documents (>12M characters, zero benchmark leakage) and ChatML dialogues for production training of `runs/bfg-v2-base/last.pt` and `runs/bfg-v2-instruct/last.pt`.
 
+---
+
+## BFG-Diff v2.2 Architecture: Unstarving Gradients & Sigma Self-Conditioning
+
+### 1. Flat Frontier Plateau Weighting in Diffusion Loss
+- **Problem:** Previously, `diffusion_loss` decayed target position weights exponentially immediately starting at the mask frontier: $w_j = \exp(-0.15 \cdot j_{\text{rel}})$. This starved multi-offset lookahead positions $+2, +3, +4$ of supervisory gradients, locking $A_{+2..4}$ at $12.5\% \text{--} 16.7\%$.
+- **Fix:** Implemented a flat plateau across lookahead positions $0 \dots 4$ ($w_j = 1.0$), with gentle decay only past offset $4$: $w_j = \exp(-0.10 \cdot (j_{\text{rel}} - 4))$.
+
+### 2. Sigma Predicted-Embedding Self-Conditioning & Analytical SVD Init
+- **Concept:** Following Sigma (*arXiv:2610.02665*) and iWSP (*arXiv:2611.18114*), Zone B mask slots receive concrete lexical guidance to resolve multi-token semantic ambiguity without breaking Zone A causal isolation.
+- **Formulation:**
+  $$E_{\text{Zone B}}[j] = \text{Emb}(\text{mask\_id}) + \text{SlotEmb}[j] + W_{\text{up}}\big(\text{SiLU}(W_{\text{down}}(\text{Norm}(h^{(L)}_{\text{prev}}[j])))\big) + \alpha_{\text{sc}} \cdot \text{Norm}\big(\text{Emb}(\hat{y}^{(s-1)}_j)\big)$$
+- **Zero-Init Parity:** $\alpha_{\text{sc}}$ (`pred_emb_scale`) is initialized to $0.0$, guaranteeing $100\%$ numerical identity with step-0 and legacy checkpoints ($\Delta < 10^{-6}$).
+- **Training Unroll:** On 25% of training steps, an unroll pass generates $\hat{y}$ predictions under `torch.no_grad()`, passing token embeddings into pass 2.
+- **Inference Recycling:** In `sample_staircase_sliding`, both top-layer hidden states `latents` and predicted token embeddings `prev_pred_embeds` are recycled into Zone B for the subsequent step.
+
+
 
 

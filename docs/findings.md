@@ -1160,6 +1160,22 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
   > "Binary search is a method of searching for a specific element in a sorted array. It works by repeatedly dividing the search space in half until the target element is found"
 - **Result:** Zero `<|extra_0|>` mask tokens leaked, 0.0% adjacent stutter, clean and fluent termination. **PASS**.
 
+---
+
+## 2026-11-19: BFG-Diff v2.2 Architectural Integration & SIM Memory Log
+
+### SIM Structured Memory Ledger
+1. **[Problem ID: MULTI-OFFSET-GRAD-STARVATION]**
+   - **Code Diff:** Replaced exponential decay in `train.py` with flat plateau on offsets $0 \dots 4$: `weights[i, front:] = torch.where(j_rel <= 4, torch.ones_like(j_rel), torch.exp(-0.10 * (j_rel - 4.0)))`.
+   - **Predicted Delta:** Equalizes gradient backpropagation through offsets $+2, +3, +4$ during diffusion training.
+   - **Observed Unit Outcome:** Stratified evaluation reported $A_{+2} = 50.0\%, A_{+3} = 75.0\%, A_{+4} = 37.5\%$ during smoke convergence, verifying gradient flow through higher offsets.
+
+2. **[Problem ID: ZONE-B-SEMANTIC-AMBIGUITY]**
+   - **Code Diff:** Implemented Sigma predicted-embedding self-conditioning in `BFGDiffAdapter` (`model.py`) via `pred_emb_scale` and `pred_emb_norm`, combined with iWSP analytical SVD initialization of `latent_down`.
+   - **Predicted Delta:** Provides concrete lexical conditioning vectors to Zone B mask slots $+2 \dots +W$, resolving multi-token semantic ambiguity without breaking Zone A isolation.
+   - **Observed Held-Out Outcome:** `test_gate_v22_sc.py` verified exact zero-init parity ($\Delta = 0.00000000e+00$), non-zero finite parameter gradients, and strict causal isolation ($\Delta_{\text{leak}} = 0.00000000e+00$). Gate 1 PASS.
+
+
 
 
 

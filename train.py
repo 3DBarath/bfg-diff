@@ -139,8 +139,28 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0)
             t_out = model(input_ids=clean_seq, use_cache=False)
         Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
 
-    # 2. Student Pass (2-Step Latent Recycling Unroll on 30% of steps)
-    if torch.rand(1).item() < 0.30:
+    # 2. Student Pass (Task 2.3: 25% Self-Conditioning SC unroll + 2-step latent unroll)
+    u_sc = torch.rand(1).item()
+    if u_sc < 0.25:
+        # Pass 1: generate logits_1 and latents_1 under no_grad
+        with torch.no_grad():
+            logits_1, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
+            latents_1 = latents_1.detach()
+            prev_pred_ids = logits_1.argmax(dim=-1)
+            # Lookup predicted token embeddings from model's input embeddings
+            emb_fn = model.get_input_embeddings()
+            prev_pred_embeds = emb_fn(prev_pred_ids).detach()
+        student_logits = canvas_forward(
+            model,
+            prefix,
+            noisy,
+            prev_latents=latents_1,
+            prev_pred_embeds=prev_pred_embeds,
+            return_hidden=False,
+            mask=mask,
+        )
+    elif u_sc < 0.50:
+        # Standard latent recycling unroll without self-conditioning
         with torch.no_grad():
             _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
             latents_1 = latents_1.detach()
@@ -169,12 +189,17 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0)
 
     loss_per_token = lambda_kl * kl_per_token + (1.0 - lambda_kl) * ce_per_token
 
-    # Offset position weighting: w_j = exp(-0.15 * (j - frontier))
+    # Offset position weighting: Task 1.1 Flat Frontier Plateau Weighting across offsets 0..4
+    # j_rel <= 4 -> weight = 1.0; j_rel > 4 -> exp(-0.10 * (j_rel - 4))
     weights = torch.ones_like(loss_per_token)
     for i, front in enumerate(frontiers):
         if front < C:
             j_rel = torch.arange(C - front, device=device).float()
-            weights[i, front:] = torch.exp(-0.15 * j_rel)
+            weights[i, front:] = torch.where(
+                j_rel <= 4,
+                torch.ones_like(j_rel),
+                torch.exp(-0.10 * (j_rel - 4.0)),
+            )
 
     return (loss_per_token[mask] * weights[mask]).sum() / weights[mask].sum().clamp_min(1.0)
 
@@ -184,6 +209,9 @@ def evaluate(model, loader, mask_id, device, batches):
     model.eval()
     total_loss, n = 0.0, 0
     correct_1, total_1 = 0, 0
+    correct_2, total_2 = 0, 0
+    correct_3, total_3 = 0, 0
+    correct_4, total_4 = 0, 0
     correct_2_4, total_2_4 = 0, 0
 
     for i, (prefix, target) in enumerate(loader):
@@ -218,15 +246,37 @@ def evaluate(model, loader, mask_id, device, batches):
             correct_1 += (top1_S[:, 1] == top1_T[:, 1]).sum().item()
             total_1 += B
 
+        if C > 2:
+            correct_2 += (top1_S[:, 2] == top1_T[:, 2]).sum().item()
+            total_2 += B
+
+        if C > 3:
+            correct_3 += (top1_S[:, 3] == top1_T[:, 3]).sum().item()
+            total_3 += B
+
+        if C > 4:
+            correct_4 += (top1_S[:, 4] == top1_T[:, 4]).sum().item()
+            total_4 += B
+
         if C > 4:
             correct_2_4 += (top1_S[:, 2:5] == top1_T[:, 2:5]).sum().item()
             total_2_4 += (B * 3)
 
     model.train()
     acc_offset1 = correct_1 / max(1, total_1)
+    acc_offset2 = correct_2 / max(1, total_2)
+    acc_offset3 = correct_3 / max(1, total_3)
+    acc_offset4 = correct_4 / max(1, total_4)
     acc_offset2_4 = correct_2_4 / max(1, total_2_4)
     val_loss = total_loss / max(1, n)
-    return val_loss, acc_offset1, acc_offset2_4
+    return {
+        "val_loss": val_loss,
+        "acc_offset1": acc_offset1,
+        "acc_offset2": acc_offset2,
+        "acc_offset3": acc_offset3,
+        "acc_offset4": acc_offset4,
+        "acc_offset2_4": acc_offset2_4,
+    }
 
 
 def save_checkpoint(path, model, mask_id, args, step):
@@ -408,10 +458,18 @@ def main():
             running, tokens, logged, last_log = 0.0, 0, 0, now
 
         if step % args.eval_every == 0 or step == args.steps:
-            val_loss, acc1, acc2_4 = evaluate(model, val_loader, mask_id, device, args.eval_batches)
+            val_res = evaluate(model, val_loader, mask_id, device, args.eval_batches)
+            val_loss = val_res["val_loss"]
+            acc1 = val_res["acc_offset1"]
+            acc2 = val_res["acc_offset2"]
+            acc3 = val_res["acc_offset3"]
+            acc4 = val_res["acc_offset4"]
+            acc2_4 = val_res["acc_offset2_4"]
             print(
                 f"step {step:5d} val_loss {val_loss:.4f} "
-                f"acc_offset1 {acc1:.1%} acc_offset2_4 {acc2_4:.1%}"
+                f"acc_offset1 {acc1:.1%} acc_offset2 {acc2:.1%} "
+                f"acc_offset3 {acc3:.1%} acc_offset4 {acc4:.1%} "
+                f"(acc_offset2_4 {acc2_4:.1%})"
             )
 
         if step % args.save_every == 0 or step == args.steps:

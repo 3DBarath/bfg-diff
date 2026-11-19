@@ -60,6 +60,7 @@ def sample_staircase_sliding(
     tree_branches = None  # (b1_tokens, b2_tokens) if 2-branch micro-tree active
     committed_tokens = []
     prev_latents = None
+    prev_pred_embeds = None
 
     step = 0
     while len(committed_tokens) < canvas_len:
@@ -113,7 +114,9 @@ def sample_staircase_sliding(
 
         inputs_embeds = None
         if adapter is not None and hasattr(adapter, "get_inputs_embeds"):
-            inputs_embeds = adapter.get_inputs_embeds(model, active_ids, zone_a_len, W, prev_latents)
+            inputs_embeds = adapter.get_inputs_embeds(
+                model, active_ids, zone_a_len, W, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds
+            )
 
         if stats_out is not None:
             stats_out["forward_passes"] += 1
@@ -132,6 +135,7 @@ def sample_staircase_sliding(
             return_hidden=return_hidden,
             inputs_embeds=inputs_embeds,
             prev_latents=prev_latents,
+            prev_pred_embeds=prev_pred_embeds,
         )
         if return_hidden and isinstance(out_step, tuple):
             logits, latents = out_step
@@ -358,8 +362,14 @@ def sample_staircase_sliding(
                         draft_ids = torch.tensor([candidate_drafts], dtype=torch.long, device=device).expand(B, -1)
                         if latents is not None:
                             prev_latents = latents[:, zone_a_len : zone_a_len + len(candidate_drafts)]
+                        else:
+                            prev_latents = None
+                        # Sigma SC: extract predicted embeddings for Zone B candidate drafts
+                        emb_fn = model.get_input_embeddings()
+                        prev_pred_embeds = emb_fn(draft_ids).detach()
                     else:
                         prev_latents = None
+                        prev_pred_embeds = None
             else:
                 # Partial rejection fallback: r < V_cur.
                 # Avoid resetting V_cur = 0 by extracting lookahead draft from Zone B slot 0
@@ -377,10 +387,14 @@ def sample_staircase_sliding(
                         prev_latents = latents[:, zone_a_len : zone_a_len + 1]
                     else:
                         prev_latents = None
+                    emb_fn = model.get_input_embeddings()
+                    prev_pred_embeds = emb_fn(draft_ids).detach()
                 else:
                     prev_latents = None
+                    prev_pred_embeds = None
         else:
             prev_latents = None
+            prev_pred_embeds = None
 
         if step_callback:
             disp_tokens = list(committed_tokens)

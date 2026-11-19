@@ -534,6 +534,29 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - **Gate B & C (Ablation Table & Adapter Contribution):** Passed on both v2 checkpoints with $A_{+1}$ up to 87.5%.
    - **Gate D (ChatML Fluency & Zero Mask Leakage):** Passed in `chat.py` CLI test; fluent 32-token response with 0 `<|extra_0|>` tokens and 0.0% adjacent duplication.
 
+## 32. BFG-Diff v2.2 Architecture Implementation: Unstarving Gradients & Sigma Self-Conditioning (2026-11-19)
+
+1. **Phase 1: Unstarve Multi-Offset Gradients & Stratified Logging:**
+   - Updated `diffusion_loss` in `train.py`: replaced immediate exponential decay with a flat plateau across offsets 0..4 (`j_rel <= 4 -> weight = 1.0; j_rel > 4 -> exp(-0.10 * (j_rel - 4))`).
+   - Updated `evaluate()` in `train.py` to stratify and report individual offset accuracies `acc_offset1`, `acc_offset2`, `acc_offset3`, `acc_offset4`, alongside `acc_offset2_4`.
+
+2. **Phase 2: Sigma Predicted-Embedding Self-Conditioning & iWSP SVD Initialization:**
+   - In `model.py` (`BFGDiffAdapter`): Added learnable scalar gate `pred_emb_scale` (zero-initialized for exact legacy parity) and `pred_emb_norm`.
+   - Added `init_svd_from_embeddings` method for analytical SVD shift-register initialization of `latent_down` from the token embedding subspace.
+   - Updated `apply_to_embeds`, `canvas_forward`, and `canvas_step_with_cache` to support `prev_pred_embeds`.
+   - In `train.py`: Wired 25% self-conditioning training unroll (generating pass-1 `prev_pred_ids` under `no_grad` and feeding input embeddings into pass 2).
+   - In `sampler.py`: Wired live `prev_pred_embeds` and `prev_latents` recycling into Zone B.
+
+3. **Verification & Gates:**
+   - **Gate 1 Unit Suite (`test_gate_v22_sc.py`):**
+     - Zero-init step-0 parity: Delta parity = `0.00000000e+00` (PASS).
+     - iWSP SVD initialization: Verified non-zero projection weights aligned with embedding subspace (PASS).
+     - Gradient flow: Non-zero finite gradients verified across `slot_emb`, `latent_down`, `latent_up`, and `pred_emb_scale` (PASS).
+     - Zone A strict causal isolation: Delta_leak = `0.00000000e+00` (PASS).
+   - **Train Smoke Test (`train.py --smoke_test`):** `smoke convergence: 11.8025 -> 4.5754 PASS` with stratified logging: `acc_offset1 75.0% acc_offset2 50.0% acc_offset3 75.0% acc_offset4 37.5% (acc_offset2_4 54.2%)`.
+   - **Benchmark Smoke Test (`benchmark.py --smoke_test`):** Generation and reconstruction benchmark suite passed with clean output and zero regressions.
+
+
 
 
 

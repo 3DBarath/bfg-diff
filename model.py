@@ -130,15 +130,17 @@ def prefill_prefix(model, prefix_ids, prefix_keep=None):
 
 
 class BFGDiffAdapter(torch.nn.Module):
-    """Pillar 3: Slot-Offset Embeddings & Latent Residual Recycling.
+    """Pillar 3: Slot-Offset Embeddings, Latent Residual Recycling, and Sigma Self-Conditioning.
 
     - slot_emb: Learnable offset embeddings for Zone B positions +1..+W
     - latent_norm + latent_down + latent_up: Residual projection recycling
       previous step's top-layer hidden states h^(L) into Zone B lookahead slots.
-    Zero-initialized so that legacy checkpoints and step 0 produce 100% identical outputs.
+    - pred_emb_scale + pred_emb_norm: Sigma predicted-embedding self-conditioning (arXiv:2610.02665).
+      Zero-initialized so that legacy checkpoints and step 0 produce 100% identical outputs.
     """
     def __init__(self, hidden_size, max_w=16, lora_r=16):
         super().__init__()
+        self.hidden_size = hidden_size
         self.max_w = max_w
         self.slot_emb = torch.nn.Embedding(max_w, hidden_size)
         torch.nn.init.zeros_(self.slot_emb.weight)
@@ -146,12 +148,33 @@ class BFGDiffAdapter(torch.nn.Module):
         try:
             from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
             self.latent_norm = Qwen2RMSNorm(hidden_size, eps=1e-6)
+            self.pred_emb_norm = Qwen2RMSNorm(hidden_size, eps=1e-6)
         except Exception:
             self.latent_norm = torch.nn.LayerNorm(hidden_size)
+            self.pred_emb_norm = torch.nn.LayerNorm(hidden_size)
 
         self.latent_down = torch.nn.Linear(hidden_size, lora_r, bias=False)
         self.latent_up = torch.nn.Linear(lora_r, hidden_size, bias=False)
         torch.nn.init.zeros_(self.latent_up.weight)
+
+        # Task 2.1 Sigma self-conditioning gate (zero-initialized for backward compatibility)
+        self.pred_emb_scale = torch.nn.Parameter(torch.tensor(0.0))
+
+    def init_svd_from_embeddings(self, embed_weight, scale=0.02):
+        """Task 2.2 Analytical SVD Shift-Register Init (iWSP arXiv:2611.18114).
+        Initializes latent_down from top-r right singular vectors of token embeddings."""
+        with torch.no_grad():
+            W_emb = embed_weight.float()
+            r = self.latent_down.out_features
+            # torch.svd_lowrank computes U, S, V where W_emb ~= U @ diag(S) @ V.T
+            # V has shape (hidden_size, r). latent_down.weight has shape (r, hidden_size).
+            _, _, V = torch.svd_lowrank(W_emb, q=r, niter=4)
+            self.latent_down.weight.copy_(V.T.to(dtype=self.latent_down.weight.dtype))
+            # Keep latent_up at small scale or zero
+            if scale > 0.0:
+                torch.nn.init.normal_(self.latent_up.weight, std=scale)
+            else:
+                torch.nn.init.zeros_(self.latent_up.weight)
 
     def forward_offset(self, j_indices):
         return self.slot_emb(j_indices)
@@ -160,8 +183,15 @@ class BFGDiffAdapter(torch.nn.Module):
         normed = self.latent_norm(prev_latents)
         return self.latent_up(torch.nn.functional.silu(self.latent_down(normed)))
 
+    def forward_pred_embeds(self, pred_embeds):
+        """Normalize predicted token embeddings and scale by pred_emb_scale."""
+        if self.pred_emb_scale == 0.0 and not self.pred_emb_scale.requires_grad:
+            return torch.zeros_like(pred_embeds)
+        normed = self.pred_emb_norm(pred_embeds)
+        return self.pred_emb_scale * normed
+
     def apply_to_embeds(
-        self, embeds, zone_a_len=0, zone_b_len=0, prev_latents=None, mask=None, prefix_len=None
+        self, embeds, zone_a_len=0, zone_b_len=0, prev_latents=None, prev_pred_embeds=None, mask=None, prefix_len=None
     ):
         out_embeds = embeds.clone()
         B = embeds.shape[0]
@@ -180,6 +210,11 @@ class BFGDiffAdapter(torch.nn.Module):
                         if w_use > 0:
                             rec = self.forward_latent(prev_latents[b : b + 1, :w_use])
                             out_embeds[b, seq_pos[:w_use]] = out_embeds[b, seq_pos[:w_use]] + rec[0]
+                    if prev_pred_embeds is not None:
+                        w_sc = min(len(masked_idx), prev_pred_embeds.shape[1])
+                        if w_sc > 0:
+                            sc = self.forward_pred_embeds(prev_pred_embeds[b : b + 1, :w_sc])
+                            out_embeds[b, seq_pos[:w_sc]] = out_embeds[b, seq_pos[:w_sc]] + sc[0]
             return out_embeds
 
         if zone_b_len <= 0:
@@ -201,12 +236,20 @@ class BFGDiffAdapter(torch.nn.Module):
                     out_embeds[:, zone_a_len : zone_a_len + w_use] + rec_embs
                 )
 
+        if prev_pred_embeds is not None:
+            w_sc = min(zone_b_len, prev_pred_embeds.shape[1])
+            if w_sc > 0:
+                sc_embs = self.forward_pred_embeds(prev_pred_embeds[:, :w_sc])
+                out_embeds[:, zone_a_len : zone_a_len + w_sc] = (
+                    out_embeds[:, zone_a_len : zone_a_len + w_sc] + sc_embs
+                )
+
         return out_embeds
 
-    def get_inputs_embeds(self, model, active_ids, zone_a_len, zone_b_len, prev_latents=None):
+    def get_inputs_embeds(self, model, active_ids, zone_a_len, zone_b_len, prev_latents=None, prev_pred_embeds=None):
         base_embeds = model.get_input_embeddings()(active_ids)
         return self.apply_to_embeds(
-            base_embeds, zone_a_len=zone_a_len, zone_b_len=zone_b_len, prev_latents=prev_latents
+            base_embeds, zone_a_len=zone_a_len, zone_b_len=zone_b_len, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds
         )
 
 
@@ -293,6 +336,7 @@ def canvas_step_with_cache(
     return_hidden=False,
     inputs_embeds=None,
     prev_latents=None,
+    prev_pred_embeds=None,
 ):
     """Logits for staircase step pass.
 
@@ -353,7 +397,7 @@ def canvas_step_with_cache(
     if inputs_embeds is None and getattr(model, "bfg_adapter", None) is not None:
         base_embeds = model.get_input_embeddings()(active_ids)
         inputs_embeds = model.bfg_adapter.apply_to_embeds(
-            base_embeds, z_a_len, z_b_len, prev_latents=prev_latents
+            base_embeds, z_a_len, z_b_len, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds
         )
 
     kwargs = {
@@ -382,7 +426,7 @@ def canvas_step_with_cache(
 
 
 def canvas_forward(
-    model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, return_hidden=False, mask=None
+    model, prefix_ids, canvas_ids, prefix_keep=None, prev_latents=None, prev_pred_embeds=None, return_hidden=False, mask=None
 ):
     """Logits for the canvas block only: (B, C, vocab), aligned with Qwen's k -> k+1 prediction."""
     B, P = prefix_ids.shape
@@ -402,11 +446,11 @@ def canvas_forward(
 
     if getattr(model, "bfg_adapter", None) is not None:
         base_embeds = model.get_input_embeddings()(input_ids)
-        # BFGDiffAdapter must only apply slot_emb and prev_latents to actual [MASK] tokens (canvas_ids == mask_id)
+        # BFGDiffAdapter must only apply slot_emb, prev_latents, and prev_pred_embeds to actual [MASK] tokens (canvas_ids == mask_id)
         effective_mask_id = getattr(model, "mask_id", 151665)
         mask_to_use = (canvas_ids == effective_mask_id)
         inputs_embeds = model.bfg_adapter.apply_to_embeds(
-            base_embeds, mask=mask_to_use, prefix_len=P, prev_latents=prev_latents
+            base_embeds, mask=mask_to_use, prefix_len=P, prev_latents=prev_latents, prev_pred_embeds=prev_pred_embeds
         )
         kwargs["inputs_embeds"] = inputs_embeds
     else:
