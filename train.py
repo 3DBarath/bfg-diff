@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--max_tokens", type=int, default=None, help="cap on corpus tokens")
     p.add_argument("--texts", type=int, default=32, help="synthetic texts when --data is unset")
     p.add_argument("--device", default="auto")
-    p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp32"])
+    p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     p.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
     p.add_argument("--cpu", action="store_true", help="CPU-friendly preset (P=128, C=32, 1k steps)")
     p.add_argument("--lora", action="store_true", help="train LoRA adapters, freeze the base model")
@@ -323,13 +323,24 @@ def main():
     except RuntimeError:  # already set by an earlier import
         pass
     device = pick_device(args.device)
-    dtype = (
-        torch.bfloat16
-        if args.dtype == "bf16" or (args.dtype == "auto" and device.type == "cuda")
-        else torch.float32
-    )
+    if args.dtype == "bf16":
+        selected_dtype = "bf16"
+    elif args.dtype == "fp16":
+        selected_dtype = "fp16"
+    elif args.dtype == "fp32":
+        selected_dtype = "fp32"
+    else:  # auto
+        if device.type == "cuda":
+            cap_major = torch.cuda.get_device_capability(device)[0]
+            selected_dtype = "bf16" if cap_major >= 8 else "fp16"
+        else:
+            selected_dtype = "fp32"
 
-    model, tok, mask_id = prepare(args.model, device=device, dtype=dtype)
+    use_fp16 = (selected_dtype == "fp16" and device.type == "cuda")
+    # fp16 mixed precision requires model master weights in fp32 to prevent GradScaler unscale errors
+    load_dtype = torch.bfloat16 if selected_dtype == "bf16" else torch.float32
+
+    model, tok, mask_id = prepare(args.model, device=device, dtype=load_dtype)
     from model import setup_bfg_adapter
     setup_bfg_adapter(model, lora_r=args.lora_r if args.lora else 16)
     # Task 3: Wire Analytical SVD Init before loading checkpoint weights (scale=0.0 preserves Delta=0.0 parity)
@@ -380,7 +391,7 @@ def main():
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
     print(
-        f"device={device} dtype={dtype} mask_id={mask_id} "
+        f"device={device} selected_dtype={selected_dtype} (model={load_dtype}) mask_id={mask_id} "
         f"train={len(train_ds)} val={len(val_ds)} chunks"
     )
 
@@ -408,9 +419,12 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    autocast_dtype = torch.float16 if use_fp16 else (torch.bfloat16 if selected_dtype == "bf16" else torch.float32)
+    autocast_enabled = (use_fp16 or (selected_dtype == "bf16" and device.type == "cuda"))
     autocast = torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=(dtype == torch.bfloat16)
+        device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     model.train()
     opt.zero_grad(set_to_none=True)
@@ -438,30 +452,42 @@ def main():
         prefix, target = prefix.to(device), target.to(device)
         with autocast:
             loss = diffusion_loss(model, prefix, target, mask_id) / args.grad_accum
-        loss.backward()
+        if use_fp16:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         step_loss = loss.item() * args.grad_accum
         running += step_loss
         logged += 1
         tokens += prefix.numel() + target.numel()
 
         if step % args.grad_accum == 0 or step == args.steps:
+            if use_fp16:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
-            opt.step()
+            if use_fp16:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             sched.step()  # one schedule step per optimizer update
             opt.zero_grad(set_to_none=True)
 
             # Update the single [MASK] row with Adam moments
             if emb_weight.requires_grad and emb_weight.grad is not None:
                 g = emb_weight.grad[mask_id]
-                mask_t += 1
-                beta1, beta2, eps = 0.9, 0.95, 1e-8
-                mask_m = beta1 * mask_m + (1.0 - beta1) * g
-                mask_v = beta2 * mask_v + (1.0 - beta2) * (g ** 2)
-                m_hat = mask_m / (1.0 - beta1 ** mask_t)
-                v_hat = mask_v / (1.0 - beta2 ** mask_t)
-                lr = sched.get_last_lr()[0]
-                with torch.no_grad():
-                    emb_weight[mask_id] -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+                if use_fp16:
+                    g = g / scaler.get_scale()
+                if torch.isfinite(g).all():
+                    mask_t += 1
+                    beta1, beta2, eps = 0.9, 0.95, 1e-8
+                    mask_m = beta1 * mask_m + (1.0 - beta1) * g
+                    mask_v = beta2 * mask_v + (1.0 - beta2) * (g ** 2)
+                    m_hat = mask_m / (1.0 - beta1 ** mask_t)
+                    v_hat = mask_v / (1.0 - beta2 ** mask_t)
+                    lr = sched.get_last_lr()[0]
+                    with torch.no_grad():
+                        emb_weight[mask_id] -= lr * m_hat / (torch.sqrt(v_hat) + eps)
                 emb_weight.grad.zero_()
 
         if step % args.log_every == 0 or step == 1:

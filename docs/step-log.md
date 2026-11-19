@@ -673,6 +673,23 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python train.py --smoke_test --lr 2e-5`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
    - `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: `PASS` (Reconstruction 31.6%, Causal generate 13.4 TPS).
 
+## 40. Native FP16 Mixed-Precision & Capacity Ablations Ingestion (2026-11-19)
+
+1. **`train.py` Native FP16 + GradScaler:**
+   - Added `fp16` to `--dtype` options (`["auto", "bf16", "fp16", "fp32"]`). On CUDA, `--dtype auto` selects `bf16` if device capability major >= 8, else `fp16` (Turing/T4).
+   - Ensured model loads in `torch.float32` when using `fp16` mixed precision so master weights avoid `GradScaler` unscale errors.
+   - Wired `scaler.scale(loss).backward()`, `scaler.unscale_(opt)`, `torch.nn.utils.clip_grad_norm_`, `scaler.step(opt)`, and `scaler.update()`.
+   - Added unscaling guard for manual `mask_id` embedding update: `g = emb_weight.grad[mask_id] / scaler.get_scale()` with `torch.isfinite(g).all()` safety check.
+2. **Capacity Ablation Checkpoints Ingested (`bfg-v2.3-capacity-ab.zip`):**
+   - Unpacked to `runs/ab-r16-attn/` and `runs/ab-r64-mlp/`.
+   - `ab-r16-attn`: Step 400 loss 2.5226, val loss 6.0014, `acc_offset1 34.4%`, `acc_offset2 37.5%`. Smoke test: $\alpha = 1.10$.
+   - `ab-r64-mlp`: Step 400 loss 1.9649, val loss 5.9829, `acc_offset1 31.2%`, `acc_offset2 25.0%`. Smoke test: $\alpha = 1.33$.
+3. **Verification:**
+   - `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+   - `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: `PASS`.
+   - `python benchmark.py --checkpoint runs/ab-r16-attn/last.pt --num_prompts 2 --canvas_len 16 --batch_size 1 --smoke_test`: `PASS`.
+   - `python benchmark.py --checkpoint runs/ab-r64-mlp/last.pt --num_prompts 2 --canvas_len 16 --batch_size 1 --smoke_test`: `PASS`.
+
 
 
 

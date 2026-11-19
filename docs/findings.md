@@ -1278,6 +1278,17 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
      - Replaced flat plateau loss weighting across offsets `0..4` with speculative gatekeeper ramp:
        `j_rel == 0 -> 1.0`, `j_rel == 1 -> 3.0` (3× front-loaded penalty), `j_rel == 2 -> 1.5`, `j_rel == 3 -> 0.75`, `j_rel >= 4 -> 0.5 * exp(-0.15 * (j_rel - 4))`.
      - Confirmed smoke convergence: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+   - **Native `fp16` Mixed-Precision & GradScaler Support (`train.py`):**
+     - Added `fp16` to `--dtype` options with auto-detection for Turing/T4 architectures (`cap_major < 8`).
+     - Kept master weights in `float32` when training in `fp16` to prevent `GradScaler` unscale errors.
+     - Added unscaling guard for manual Adam update on `mask_id`: `g = emb_weight.grad[mask_id] / scaler.get_scale()` with `torch.isfinite(g).all()` safety check.
+   - **Ingested Capacity Ablation Checkpoints (`runs/ab-*` from `bfg-v2.3-capacity-ab.zip`):**
+     - **`ab-r16-attn` (LoRA r=16 attention-only, 400 steps):**
+       - Final val loss: `6.0014`, `acc_offset1 34.4% acc_offset2 37.5% acc_offset3 15.6% acc_offset4 3.1% (acc_offset2_4 18.8%)`.
+     - **`ab-r64-mlp` (LoRA r=64 + MLP layers, 400 steps):**
+       - Final val loss: `5.9829`, `acc_offset1 31.2% acc_offset2 25.0% acc_offset3 9.4% acc_offset4 12.5% (acc_offset2_4 15.6%)`.
+       - Benchmark smoke generation confirms acceptance boost: $\alpha = 1.33$ tok/pass (vs $1.10$ for r16) with $R_{\text{kv}} = 2.97$.
+       - Confirms theoretical boundary: increasing capacity to $r=64$ with MLP adaptation stabilizes training loss and acceptance but does not shatter the $A_{+1} \approx 31\% - 35\%$ ceiling without dedicated draft heads.
 
 
 
