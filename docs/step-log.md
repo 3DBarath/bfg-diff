@@ -586,6 +586,21 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Instruct model achieved 23.4 TPS vs 21.6 TPS Causal (1.08x speedup, alpha 1.22-1.26).
    - Both checkpoints recorded in `docs/findings.md`.
 
+## 35. PEFT Adapter Unfreezing & Mask Evaluation Alignment (2026-11-19)
+
+1. **Diagnosis & Root-Cause Remediation:**
+   - Identified that `peft.get_peft_model()` was silently freezing `BFGDiffAdapter` (`requires_grad = False` on all non-LoRA parameters), explaining why Stage 1 and Stage 2 produced identical metrics on the 600-step T4 GPU run.
+   - Identified evaluation mask mismatch: `evaluate()` previously set `mask[:, 1:] = True`, leaving slot 0 clean and measuring predictions from clean context instead of masked tokens.
+   - Fixed `train.py`:
+     - Added explicit unfreezing loop `param.requires_grad = True` for `model.bfg_adapter.parameters()` after `apply_lora()`.
+     - Changed evaluation mask to `mask[:, :] = True` so validation matches inference reality.
+   - Confirmed caching is not a bottleneck: BFG-Diff v2 already utilizes full 24-layer prefix caching and $O(1)$ in-place KV slicing; per-step T4 GPU latency remains flat from $N=1$ to $N=16$.
+2. **Verification:**
+   - Ran `test_verify_unfrozen.py`: Confirmed all adapter parameters have `requires_grad = True`, gradients exist and are finite, and weights update after 2 steps (`slot_emb norm: 0.0 -> 0.108432`, `latent_up norm: 0.0 -> 0.193143`, `pred_emb_scale: 0.0 -> 0.001445`).
+   - Ran `python train.py --smoke_test`: `smoke convergence: 11.3403 -> 4.4013 PASS`, `acc_offset1 62.5% acc_offset2 50.0% acc_offset3 87.5% acc_offset4 75.0% (acc_offset2_4 70.8%)`.
+   - Ran `python benchmark.py --smoke_test`: Verified clean execution without errors.
+
+
 
 
 

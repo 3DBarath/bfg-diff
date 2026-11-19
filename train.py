@@ -123,7 +123,7 @@ def make_mask(target, mask_id):
     return noisy, mask, frontiers
 
 
-def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0):
+def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0, force_sc=False):
     B, C = target.shape
     P = prefix.shape[1]
     device = prefix.device
@@ -141,7 +141,7 @@ def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0)
 
     # 2. Student Pass (Task 2.3: 25% Self-Conditioning SC unroll + 2-step latent unroll)
     u_sc = torch.rand(1).item()
-    if u_sc < 0.25:
+    if force_sc or u_sc < 0.25:
         # Pass 1: generate logits_1 and latents_1 under no_grad
         with torch.no_grad():
             logits_1, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask)
@@ -230,7 +230,7 @@ def evaluate(model, loader, mask_id, device, batches):
         Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
 
         mask = torch.zeros_like(target, dtype=torch.bool)
-        mask[:, 1:] = True
+        mask[:, :] = True
         noisy = target.masked_fill(mask, mask_id)
 
         Z_student = canvas_forward(model, prefix, noisy, mask=mask).float()
@@ -328,6 +328,10 @@ def main():
     if args.lora:
         targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
         model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets, mask_id=mask_id)
+        # PEFT get_peft_model sets requires_grad = False on non-LoRA modules; explicitly unfreeze BFGDiffAdapter
+        if getattr(model, "bfg_adapter", None) is not None:
+            for param in model.bfg_adapter.parameters():
+                param.requires_grad = True
         if args.resume and Path(args.resume).exists():
             print(f"resuming LoRA and mask weights from {args.resume}...")
             from peft import set_peft_model_state_dict
