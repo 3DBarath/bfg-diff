@@ -750,6 +750,24 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Added `engine: Optional[StaticDraftEngine] = None` parameter to `generate_speculative_v3` and wired `shared_engine` pre-allocation across 50 prompts in `benchmark_v3.py`.
    - Re-verified `benchmark_v3.py --smoke_test`, `test_v3_gates.py`, and `train_v3.py --smoke_test` (ALL PASS).
 
+## 44. Pre-Kaggle T4 Surgical Fixes: Dtype Dynamic Casting & CUDA Graph Profiling (2026-11-20)
+
+1. **Dtype Dynamic Casting (`model_v3.py`):**
+   - Removed hardcoded `.to(torch.float32)` in `ManifoldAlignmentBridge.forward`, casting inputs to `w_dtype = self.down.weight.dtype`.
+   - In `DraftLoRADelta.forward`, executed in `self.lora_A.dtype` and cast residual output back to `x.dtype`.
+   - Tested 1-step forward on both `torch.float16` and `torch.bfloat16` across `BottleneckFusion`, `ManifoldAlignmentBridge`, `project_prefix_kv`, and `forward_draft_layer`: zero dtype mismatches.
+2. **Kaggle VM Compatibility & Profiling (`test_v3_gates.py`):**
+   - Added fallback for `AutoConfig.from_pretrained` (`try: local_files_only=True except: local_files_only=False`) in `test_unit_gate_b`.
+   - Updated `test_gate0_gate1_profile` to invoke `eng.capture_cuda_graphs(mask_id)` on CUDA before prefill, and print `CUDA Graph Replay Active: {is_graph_active}`.
+3. **Surfaced CUDA Graph Capture Errors (`sampler_v3.py`):**
+   - Added explicit logging of capture exceptions: `[WARN] CUDA Graph capture failed, falling back to eager: {e}`.
+4. **Full Verification Suite:**
+   - Ran `test_v3_gates.py` (all 4 Unit Gates PASS).
+   - Ran `train_v3.py --smoke_test` (8.8874 -> 4.7713 PASS).
+   - Ran `benchmark_v3.py --smoke_test` (100.0% exact consistency PASS).
+   - Ran `train.py --smoke_test` (4.8838 -> 4.7517 PASS).
+
+
 
 
 

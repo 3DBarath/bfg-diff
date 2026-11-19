@@ -205,6 +205,7 @@ class StaticDraftEngine:
                 self._step_draft_kernel()
         except Exception as e:
             # Fall back to eager static execution if CUDA graph capture fails on host
+            print(f"[WARN] CUDA Graph capture failed, falling back to eager: {e}")
             self.cuda_graph_verify = None
             self.cuda_graph_draft = None
 

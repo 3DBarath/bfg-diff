@@ -1423,6 +1423,42 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   - New order captures graphs first, followed by `engine.prefill()` which executes `target_cache.reset()` and cleanly writes real prompt token KV states `0 .. P-1`.
   - Added `engine: Optional[StaticDraftEngine] = None` parameter to `generate_speculative_v3` and pre-allocated `shared_engine` in `benchmark_v3.py` across the 50-prompt loop, eliminating redundant captures and ensuring lossless parity on CUDA.
 
+## 44. Pre-Kaggle T4 Surgical Fixes: Dtype Dynamic Casting & CUDA Graph Profiling (2026-11-20)
+
+### Fix Summary
+1. **Dynamic Drafter Dtype Handling (`model_v3.py`)**:
+   - Eliminated hardcoded `.to(torch.float32)` casts in `ManifoldAlignmentBridge.forward` (`norm_y`, `norm_mask`, `slots_1_to_w`, `f_ctx_expanded`), dynamically casting inputs to `w_dtype = self.down.weight.dtype`.
+   - Updated `DraftLoRADelta.forward` to execute in `self.lora_A.dtype` (`w_dtype`), and cast residual output back to `x.dtype`.
+   - Tested 1-step forward on both `torch.float16` and `torch.bfloat16` across `BottleneckFusion`, `ManifoldAlignmentBridge`, `project_prefix_kv`, and `forward_draft_layer`: zero `Float vs Half` or `Float vs BFloat16` mismatches.
+2. **Fresh Kaggle VM Compatibility & Profiling (`test_v3_gates.py`)**:
+   - Updated `test_unit_gate_b` with fallback: `try: local_files_only=True except: local_files_only=False` for offline local runs and online fresh Kaggle environments.
+   - Updated `test_gate0_gate1_profile` to capture CUDA graphs before prefill when on CUDA and log `CUDA Graph Replay Active: {is_graph_active}`.
+3. **Surfaced CUDA Graph Capture Errors (`sampler_v3.py`)**:
+   - Added `print(f"[WARN] CUDA Graph capture failed, falling back to eager: {e}")` inside `capture_cuda_graphs` exception handler.
+
+### Observed Verification Numbers
+- **Dtype Casting Test**:
+  - `torch.float16`: ALL PASS (zero dtype mismatches).
+  - `torch.bfloat16`: ALL PASS (zero dtype mismatches).
+- **Unit Gate Suite (`test_v3_gates.py --model Qwen/Qwen2.5-0.5B`)**:
+  - `Unit Gate A (Lossless Parity)`: 10/10 greedy matches on $B=1$, batched $B=4$ parity match: True. `PASS`.
+  - `Unit Gate B (Param Budget)`: 1.5B = 0.752% (11.58M), 3B = 0.487% (15.06M). `PASS`.
+  - `Unit Gate C (Gradient Flow)`: All finite gradients, 0 base model gradients. `PASS`.
+  - `Unit Gate D (Train-Inference Numerical Parity)`:
+    - Max $|logits_{train} - logits_{infer}| = 3.15 \times 10^{-5} < 10^{-4}$.
+    - Mean $|logits_{train} - logits_{infer}| = 4.42 \times 10^{-6}$. `PASS`.
+  - `Gate 0 & Gate 1 Profile`:
+    - `CUDA Graph Replay Active: False` (CPU run)
+    - $T_{\text{verify}}(Q=1, P=128) = 72.83\text{ ms}$
+    - $T_{\text{verify}}(Q_A=8, P=128) = 147.62\text{ ms}$
+    - $T_{\text{draft}}(4L, W=7, P=128) = 59.36\text{ ms}$
+    - Draft Cost Ratio: $2.84\times$
+- **Smoke Tests**:
+  - `train_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: probe loss convergence $8.8874 \to 4.7713$, `PASS`.
+  - `benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: Exact Lossless Consistency 100.0%, `PASS`.
+  - `train.py --smoke_test`: probe loss convergence $4.8838 \to 4.7517$, `PASS`.
+
+
 
 
 

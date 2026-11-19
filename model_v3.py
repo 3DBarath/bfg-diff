@@ -50,10 +50,10 @@ class DraftLoRADelta(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is (..., in_features)
-        # Compute in delta precision (fp32 during training or cast during inference)
-        lora_a = self.lora_A.to(dtype=x.dtype)
-        lora_b = self.lora_B.to(dtype=x.dtype)
-        return self.scaling * F.linear(F.linear(x, lora_a), lora_b)
+        # Compute in delta.lora_A.dtype, then cast residual output back to x.dtype
+        x_in = x.to(dtype=self.lora_A.dtype)
+        out = self.scaling * F.linear(F.linear(x_in, self.lora_A), self.lora_B)
+        return out.to(dtype=x.dtype)
 
 
 def apply_linear_with_delta(base_linear: nn.Linear, x: torch.Tensor, delta: DraftLoRADelta) -> torch.Tensor:
@@ -117,23 +117,24 @@ class ManifoldAlignmentBridge(nn.Module):
         """Construct aligned draft block input of length W in Layer-(L-4) manifold."""
         B = y_star_emb.shape[0]
         dtype = y_star_emb.dtype
+        w_dtype = self.down.weight.dtype
 
         # Slot 0 token embedding: y*
-        norm_y = self.emb_norm(y_star_emb.to(torch.float32)) + self.slot_emb[0:1].unsqueeze(0)  # (B, 1, D)
+        norm_y = self.emb_norm(y_star_emb.to(w_dtype)) + self.slot_emb[0:1].unsqueeze(0).to(w_dtype)  # (B, 1, D)
 
         # Slots 1..W-1 token embeddings: [MASK]
-        norm_mask = self.emb_norm(mask_emb.to(torch.float32))  # (B or 1, 1, D)
+        norm_mask = self.emb_norm(mask_emb.to(w_dtype))  # (B or 1, 1, D)
         if norm_mask.shape[0] != B:
             norm_mask = norm_mask.expand(B, 1, self.dim)
 
         if w > 1:
-            slots_1_to_w = self.slot_emb[1:w].unsqueeze(0).expand(B, w - 1, self.dim)  # (B, W-1, D)
+            slots_1_to_w = self.slot_emb[1:w].unsqueeze(0).expand(B, w - 1, self.dim).to(w_dtype)  # (B, W-1, D)
             norm_mask_slots = norm_mask.expand(B, w - 1, self.dim) + slots_1_to_w
             norm_emb = torch.cat([norm_y, norm_mask_slots], dim=1)  # (B, W, D)
         else:
             norm_emb = norm_y  # (B, 1, D)
 
-        f_ctx_expanded = f_ctx_last.expand(B, w, self.dim).to(torch.float32)
+        f_ctx_expanded = f_ctx_last.expand(B, w, self.dim).to(w_dtype)
         cat_feat = torch.cat([norm_emb, f_ctx_expanded], dim=-1)  # (B, W, 2*D)
 
         bridge_out = self.up(self.act(self.down(cat_feat)))  # (B, W, D)

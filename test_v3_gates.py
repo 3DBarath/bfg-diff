@@ -43,7 +43,10 @@ def test_unit_gate_b(model_names: List[str] = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.
     all_pass = True
 
     for m_name in model_names:
-        cfg = AutoConfig.from_pretrained(m_name, local_files_only=True)
+        try:
+            cfg = AutoConfig.from_pretrained(m_name, local_files_only=True)
+        except Exception:
+            cfg = AutoConfig.from_pretrained(m_name, local_files_only=False)
         D = cfg.hidden_size
         num_heads = cfg.num_attention_heads
         num_kv = cfg.num_key_value_heads
@@ -367,6 +370,10 @@ def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str 
 
     eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=W, device=device, dtype=base_dtype)
     prompt_ids = torch.randint(100, 1000, (1, P), device=device)
+    if eng.device.type == "cuda":
+        eng.capture_cuda_graphs(mask_id)
+    is_graph_active = (eng.cuda_graph_verify is not None and eng.cuda_graph_draft is not None)
+    print(f"  CUDA Graph Replay Active: {is_graph_active}")
     _, f_last = eng.prefill(prompt_ids)
     y_star = prompt_ids[:, -1:]
     q8_ids = torch.randint(100, 1000, (1, Q_A), device=device)
