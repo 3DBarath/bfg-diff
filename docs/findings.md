@@ -1180,6 +1180,62 @@ Command: `python3 benchmark.py --model Qwen/Qwen2.5-0.5B --checkpoint runs/bfg-p
    - **Predicted Delta:** Fixes lookahead self-conditioning coordinate shift at arbitrary mask frontiers $m > 0$.
    - **Observed Held-Out Outcome:** `test_gate_v22_sc.py` verified non-zero frontier ($m=3$) alignment with zero distortion to clean prefix context.
 
+---
+
+## 2026-11-19: Tesla T4 GPU Dual Training & Benchmark Logs (Kaggle Environment)
+
+### 1. Training Setup & Logs (600 Steps per Checkpoint on Dual T4 GPUs)
+- **Hardware:** NVIDIA Tesla T4 (2x GPUs: GPU 0 Base, GPU 1 Instruct).
+- **Corpora:**
+  - Base: WikiText-103 raw + technical corpus (2.0+ MB, cleaned NUL bytes).
+  - Instruct: UltraChat-200k multi-turn conversations in ChatML format.
+- **Hyperparameters:**
+  `--prefix_len 256 --canvas_len 64 --batch_size 12 --grad_accum 1 --steps 600 --warmup 50 --lr 3e-4 --lora --device cuda`
+- **Observed Training Tails:**
+  - **Base Checkpoint (`runs/bfg-v2.2-base/last.pt`):**
+    - Final Step: `step 600/600 loss 2.3217 lr 0.00e+00 tok/s 481 elapsed 4614s`
+    - Stratified Validation at step 600:
+      `val_loss 6.2114 acc_offset1 47.9% acc_offset2 25.0% acc_offset3 29.2% acc_offset4 31.2% (acc_offset2_4 28.5%)`
+  - **Instruct Checkpoint (`runs/bfg-v2.2-instruct/last.pt`):**
+    - Final Step: `step 600/600 loss 3.7593 lr 0.00e+00 tok/s 505 elapsed 4374s`
+    - Stratified Validation at step 600:
+      `val_loss 6.5751 acc_offset1 87.5% acc_offset2 27.1% acc_offset3 8.3% acc_offset4 12.5% (acc_offset2_4 16.0%)`
+
+### 2. Verified T4 GPU Ablation Benchmarks (Measured Hardware Output)
+
+#### A. Base Model (`Qwen/Qwen2.5-0.5B`, `B=1`, `num_prompts=20`, `canvas_len=64`)
+- **Offset Accuracy Probe (10 prompts, W=4, tau=0.8):**
+  - Offset $+0$: $100.0\%$
+  - Offset $+1$: $30.0\%$ (A_exact: $30.0\%$, A_tau: $30.0\%$)
+  - Offset $+2$: $10.0\%$ (A_exact: $10.0\%$, A_tau: $20.0\%$)
+  - Offset $+3$: $0.0\%$ (A_exact: $0.0\%$, A_tau: $10.0\%$)
+  - Offset $+4$: $10.0\%$ (A_exact: $10.0\%$, A_tau: $10.0\%$)
+- **Ablation Results:**
+  | Method | TPS | Speedup (x) | Alpha (tok/pass) | R_kv | A_+1 (%) | A_+2 (%) | H4 | rep4 (%) | adj_dup (%) |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Causal Baseline (generate, B=1) | 21.4 | 1.00x | 1.00 | 0.00 | 100.0% | N/A | 0.884 | 27.9% | 0.6% |
+  | BFG-Diff v1 (Sub-block recompute, cap 2, B=1) | 20.1 | 0.94x | 1.24 | 2.88 | 30.0% | 20.0% | 0.914 | 21.5% | 0.0% |
+  | BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice, B=1) | 24.8 | **1.16x** | **1.33** | 3.53 | 30.0% | 20.0% | 0.936 | 16.6% | 0.0% |
+  | BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill, B=1) | 24.3 | 1.13x | 1.33 | 3.53 | 30.0% | 20.0% | 0.936 | 16.6% | 0.0% |
+  | BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification, B=1) | 24.5 | 1.14x | **1.34** | 3.77 | 30.0% | 20.0% | 0.947 | **13.9%** | **0.0%** |
+
+#### B. Instruct Model (`Qwen/Qwen2.5-0.5B-Instruct`, `B=1`, `num_prompts=20`, `canvas_len=64`)
+- **Offset Accuracy Probe (10 prompts, W=4, tau=0.8):**
+  - Offset $+0$: $100.0\%$
+  - Offset $+1$: $20.0\%$ (A_exact: $20.0\%$, A_tau: $20.0\%$)
+  - Offset $+2$: $10.0\%$ (A_exact: $10.0\%$, A_tau: $30.0\%$)
+  - Offset $+3$: $10.0\%$ (A_exact: $10.0\%$, A_tau: $10.0\%$)
+  - Offset $+4$: $10.0\%$ (A_exact: $10.0\%$, A_tau: $20.0\%$)
+- **Ablation Results:**
+  | Method | TPS | Speedup (x) | Alpha (tok/pass) | R_kv | A_+1 (%) | A_+2 (%) | H4 | rep4 (%) | adj_dup (%) |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Causal Baseline (generate, B=1) | 21.6 | 1.00x | 1.00 | 0.00 | 100.0% | N/A | 0.987 | 3.8% | 0.0% |
+  | BFG-Diff v1 (Sub-block recompute, cap 2, B=1) | 20.2 | 0.94x | 1.24 | 2.88 | 20.0% | 30.0% | 0.948 | 14.3% | 0.0% |
+  | BFG-Diff v2 - Stage 1 (Staircase Zone A/B + In-Place KV Slice, B=1) | 22.9 | **1.06x** | **1.22** | 3.90 | 20.0% | 30.0% | 0.959 | 11.1% | 0.0% |
+  | BFG-Diff v2 - Stage 2 (+ SlotEmb + Latent Recycling + Self-Distill, B=1) | 22.6 | 1.05x | 1.22 | 3.90 | 20.0% | 30.0% | 0.959 | 11.1% | 0.0% |
+  | BFG-Diff v2 - Stage 3 (+ 2-Branch Micro-Tree Verification, B=1) | 23.4 | **1.08x** | **1.26** | 3.98 | 20.0% | 30.0% | 0.959 | 10.7% | 0.0% |
+
+
 
 
 

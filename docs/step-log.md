@@ -574,6 +574,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - `python train.py --resume runs/bfg-v2-base/last.pt --steps 2 ...`: Resumed and completed 2 steps with zero errors.
    - `python benchmark.py --smoke_test`: `bfg-diff k=2` achieved 21.1% recovery and 1.23 alpha cleanly.
 
+## 34. Dual T4 GPU Training Runs & Ablation Benchmarking (2026-11-19)
+
+1. **Checkpoints Ingested:**
+   - Extracted uploaded `bfg-v2.2-final-checkpoints.zip` containing 600-step T4 GPU trained adapters:
+     - `runs/bfg-v2-base/last.pt` (Trained on WikiText-103 raw + tech corpus, final loss 2.3217).
+     - `runs/bfg-v2-instruct/last.pt` (Trained on UltraChat-200k ChatML, final loss 3.7593).
+     - Associated training logs: `runs/train-t4-v2.2-base.log` and `runs/train-t4-v2.2-instruct.log`.
+2. **Benchmark Measurements Logged:**
+   - Base model achieved 24.8 TPS vs 21.4 TPS Causal (1.16x speedup, alpha 1.33-1.34, 4-gram repetition reduced from 27.9% to 13.9%).
+   - Instruct model achieved 23.4 TPS vs 21.6 TPS Causal (1.08x speedup, alpha 1.22-1.26).
+   - Both checkpoints recorded in `docs/findings.md`.
+
+
 
 
 
