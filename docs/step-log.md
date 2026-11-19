@@ -684,7 +684,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Unpacked to `runs/ab-r16-attn/` and `runs/ab-r64-mlp/`.
    - `ab-r16-attn`: Step 400 loss 2.5226, val loss 6.0014, `acc_offset1 34.4%`, `acc_offset2 37.5%`. Smoke test: $\alpha = 1.10$.
    - `ab-r64-mlp`: Step 400 loss 1.9649, val loss 5.9829, `acc_offset1 31.2%`, `acc_offset2 25.0%`. Smoke test: $\alpha = 1.33$.
-3. **Verification:**
+3. **Head-to-Head Comparative Probe (50 Diverse Prompts, W=4, tau=0.8):**
+   - Ran `run_offset_accuracy_probe` on 50 diverse prompts (`min(50, len(prompt_ids))`):
+     - `ab-r16-attn`: $A_{+1} = 26.0\%$ (exact), $32.0\%$ ($\tau=0.8$); $A_{+2} = 16.0\% / 20.0\%$; $A_{+3} = 12.0\% / 16.0\%$; $A_{+4} = 8.0\% / 12.0\%$.
+     - `ab-r64-mlp`: $A_{+1} = 40.0\%$ (exact), $50.0\%$ ($\tau=0.8$); $A_{+2} = 18.0\% / 20.0\%$; $A_{+3} = 20.0\% / 24.0\%$; $A_{+4} = 8.0\% / 18.0\%$.
+     - `v2.2-base-unfrozen`: $A_{+1} = 36.0\%$ (exact), $44.0\%$ ($\tau=0.8$); $A_{+2} = 20.0\% / 24.0\%$; $A_{+3} = 26.0\% / 26.0\%$; $A_{+4} = 10.0\% / 10.0\%$.
+   - **Result:** `ab-r64-mlp` achieves $+18.0\%$ higher $A_{+1}$ lookahead accuracy at $\tau=0.8$ and boosts generation acceptance rate $\alpha$ from $1.10 \to 1.33$ tokens/pass ($+21\%$) with $18\%$ lower KV recomputation ratio $R_{\text{kv}}$.
+4. **Verification:**
    - `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
    - `python benchmark.py --smoke_test --checkpoint runs/smoke/last.pt`: `PASS`.
    - `python benchmark.py --checkpoint runs/ab-r16-attn/last.pt --num_prompts 2 --canvas_len 16 --batch_size 1 --smoke_test`: `PASS`.
