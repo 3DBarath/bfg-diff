@@ -900,6 +900,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - `python train_v3.py --smoke_test`: `smoke convergence: 10.3253 -> 6.1173 PASS`.
      - `python benchmark_v3.py --smoke_test`: 100.0% exact lossless consistency, PASS.
 
+3. **CPU/GPU Dynamic Auto-Adaptation & `v4` Branch Release:**
+   - Created and pushed dedicated branch `v4` to `origin/v4`.
+   - Updated `sampler_v3.py` to auto-detect execution device:
+     - On CUDA: retains Power-of-2 Buckets + CUDA Graph capture and replay for deterministic tensor shapes.
+     - On CPU: executes dynamic zero-padding KV slicing (`S_active = max_total_len` in verify, `S_active = max_prefix_len` in draft), eliminating memory-bus thrashing over empty `-1e4` padding slots while preserving WAL and in-place `[0:W]` scratch tail.
+   - Re-verified all four unit tests in `test_v4_units.py` (ALL PASS).
+
 
 
 

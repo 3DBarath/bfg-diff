@@ -583,9 +583,12 @@ class StaticDraftEngine:
             g_verify.replay()
             return self.static_verify_logits, self.static_f_ctx_verify
 
-        # Eager static execution path (CPU or B > 1)
+        # Eager execution path (CPU or batched B > 1 on CUDA without graphs)
         max_total_len = max(cur_pos_list) + Q_A
-        S_active = max(S_b, max_total_len)
+        if self.device.type == "cuda":
+            S_active = max(S_b, max_total_len)
+        else:
+            S_active = max_total_len  # CPU: dynamic zero-padding KV slicing
         pos_ids = torch.zeros(B, Q_A, dtype=torch.long, device=self.device)
         mask = torch.full((B, 1, Q_A, S_active), -1e4, dtype=self.dtype, device=self.device)
 
@@ -714,7 +717,7 @@ class StaticDraftEngine:
                 return self.static_draft_ids, self.static_draft_logits
             return self.static_draft_ids
 
-        # Eager static execution path (CPU or B > 1)
+        # Eager execution path (CPU or batched B > 1 on CUDA without graphs)
         y_star_emb = self.drafter.embed_tokens(y_star_ids)
         mask_tensor = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
         mask_emb = self.drafter.embed_tokens(mask_tensor)
@@ -722,7 +725,10 @@ class StaticDraftEngine:
         h = self.drafter.bridge(y_star_emb, mask_emb, f_ctx_last, w=W)
         pos_draft = torch.zeros(B, W, dtype=torch.long, device=self.device)
         max_prefix_len = max(cur_pos_list)
-        S_active = max(S_b, max_prefix_len)
+        if self.device.type == "cuda":
+            S_active = max(S_b, max_prefix_len)
+        else:
+            S_active = max_prefix_len  # CPU: dynamic zero-padding KV slicing
         attn_mask = torch.full((B, 1, W, W + S_active), -1e4, dtype=self.dtype, device=self.device)
 
         for b in range(B):
