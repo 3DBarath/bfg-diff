@@ -1510,6 +1510,18 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   - Verified gates: `test_v3_gates.py` (ALL PASS).
   - Verified legacy: `train.py --smoke_test` (PASS).
 
+## 48. Ingestion of Kaggle T4 Trained 1.5B Drafter Bundle (2026-11-20)
+
+### Artifacts Unpacked
+- **Trained 1.5B Drafter Checkpoint (`runs/bfg_v3_1.5b_6k/last.pt`)**:
+  - Size: 45 MB (trainable-only parameters, 63 tensors).
+  - Trainable parameters: 11,582,464 (11.58M), exactly 0.752% of Qwen2.5-1.5B backbone.
+  - Training configuration: trained on Kaggle T4 (`--model Qwen/Qwen2.5-1.5B --batch_size 8 --lr 3e-4 --w 7 --n_anchors 16`).
+- **Clean On-Policy Dataset (`data/onpolicy_1.5b_5k_clean.pt`)**:
+  - Size: 7.8 MB.
+  - 3,984 sequences of length 256 (`torch.Size([3984, 256])`), generated on-policy by Qwen2.5-1.5B across balanced UltraChat-200k, MetaMathQA, and FineWeb-Edu.
+
+
 
 
 

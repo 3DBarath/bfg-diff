@@ -321,11 +321,10 @@ def main():
 
         if step % args.save_every == 0 or step == args.steps:
             save_path = Path(args.out) / f"ckpt-{step}.pt"
-            drafter_sd = {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))}
             torch.save(
                 {
                     "step": step,
-                    "drafter_state_dict": drafter_sd,
+                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
                     "args": vars(args),
                     "bd": bd,
                 },
@@ -335,7 +334,7 @@ def main():
             torch.save(
                 {
                     "step": step,
-                    "drafter_state_dict": drafter_sd,
+                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
                     "args": vars(args),
                     "bd": bd,
                 },

@@ -800,6 +800,14 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Verified `test_v3_gates.py` (ALL PASS).
    - Verified `train.py --smoke_test` (PASS).
 
+## 48. Ingestion of Kaggle T4 Trained 1.5B Drafter Bundle (2026-11-20)
+
+1. **Unpacked Bundle (`bfg_v3_1.5b_bundle.zip`):**
+   - Extracted `runs/bfg_v3_1.5b_6k/last.pt` (45 MB, 11.58M trainable parameters).
+   - Extracted `data/onpolicy_1.5b_5k_clean.pt` (7.8 MB, 3,984 sequences of length 256).
+   - Extracted and verified `train_v3.py`.
+
+
 
 
 
