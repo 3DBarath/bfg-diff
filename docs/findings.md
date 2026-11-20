@@ -1638,6 +1638,54 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
 - `bfg-web.service` active memory footprint: dropped from **7.1 GB** down to **~530 MB–800 MB RSS**.
 - Switching between `1.5b-instruct`, `1.5b`, and `0.5b` logs eviction and keeps RAM usage flat.
 
+## 52. BFG-Diff v4 Zero-Retraining Inference Engine Verification (2026-11-20)
+
+### 1. Unit Tests Suite (`test_v4_units.py`)
+- **Test 1: Fused Ghost Weights (`merge_ghost_weights()`):**
+  - Evaluated output difference between raw `apply_linear_with_delta` and fused `F.linear` across all 4 tapped drafter layers.
+  - Measured max absolute diff: `0.00e+00` (`PASS`).
+- **Test 2: WAL + `[0:W]` Scratch Tail + Power-of-2 Bucket Transitions:**
+  - Configured buckets `(32, 64, 128, 256)`. Started at $P=22$, crossed bucket $32 \to 64 \to 128$ while generating 45 tokens.
+  - Speculative decoding vs. base model greedy `generate()` exact match: `True` (`PASS`).
+- **Test 3: `6+1` Leaf-Hedge Exact Lossless Parity:**
+  - Tested across 3 diverse prompts with `hedge_margin = 2.0` (triggering 84 hedge attempts).
+  - Prompts 1, 2, 3: `Exact match = True` across all generated tokens (`PASS`).
+  - Natural Case B hedge hit observed and verified in prompt 1 (`Attempts: 25, Hits: 1`).
+- **Test 4: Synthetic Direct Case B (Hedge Branch Hit) Verification:**
+  - Evaluated $t_0 == d_{0,2}$ condition where slot 0 primary guess $d_{0,1}$ missed but hedge candidate $d_{0,2}$ hit.
+  - Observed verified bonus token from slot 7: `18512`.
+  - Base model ground-truth next token on $[input\_ids, y^*, d_{0,2}]$: `18512` (`PASS`).
+
+### 2. Unit Gates Regression Suite (`test_v3_gates.py`)
+- **Unit Gate A (Lossless Parity):**
+  - $B=1$ across 10 diverse prompts: 10/10 passed (`PASS`).
+  - $B=4$ batched ragged generation: `Parity Match: True` (`PASS`).
+- **Unit Gate B (Param Budget):**
+  - `Qwen2.5-1.5B`: 11,582,464 parameters (0.752% trainable ratio vs. <1.000% target) (`PASS`).
+  - `Qwen2.5-3B`: 15,060,992 parameters (0.487% trainable ratio vs. <0.850% target) (`PASS`).
+- **Unit Gate C (Gradient Flow):**
+  - Fusion (3 tensors finite), Bridge (4 tensors finite), Slot Emb (finite and non-zero), 4-Layer LoRA Deltas (28 projections finite), Base model parameters with gradients: 0 (`PASS`).
+- **Unit Gate D (Train-Inference Numerical Parity):**
+  - Max absolute difference: `2.48e-05` (threshold: `1.0e-04`). Mean diff: `3.51e-06`. Argmax token parity: `True` (`PASS`).
+- **Gate 0 & Gate 1 Profile:**
+  - $T_{\text{verify}}(Q=1, P=128) = 74.07$ ms.
+  - $T_{\text{verify}}(Q_A=8, P=128) = 153.95$ ms.
+  - $T_{\text{draft}}(4L, W=7, P=128) = 56.09$ ms.
+  - Draft Cost Ratio: $2.84\times$.
+
+### 3. Rule 2 Smoke Tests
+- **`python train.py --smoke_test`**:
+  - `smoke convergence: 4.8838 -> 4.7517 PASS`.
+- **`python benchmark.py --smoke_test`**:
+  - Reconstruction: recovery 31.6%, TPS 10.4.
+  - Generation: causal generate TPS 13.5, bfg-diff TPS 7.3, alpha 1.03 (`PASS`).
+- **`python train_v3.py --smoke_test`**:
+  - `smoke convergence: 10.3253 -> 6.1173 PASS`.
+- **`python benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`**:
+  - Exact Lossless Consistency %: `100.0%`.
+  - Leaf-Hedge Hit Rate: `0.0% (0/23)`.
+  - `benchmark_v3.py --smoke_test PASS`.
+
 
 
 

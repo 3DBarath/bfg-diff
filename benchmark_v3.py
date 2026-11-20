@@ -142,6 +142,7 @@ def run_benchmark(
     max_new_tokens: int = 128,
     batch_size: int = 1,
     temperature: float = 0.0,
+    hedge_margin: float = 1.0,
     device: str = "auto",
     smoke_test: bool = False,
 ):
@@ -165,6 +166,8 @@ def run_benchmark(
         ckpt = torch.load(checkpoint, map_location=device)
         drafter.load_state_dict(ckpt["drafter_state_dict"], strict=False)
         print("Loaded drafter weights successfully.")
+
+    drafter.merge_ghost_weights(dtype=base_dtype)
 
     prompts = GEN_PROMPTS[:num_prompts]
     tok.padding_side = "left"
@@ -251,6 +254,8 @@ def run_benchmark(
     total_draft_tokens = 0
     total_steps = 0
     exact_matches = 0
+    total_hedge_attempts = 0
+    total_hedge_hits = 0
     a_plus_totals = [0.0, 0.0, 0.0, 0.0]
 
     # Pre-allocate shared engine for CUDA Graph reuse across benchmark prompts
@@ -265,6 +270,7 @@ def run_benchmark(
         device=device,
         dtype=base_dtype,
         use_cuda_graph=(batch_size == 1),
+        hedge_margin=hedge_margin,
     )
     if shared_engine.device.type == "cuda" and batch_size == 1:
         shared_engine.capture_cuda_graphs(mask_id)
@@ -285,6 +291,7 @@ def run_benchmark(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 engine=shared_engine,
+                hedge_margin=hedge_margin,
             )
         sync_device()
         elapsed = time.perf_counter() - t0
@@ -298,6 +305,8 @@ def run_benchmark(
         total_accepted_drafts += stats["accepted_draft_tokens"]
         total_draft_tokens += stats["total_draft_tokens"]
         total_steps += stats["steps"] * len(b_prompts)
+        total_hedge_attempts += stats.get("hedge_attempts", 0)
+        total_hedge_hits += stats.get("hedge_hits", 0)
 
         a_plus_totals[0] += stats.get("a_plus_1", 0.0)
         a_plus_totals[1] += stats.get("a_plus_2", 0.0)
@@ -332,6 +341,7 @@ def run_benchmark(
     alpha = (total_accepted_drafts + total_steps) / max(1, total_steps)
     speedup = spec_tps / max(1e-4, raw_tps)
     consistency_pct = (exact_matches / max(1, len(prompts))) * 100.0 if temperature == 0.0 else 100.0
+    hedge_hit_rate = (total_hedge_hits / max(1, total_hedge_attempts)) * 100.0
 
     # Profile isolated verify and draft step times on populated P=128 cache
     eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=7, device=device, dtype=base_dtype)
@@ -357,9 +367,9 @@ def run_benchmark(
     t_draft_ms = ((time.perf_counter() - t0) / 5.0) * 1000.0
 
     print("\n" + "=" * 80)
-    print("BFG-DIFF v3 BENCHMARK RESULTS:")
+    print("BFG-DIFF v4 BENCHMARK RESULTS:")
     print("=" * 80)
-    print(f"{'Metric':<35}{'Raw Baseline':>15}{'BFG-Diff v3':>15}")
+    print(f"{'Metric':<35}{'Raw Baseline':>15}{'BFG-Diff v4':>15}")
     print("-" * 80)
     print(f"{'Throughput (TPS)':<35}{raw_tps:>15,.1f}{spec_tps:>15,.1f}")
     if compiled_tps is not None:
@@ -371,6 +381,7 @@ def run_benchmark(
     print(f"{'A_+2 Acceptance Rate':<35}{'-':>15}{f'{a2:.1f}%':>15}")
     print(f"{'A_+3 Acceptance Rate':<35}{'-':>15}{f'{a3:.1f}%':>15}")
     print(f"{'A_+4 Acceptance Rate':<35}{'-':>15}{f'{a4:.1f}%':>15}")
+    print(f"{'Leaf-Hedge Hit Rate':<35}{'-':>15}{f'{hedge_hit_rate:.1f}% ({total_hedge_hits}/{total_hedge_attempts})':>15}")
     print(f"{'T_verify (Q_A=8)':<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
     print(f"{'T_draft (4L, W=7)':<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%':>15}{f'{consistency_pct:.1f}%':>15}")
@@ -391,6 +402,7 @@ def main():
     p.add_argument("--canvas_len", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--hedge_margin", type=float, default=1.0)
     p.add_argument("--device", default="auto")
     p.add_argument("--smoke_test", action="store_true")
     args = p.parse_args()
@@ -402,6 +414,7 @@ def main():
         max_new_tokens=args.canvas_len,
         batch_size=args.batch_size,
         temperature=args.temperature,
+        hedge_margin=args.hedge_margin,
         device=args.device,
         smoke_test=args.smoke_test,
     )

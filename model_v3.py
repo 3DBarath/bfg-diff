@@ -17,10 +17,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, apply_rotary_pos_emb, repeat_kv
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, apply_rotary_pos_emb, repeat_kv, rotate_half
 
 MASK_TOKEN = "<|extra_0|>"
 MASK_TOKEN_ID = 151665  # Authoritative ID in Qwen2.5 tokenizer
+
+
+def apply_rotary_pos_emb_k(k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> torch.Tensor:
+    """Key-only rotary position embedding without dummy query allocation."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (k * cos) + (rotate_half(k) * sin)
 
 
 def setup_tokenizer(model_name: str):
@@ -223,6 +230,39 @@ class WeightTiedTopKDrafter(nn.Module):
             ]
         )
 
+        # Ghost layers for zero-overhead inference
+        self.ghost_layers = None
+        self.has_ghost_layers = False
+
+    def merge_ghost_weights(self, dtype: Optional[torch.dtype] = None):
+        """Inference-only optimization: deep-copy the 4 tapped decoder layers and fold
+        LoRA deltas directly into the linear weights: W_ghost = W_base + (alpha / r) * (B @ A).
+        Eliminates 28 unfused delta additions per draft step without modifying base_model.
+        """
+        import copy
+        self.ghost_layers = nn.ModuleList([copy.deepcopy(layer) for layer in self.draft_layers])
+        for l_idx, ghost_layer in enumerate(self.ghost_layers):
+            deltas = self.layer_deltas[l_idx]
+            for name, proj in [
+                ("q_proj", ghost_layer.self_attn.q_proj),
+                ("k_proj", ghost_layer.self_attn.k_proj),
+                ("v_proj", ghost_layer.self_attn.v_proj),
+                ("o_proj", ghost_layer.self_attn.o_proj),
+                ("gate_proj", ghost_layer.mlp.gate_proj),
+                ("up_proj", ghost_layer.mlp.up_proj),
+                ("down_proj", ghost_layer.mlp.down_proj),
+            ]:
+                delta = getattr(deltas, name)
+                delta_w = delta.scaling * torch.matmul(delta.lora_B.data.float(), delta.lora_A.data.float())
+                w_merged = proj.weight.data.float() + delta_w
+                target_dtype = dtype if dtype is not None else proj.weight.dtype
+                proj.weight.data.copy_(w_merged.to(target_dtype))
+                proj.weight.requires_grad = False
+        if dtype is not None:
+            self.ghost_layers.to(dtype=dtype)
+        self.has_ghost_layers = True
+        return self
+
     def get_trainable_parameters(self) -> List[nn.Parameter]:
         """Return list of trainable parameters (fusion, bridge, layer_deltas)."""
         params = []
@@ -266,12 +306,53 @@ class WeightTiedTopKDrafter(nn.Module):
         v_prefix: Optional[torch.Tensor] = None,  # (B, num_kv_heads, S_p, head_dim)
         attn_mask: Optional[torch.Tensor] = None,  # (B, 1, W, S_p + W) bool or float
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute one draft layer referencing base_model layer with DraftLoRADelta.
+        """Execute one draft layer referencing base_model layer with DraftLoRADelta (or fused ghost weights).
         Returns: (hidden_states, k_draft_total, v_draft_total)
         """
+        B, W, D = hidden_states.shape
+
+        if self.has_ghost_layers:
+            ghost_layer = self.ghost_layers[layer_idx]
+            norm_h = ghost_layer.input_layernorm(hidden_states)
+            q = ghost_layer.self_attn.q_proj(norm_h).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+            k_draft = ghost_layer.self_attn.k_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_draft = ghost_layer.self_attn.v_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            cos_d, sin_d = self.rotary_emb(norm_h, pos_draft)
+            q, k_draft = apply_rotary_pos_emb(q, k_draft, cos_d, sin_d, unsqueeze_dim=1)
+
+            if k_prefix is not None and v_prefix is not None:
+                k_total = torch.cat([k_prefix, k_draft], dim=2)
+                v_total = torch.cat([v_prefix, v_draft], dim=2)
+            else:
+                k_total = k_draft
+                v_total = v_draft
+
+            if self.num_heads != self.num_kv_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k_attn = repeat_kv(k_total, n_rep)
+                v_attn = repeat_kv(v_total, n_rep)
+            else:
+                k_attn = k_total
+                v_attn = v_total
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k_attn, v_attn, attn_mask=attn_mask, dropout_p=0.0
+            )
+            attn_out = attn_out.transpose(1, 2).reshape(B, W, D)
+            hidden_states = hidden_states + ghost_layer.self_attn.o_proj(attn_out)
+
+            norm_post = ghost_layer.post_attention_layernorm(hidden_states)
+            gate = ghost_layer.mlp.gate_proj(norm_post)
+            up = ghost_layer.mlp.up_proj(norm_post)
+            mlp_act = ghost_layer.mlp.act_fn(gate) * up
+            down = ghost_layer.mlp.down_proj(mlp_act)
+            hidden_states = hidden_states + down
+            return hidden_states, k_draft, v_draft
+
+        # Standard training / unfused forward path
         base_layer = self.draft_layers[layer_idx]
         deltas = self.layer_deltas[layer_idx]
-        B, W, D = hidden_states.shape
 
         # 1. Input RMSNorm
         norm_h = base_layer.input_layernorm(hidden_states)
@@ -395,17 +476,21 @@ class WeightTiedTopKDrafter(nn.Module):
         cos, sin = self.rotary_emb(f_ctx, pos_ids)
 
         for layer_idx in range(self.k_layers):
-            base_layer = self.draft_layers[layer_idx]
-            deltas = self.layer_deltas[layer_idx]
+            if self.has_ghost_layers:
+                ghost_layer = self.ghost_layers[layer_idx]
+                k = ghost_layer.self_attn.k_proj(f_ctx)
+                v = ghost_layer.self_attn.v_proj(f_ctx)
+            else:
+                base_layer = self.draft_layers[layer_idx]
+                deltas = self.layer_deltas[layer_idx]
+                k = apply_linear_with_delta(base_layer.self_attn.k_proj, f_ctx, deltas.k_proj)
+                v = apply_linear_with_delta(base_layer.self_attn.v_proj, f_ctx, deltas.v_proj)
 
-            k = apply_linear_with_delta(base_layer.self_attn.k_proj, f_ctx, deltas.k_proj)
             k = k.view(B, S_k, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = apply_linear_with_delta(base_layer.self_attn.v_proj, f_ctx, deltas.v_proj)
             v = v.view(B, S_k, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-            # Apply RoPE
-            dummy_q = torch.zeros(B, self.num_heads, S_k, self.head_dim, dtype=k.dtype, device=k.device)
-            _, k = apply_rotary_pos_emb(dummy_q, k, cos, sin, unsqueeze_dim=1)
+            # Apply key-only RoPE without dummy_q allocation
+            k = apply_rotary_pos_emb_k(k, cos, sin, unsqueeze_dim=1)
 
             k_list.append(k)
             v_list.append(v)

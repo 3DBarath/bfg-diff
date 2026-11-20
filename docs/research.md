@@ -437,6 +437,46 @@ Concrete Token y* + [MASK] x (W-1) -> Manifold Bridge -> 4 Tied Layers (L-4..L-1
   - Transparently dispatches `/api/chat` and `/api/generate` requests with the active `model` parameter.
   - Added `/api/models` metadata endpoint returning active registry configs, parameter counts, and checkpoint paths.
 
+---
+
+## 9. BFG-Diff v4: Zero-Retraining Inference Engine (`sampler_v3.py` / `model_v3.py`)
+
+BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining systems optimizations. It is 100% backward compatible with existing v3 checkpoints (e.g. `bfg_v3_1.5b_15k/last.pt`), maintains fixed active shapes ($Q_A = 8, W = 7$) for CUDA Graphs, and preserves strict lossless verification parity against the frozen base model.
+
+### 1. Write-Ahead Log (WAL) `draft_cache` + `[0:W]` In-Place Scratch Tail + Key-Only RoPE
+- **Key-Only RoPE Helper (`apply_rotary_pos_emb_k`)**:
+  - Slices `cos, sin` rotary embeddings and rotates key states directly without allocating dummy queries:
+    $$\text{apply\_rotary\_pos\_emb\_k}(k, \cos, \sin) = (k \odot \cos) + (\text{rotate\_half}(k) \odot \sin)$$
+- **Write-Ahead Log (WAL) inside `_step_verify_kernel`**:
+  - Projects and scatters all $Q_A = 8$ verified draft KV states ahead to `W + static_pos_scatter` directly within the Stage 1 Verify CUDA Graph.
+  - Completely eliminates eager Python `commit_accepted_tokens()` from the hot loop. On acceptance of $k$ tokens, only integer pointer `cur_pos += (k + 1)` advances; unaccepted speculative slots are masked by `static_mask_B` and overwritten in-place on the next verify pass.
+- **`[0:W]` Scratch Tail Buffer Layout**:
+  - `draft_cache` allocated with sequence capacity $W + \text{max\_len}$.
+  - Indices $[0 : W]$ reserved exclusively for the current step's $W=7$ draft KV states. Committed prefix KV begins at offset $W$ (logical position $p \to W + p$).
+  - `_step_draft_kernel` writes $k_d, v_d$ directly into `draft_cache[:, :, 0:W, :]` in-place, eliminating dynamic `torch.cat` operations during drafting.
+
+### 2. Power-of-2 Bucketed CUDA Graphs
+- **Zero-Copy Shared Buffers**: Slices master `target_cache` and `draft_cache` without dynamic reallocation.
+- **4 Bucketed Graph Pairs**: Captures separate `(verify_graph, draft_graph)` pairs for $S_{\text{bucket}} \in (256, 512, 1024, 2048)$.
+  - Verify views `target_cache[:, :, :S_bucket, :]` and `static_mask_A[:, :, :, :S_bucket]`.
+  - Draft views `draft_cache[:, :, :W + S_bucket, :]` and `static_mask_B[:, :, :, :W + S_bucket]`.
+- **Dynamic Dispatch**: Automatically replays the smallest bucket $S_{\text{bucket}} \ge \text{cur\_pos} + Q_A$, eliminating attention bandwidth waste over unpopulated sequence slots.
+
+### 3. Inference-Only Merged 4-Layer Ghost Weights (`drafter.merge_ghost_weights()`)
+- Deep-copies only the 4 tapped decoder layers into `fp16` ghost layers and folds each LoRA delta directly into its weight matrix:
+  $$W_{\text{ghost}} = W_{\text{base}} + \frac{\alpha}{r} (B A)$$
+- Eliminates 28 unfused `base_linear(x) + delta(x)` kernel launches per draft step while keeping the frozen base model weights 100% untouched for Stage 1 verify.
+
+### 4. `6+1` Leaf-Hedge Mask Morphing ($Q_A = 8$)
+- **Dynamic Trigger**: When slot 0 top-2 logit margin $v_1 - v_2 < \text{hedge\_margin}$ (default `1.0`), activates leaf-hedge micro-tree tile without CUDA Graph recompilation.
+- **Tile Geometry**: `[y*, d0_1, d1, d2, d3, d4, d5, d0_2]` with RoPE positions $[t, t+1, t+2, t+3, t+4, t+5, t+6, t+1]$ and cache scatter positions $[t, t+1, \dots, t+7]$.
+  - Slots 0..6 form standard causal chain; column $t+7$ (slot 7) is masked with $-1e4$.
+  - Slot 7 ($d_{0,2}$) attends only to prefix $[0 : t] + \text{slot 0} (y^*) + \text{itself} (t+7)$, masking slots 1..6 with $-1e4$.
+- **Exact Lossless Branching**:
+  - **Case A ($t_0 == d_{0,1}$)**: Primary branch hit $\to$ verify $d_1..d_5$ sequentially; advance `cur_pos += k + 1`.
+  - **Case B ($t_0 == d_{0,2}$)**: Hedge branch hit $\to$ accept $d_{0,2}$ and verified bonus token $t_{\text{bonus}}$; copy slot 7 KV from $t+7$ into $t+1$ in both caches, advancing `cur_pos += 2`.
+  - **Case C (neither matches)**: Reject draft, emit $t_0$, advance `cur_pos += 1`.
+
 
 
 

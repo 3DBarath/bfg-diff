@@ -862,6 +862,44 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Verified active service footprint dropped from 7.1 GB to ~530 MB–800 MB RSS.
    - Verified seamless hot-swapping between `1.5b-instruct`, `1.5b`, and `0.5b` with zero memory stacking.
 
+## 52. BFG-Diff v4 Zero-Retraining Inference Engine Implementation & Verification (2026-11-20)
+
+1. **Architecture & Engine Upgrades:**
+   - **Fused Ghost Weights (`model_v3.py` / `sampler_v3.py`):**
+     - Implemented `merge_ghost_weights(dtype)` on `WeightTiedTopKDrafter`. Deep-copies the 4 tapped decoder layers into `ghost_layers` and folds LoRA deltas into $W_{\text{ghost}} = W_{\text{base}} + \frac{\alpha}{r} (B A)$.
+     - Updated `forward_draft_layer` to dispatch through `ghost_layers` via direct fused operations.
+     - Implemented key-only RoPE helper `apply_rotary_pos_emb_k(k, cos, sin)` eliminating dummy query allocations.
+   - **WAL `draft_cache` + `[0:W]` In-Place Scratch Tail (`sampler_v3.py`):**
+     - Sized `draft_cache` to $W + \text{max\_len}$ where $[0 : W]$ is the dedicated scratch tail for the current draft step, with prefix KV starting at index $W$.
+     - Integrated draft prefix KV projection directly into `_step_verify_kernel` / `forward_verify_step` to write ahead all $Q_A = 8$ draft KV states, eliminating `commit_accepted_tokens()` from the hot loop.
+     - `_step_draft_kernel` writes $k_d, v_d$ directly into `draft_cache[:, :, :W, :]` in-place, eliminating dynamic concatenations.
+   - **Power-of-2 Bucketed CUDA Graphs (`sampler_v3.py`):**
+     - Slices shared zero-copy backing buffers for `target_cache` and `draft_cache`.
+     - Captures and replays separate `(verify_graph, draft_graph)` pairs for $S_{\text{bucket}} \in (256, 512, 1024, 2048)$.
+     - Dynamically selects the smallest bucket $S_{\text{bucket}} \ge \text{cur\_pos} + Q_A$.
+   - **`6+1` Leaf-Hedge Mask Morphing (`sampler_v3.py` / `benchmark_v3.py`):**
+     - Evaluates slot 0 top-2 logit margin $v_1 - v_2$. If margin $< \text{hedge\_margin}$ (default `1.0`), places second hypothesis $d_{0,2}$ in slot 7 with separate cache scatter position $t + 7$ and RoPE position $t + 1$.
+     - Attends to prefix $[0 : t] + \text{slot 0} (y^*) + \text{slot 7} (d_{0,2})$, completely isolated from slots 1..6.
+     - Implemented Case A (primary hit), Case B (hedge hit with slot 7 KV copy to slot 1 and verified bonus token emission), and Case C (neither matches).
+     - Added `--hedge_margin` argument and reported `Leaf-Hedge Hit Rate` in `benchmark_v3.py`.
+
+2. **Verification Suite Passing:**
+   - **`python test_v4_units.py`**:
+     - Test 1 (Ghost weights max diff: `0.00e+00`): PASS.
+     - Test 2 (WAL + `[0:W]` scratch tail + bucket transitions `32 -> 64 -> 128`): PASS.
+     - Test 3 (`6+1` Leaf-Hedge lossless parity across 3 diverse prompts, 84 attempts): PASS.
+     - Test 4 (Synthetic Case B hedge hit, verified bonus token matches base model `18512`): PASS.
+   - **`python test_v3_gates.py --model Qwen/Qwen2.5-0.5B`**:
+     - Unit Gate A (Lossless Parity B=1 and B=4): PASS.
+     - Unit Gate B (Param budget: 0.752% on 1.5B, 0.487% on 3B): PASS.
+     - Unit Gate C (Gradient flow, 0 base gradients): PASS.
+     - Unit Gate D (Train-inference parity: max diff $2.48 \times 10^{-5}$): PASS.
+   - **Rule 2 Smoke Tests**:
+     - `python train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+     - `python benchmark.py --smoke_test`: PASS.
+     - `python train_v3.py --smoke_test`: `smoke convergence: 10.3253 -> 6.1173 PASS`.
+     - `python benchmark_v3.py --smoke_test`: 100.0% exact lossless consistency, PASS.
+
 
 
 
