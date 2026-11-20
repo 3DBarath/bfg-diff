@@ -8,6 +8,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import argparse
+import gc
 import json
 import math
 import sys
@@ -52,13 +53,16 @@ V3_CONFIGS = {
 
 
 class V3ModelManager:
-    """Thread-safe manager for cached loading and serving of BFG-Diff v3 models."""
+    """Thread-safe manager that keeps a single BFG-Diff v3 model resident."""
 
     def __init__(self, device: Optional[str] = None):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
-        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        # bf16 halves the memory of the 1.5B weights on CPU (no native AVX512-BF16
+        # on this Xeon, so compute is converted to fp32 internally -- same speed
+        # class as fp32, less RAM).
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
         self._models: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -71,6 +75,15 @@ class V3ModelManager:
         with self._lock:
             if cache_key in self._models:
                 return self._models[cache_key]
+
+            # Only one model fits comfortably on this box: drop the previous one
+            # before loading the next, or the second load swaps to death.
+            for old_key in list(self._models):
+                print(f"[V3ModelManager] Dropping cached model {old_key} to free memory")
+                del self._models[old_key]
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             cfg = V3_CONFIGS[key]
             model_name = cfg["model_name"]
