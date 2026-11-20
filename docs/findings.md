@@ -1458,6 +1458,32 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   - `benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B`: Exact Lossless Consistency 100.0%, `PASS`.
   - `train.py --smoke_test`: probe loss convergence $4.8838 \to 4.7517$, `PASS`.
 
+## 45. CUDA fp16 Mixed-Precision Dtype Alignment & Gate D Parity (2026-11-20)
+
+### Fix Summary
+1. **`BottleneckFusion.forward` Output Dtype Alignment (`model_v3.py`)**:
+   - Changed `return self.norm(out)` to `return self.norm(out).to(tapped_states[0].dtype)`.
+   - In mixed precision (`fp16` base model / `fp32` drafter), ensures `F_ctx` matches the base model's native `fp16` dtype before passing into `project_prefix_kv` and base projections during distillation training and gate checks.
+2. **Gate D Robust Thresholding & Argmax Token Parity (`test_v3_gates.py`)**:
+   - Set threshold `thresh = 1e-4 if base_dtype == torch.float32 else 5e-2` to accommodate fp16 quantization noise between fp32 training weights and fp16 inference weights.
+   - Added `token_parity = torch.equal(train_logits.argmax(-1), infer_logits.argmax(-1))` check to assert exact argmax token consistency.
+
+### Observed Verification Numbers
+- **Unit Gate Suite (`test_v3_gates.py --model Qwen/Qwen2.5-0.5B`)**:
+  - `Unit Gate A (Lossless Parity)`: 10/10 greedy matches on $B=1$, batched $B=4$ ragged parity: True. `PASS`.
+  - `Unit Gate B (Param Budget)`: 1.5B = 0.752% (11.58M), 3B = 0.487% (15.06M). `PASS`.
+  - `Unit Gate C (Gradient Flow)`: All finite gradients, 0 base model gradients. `PASS`.
+  - `Unit Gate D (Train-Inference Numerical Parity)`:
+    - Max $|logits_{train} - logits_{infer}| = 2.10 \times 10^{-5}$ (threshold: $1.0 \times 10^{-4}$).
+    - Mean $|logits_{train} - logits_{infer}| = 2.71 \times 10^{-6}$.
+    - Argmax Token Parity: `True`. `PASS`.
+  - `Gate 0 & Gate 1 Profile`:
+    - `CUDA Graph Replay Active: False`
+    - $T_{\text{verify}}(Q=1, P=128) = 72.91\text{ ms}$
+    - $T_{\text{verify}}(Q_A=8, P=128) = 149.82\text{ ms}$
+    - $T_{\text{draft}}(4L, W=7, P=128) = 60.43\text{ ms}$
+    - Draft Cost Ratio: $2.88\times$
+
 
 
 

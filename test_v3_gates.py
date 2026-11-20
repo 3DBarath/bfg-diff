@@ -339,12 +339,15 @@ def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
             return_logits=True,
         )
 
+    thresh = 1e-4 if base_dtype == torch.float32 else 5e-2
+    token_parity = torch.equal(train_logits.argmax(-1), infer_logits.argmax(-1))
     max_diff = (train_logits - infer_logits).abs().max().item()
     mean_diff = (train_logits - infer_logits).abs().mean().item()
-    print(f"  Max |logits_train - logits_infer|:  {max_diff:.2e} (threshold: 1e-4)")
+    print(f"  Max |logits_train - logits_infer|:  {max_diff:.2e} (threshold: {thresh:.1e})")
     print(f"  Mean |logits_train - logits_infer|: {mean_diff:.2e}")
+    print(f"  Argmax Token Parity: {token_parity}")
 
-    passed = max_diff < 1e-4
+    passed = (max_diff < thresh) and token_parity
     print(f"Unit Gate D Status: {'PASS' if passed else 'FAIL'}")
     return passed
 

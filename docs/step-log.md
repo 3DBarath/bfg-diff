@@ -767,6 +767,16 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `benchmark_v3.py --smoke_test` (100.0% exact consistency PASS).
    - Ran `train.py --smoke_test` (4.8838 -> 4.7517 PASS).
 
+## 45. CUDA fp16 Mixed-Precision Dtype Alignment & Gate D Parity (2026-11-20)
+
+1. **`BottleneckFusion.forward` Output Dtype Casting (`model_v3.py`):**
+   - Cast `return self.norm(out).to(tapped_states[0].dtype)` to align fused feature tensor `f_ctx` with the base model's native `fp16` dtype in mixed precision before `project_prefix_kv`.
+2. **Gate D Robust Thresholding & Argmax Token Parity (`test_v3_gates.py`):**
+   - Configured `thresh = 1e-4 if base_dtype == torch.float32 else 5e-2` and checked `torch.equal(train_logits.argmax(-1), infer_logits.argmax(-1))`.
+3. **Verification Suite Passing:**
+   - Ran `test_v3_gates.py` (Unit Gates A, B, C, D ALL PASS, Gate D: max diff 2.10e-05, Argmax Token Parity: True).
+
+
 
 
 

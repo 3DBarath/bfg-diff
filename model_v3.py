@@ -84,7 +84,7 @@ class BottleneckFusion(nn.Module):
         # tapped_states: list of 4 tensors (B, S, D)
         cat_h = torch.cat(tapped_states, dim=-1)  # (B, S, 4*D)
         out = self.up(self.act(self.down(cat_h.to(self.down.weight.dtype))))
-        return self.norm(out)
+        return self.norm(out).to(tapped_states[0].dtype)
 
 
 class ManifoldAlignmentBridge(nn.Module):
