@@ -1495,6 +1495,22 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
    - Loads `drafter_state_dict` from existing checkpoints (`strict=False`) before optimizer initialization.
    - Verified with `train_v3.py --smoke_test --resume runs/smoke_v3/last.pt`: successfully warm-started drafter and converged $5.0450 \to 4.4892$ (`PASS`).
 
+## 47. Trainable-Only Drafter Checkpoint Filtering (2026-11-20)
+
+### Optimization
+- **Trainable-Only State Dict Filtering (`train_v3.py`)**:
+  - Filtered `drafter.state_dict()` in `train_v3.py` when saving checkpoints:
+    `{k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))}`.
+  - Excludes the frozen referenced base model weights (`draft_layers`, `norm`, `lm_head`, `embed_tokens`).
+  - Reduces checkpoint filesize from several gigabytes down to ~26 MB (for 0.5B) and ~46 MB–60 MB (for 1.5B/3B).
+- **Verification**:
+  - Confirmed 63 trainable keys saved in `runs/smoke_v3/last.pt` (filesize: 26 MB).
+  - Verified resume: `train_v3.py --smoke_test --resume runs/smoke_v3/last.pt` loaded all 63 keys with `strict=False` and converged $5.1773 \to 4.5912$ (`PASS`).
+  - Verified evaluation: `benchmark_v3.py --smoke_test --checkpoint runs/smoke_v3/last.pt` loaded cleanly and passed with 100.0% exact consistency (`PASS`).
+  - Verified gates: `test_v3_gates.py` (ALL PASS).
+  - Verified legacy: `train.py --smoke_test` (PASS).
+
+
 
 
 

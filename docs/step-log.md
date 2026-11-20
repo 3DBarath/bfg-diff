@@ -788,6 +788,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `test_v3_gates.py` (ALL PASS).
    - Ran legacy `train.py --smoke_test` (PASS).
 
+## 47. Trainable-Only Drafter Checkpoint Filtering (2026-11-20)
+
+1. **Trainable Parameter State Dict Filtering (`train_v3.py`):**
+   - Filtered saved checkpoint to keys starting with `("fusion.", "bridge.", "layer_deltas.")`.
+   - Stripped multi-gigabyte frozen base backbone references, producing clean ~26 MB–46 MB checkpoints.
+2. **Verification Suite:**
+   - Verified checkpoint structure and size (26 MB for 0.5B, 63 keys).
+   - Verified resume with `train_v3.py --smoke_test --resume runs/smoke_v3/last.pt` (PASS).
+   - Verified evaluation with `benchmark_v3.py --smoke_test --checkpoint runs/smoke_v3/last.pt` (PASS).
+   - Verified `test_v3_gates.py` (ALL PASS).
+   - Verified `train.py --smoke_test` (PASS).
+
+
 
 
 
