@@ -8,6 +8,13 @@ runs/*
 !runs/bfg-polished-v2/last.pt
 !runs/bfg-instruct-v2/
 !runs/bfg-instruct-v2/last.pt
+!runs/bfg_v3_1.5b_15k/
+!runs/bfg_v3_1.5b_15k/last.pt
+!runs/bfg_v3_1.5b_6k/
+!runs/bfg_v3_1.5b_6k/last.pt
+!runs/smoke_v3/
+!runs/smoke_v3/last.pt
+runs/*/ckpt-*.pt
 __pycache__/
 *.py[cod]
 *.zip
