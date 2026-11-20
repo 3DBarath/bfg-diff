@@ -579,7 +579,7 @@ def quantize_for_cpu(
     if not getattr(drafter, "has_ghost_layers", False):
         drafter.merge_ghost_weights(dtype=torch.float32)
 
-    # 2. Quantize Linear layers in-place layer by layer
+    # 2. Quantize Linear layers in-place layer by layer (keeping lm_head unquantized in fp32)
     if mode == "int8":
         if hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
             for i in range(len(base_model.model.layers)):
@@ -587,11 +587,6 @@ def quantize_for_cpu(
                     base_model.model.layers[i], {nn.Linear}, dtype=torch.qint8
                 )
                 gc.collect()
-        if hasattr(base_model, "lm_head") and isinstance(base_model.lm_head, nn.Linear):
-            base_model.lm_head = torch.ao.quantization.quantize_dynamic(
-                nn.Sequential(base_model.lm_head), {nn.Linear}, dtype=torch.qint8
-            )[0]
-            gc.collect()
 
         if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
             for i in range(len(drafter.ghost_layers)):
@@ -600,7 +595,7 @@ def quantize_for_cpu(
                 )
                 gc.collect()
         gc.collect()
-        print(f"[quantize_for_cpu] Applied in-place dynamic INT8 quantization to base model and ghost layers.")
+        print(f"[quantize_for_cpu] Applied in-place dynamic INT8 quantization to base model decoder layers and ghost layers (lm_head kept in fp32).")
 
     elif mode == "int4":
         try:
@@ -618,11 +613,6 @@ def quantize_for_cpu(
                         base_model.model.layers[i], {nn.Linear}, dtype=torch.qint8
                     )
                     gc.collect()
-            if hasattr(base_model, "lm_head") and isinstance(base_model.lm_head, nn.Linear):
-                base_model.lm_head = torch.ao.quantization.quantize_dynamic(
-                    nn.Sequential(base_model.lm_head), {nn.Linear}, dtype=torch.qint8
-                )[0]
-                gc.collect()
             if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
                 for i in range(len(drafter.ghost_layers)):
                     drafter.ghost_layers[i] = torch.ao.quantization.quantize_dynamic(

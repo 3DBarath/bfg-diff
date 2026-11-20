@@ -232,10 +232,10 @@ def test_quantized_int8_cpu_parity():
     base_model, drafter, tok, mask_id = prepare_v3("Qwen/Qwen2.5-0.5B", device="cpu", dtype=torch.float32)
     base_model, drafter = quantize_for_cpu(base_model, drafter, mode="int8")
 
-    # Verify linear layers in base_model and drafter are quantized
+    # Verify linear layers in base_model and drafter are quantized (lm_head kept in fp32)
     from torch.ao.nn.quantized.dynamic.modules.linear import Linear as QuantizedLinear
     assert isinstance(base_model.model.layers[0].self_attn.q_proj, QuantizedLinear), "Base model layers must be quantized"
-    assert isinstance(base_model.lm_head, QuantizedLinear), "Base model lm_head must be quantized"
+    assert isinstance(base_model.lm_head, torch.nn.Linear), "Base model lm_head must remain torch.nn.Linear (fp32)"
     assert drafter.has_ghost_layers, "Ghost layers must be merged prior to quantization"
     assert isinstance(drafter.ghost_layers[0].self_attn.q_proj, QuantizedLinear), "Drafter ghost layers must be quantized"
 
@@ -259,11 +259,7 @@ def test_quantized_int8_cpu_parity():
     with torch.no_grad():
         logits_first, _ = engine.prefill(input_ids)
         out_base_pre = base_model(input_ids, use_cache=True)
-        # When lm_head is dynamically quantized, evaluating lm_head on last_hidden_state
-        # matches engine.prefill (which evaluates lm_head on h[:, -1:]) bit-identically:
-        out_m = base_model.model(input_ids)
-        last_h = out_m.last_hidden_state[:, -1:]
-        ref_prefill_logits = base_model.lm_head(last_h).squeeze(1)
+        ref_prefill_logits = out_base_pre.logits[:, -1, :]
         prefill_diff = (logits_first.squeeze(1) - ref_prefill_logits).abs().max().item()
         print(f"Prefill max logit diff vs quantized base_model: {prefill_diff:.6e}")
         assert prefill_diff <= 1e-4, f"Prefill logit diff {prefill_diff} exceeds atol=1e-4"

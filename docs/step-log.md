@@ -918,6 +918,12 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - CPU smoke benchmark demonstrated 3.44× speculative speedup (1.6 TPS FP32 → 5.5 TPS INT8) and 5.47× verification latency speedup (504.5 ms → 92.2 ms).
    - Promoted `v4` as the headline production inference engine across both GPU and CPU serving configurations.
 
+5. **INT8 `lm_head` Quality Fix & KV-Cached Baseline Streaming (2026-11-20):**
+   - Retained `base_model.lm_head` in `fp32` (`torch.nn.Linear`) while keeping all transformer decoder layers in INT8, restoring sharp logit separation and eliminating URL/fragment attractors.
+   - Updated `test_v4_units.py` Test 5 asserting `isinstance(base_model.lm_head, torch.nn.Linear)` and exact verification parity.
+   - Upgraded `generate_causal_stream` in `chat.py` to stream with `use_cache=True` and `past_key_values`, achieving a fair apples-to-apples comparison (10.28 TPS Causal Baseline vs. 7.95 TPS BFG-Diff v4 on CPU).
+   - Switched chat template rendering in `chat.py` to `tok.apply_chat_template` with Qwen system prompt.
+
 
 
 

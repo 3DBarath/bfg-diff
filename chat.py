@@ -579,18 +579,25 @@ def generate_bfg_traced(
     }
 
 
-def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=None):
-    """Generate baseline response using causal next-token loop with streaming callback."""
+def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=None, stop_tokens=None):
+    """Generate baseline response using causal next-token loop with KV cache streaming callback."""
     prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
     start_time = time.perf_counter()
     generated_ids = []
-    curr_ids = prefix_ids
+    stop_token_ids = set()
+    if stop_tokens:
+        for st in stop_tokens:
+            ids = tok.encode(st, add_special_tokens=False)
+            if ids:
+                stop_token_ids.add(ids[0])
 
     with torch.no_grad():
+        out = model(prefix_ids, use_cache=True)
+        past_key_values = out.past_key_values
+        next_id = int(out.logits[0, -1].argmax())
+
         for _ in range(max_new_tokens):
-            out = model(curr_ids)
-            next_id = int(out.logits[0, -1].argmax())
-            if next_id == tok.eos_token_id or (tok.pad_token_id and next_id == tok.pad_token_id):
+            if next_id == tok.eos_token_id or (tok.pad_token_id and next_id == tok.pad_token_id) or next_id in stop_token_ids:
                 break
             generated_ids.append(next_id)
             tok_text = tok.decode([next_id], skip_special_tokens=True)
@@ -598,7 +605,14 @@ def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=
             tps = len(generated_ids) / max(1e-5, elapsed)
             if callback:
                 callback(tok_text, len(generated_ids), tps, elapsed)
-            curr_ids = torch.cat([curr_ids, torch.tensor([[next_id]], device=model.device)], dim=1)
+
+            if len(generated_ids) >= max_new_tokens:
+                break
+
+            curr_id = torch.tensor([[next_id]], device=model.device)
+            out = model(curr_id, past_key_values=past_key_values, use_cache=True)
+            past_key_values = out.past_key_values
+            next_id = int(out.logits[0, -1].argmax())
 
     elapsed = time.perf_counter() - start_time
     full_text = tok.decode(generated_ids, skip_special_tokens=True)
@@ -2270,10 +2284,23 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             temp = req.get("temp", 0.0)
 
             if mode == "chat" and "<|im_start|>" not in prompt:
-                prompt = (
-                    f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                    f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-                )
+                if hasattr(tok, "apply_chat_template"):
+                    try:
+                        prompt = tok.apply_chat_template(
+                            [{"role": "user", "content": prompt}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    except Exception:
+                        prompt = (
+                            f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                            f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                        )
+                else:
+                    prompt = (
+                        f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    )
 
             stop_tokens = ["<|im_end|>", "<|endoftext|>"] if mode == "chat" else None
 
@@ -2313,6 +2340,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 tok,
                 prompt,
                 max_new_tokens=canvas_len,
+                stop_tokens=stop_tokens,
                 callback=lambda tok_str, total, tps, elap: send_sse({
                     "type": "causal_token",
                     "token": tok_str,
@@ -2405,10 +2433,23 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-in
 
         formatted_prompt = prompt
         if mode == "chat" and "<|im_start|>" not in prompt:
-            formatted_prompt = (
-                f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            )
+            if hasattr(bundle["tok"], "apply_chat_template"):
+                try:
+                    formatted_prompt = bundle["tok"].apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                except Exception:
+                    formatted_prompt = (
+                        f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    )
+            else:
+                formatted_prompt = (
+                    f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                    f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                )
 
         print("-" * 70)
         res = generate_v3_traced(
