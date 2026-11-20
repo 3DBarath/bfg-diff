@@ -1484,6 +1484,18 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
     - $T_{\text{draft}}(4L, W=7, P=128) = 60.43\text{ ms}$
     - Draft Cost Ratio: $2.88\times$
 
+## 46. Multi-GPU Sharding & Drafter Checkpoint Warm-Starting (2026-11-20)
+
+### Enhancements
+1. **On-Policy Dataset Sharding (`generate_onpolicy.py`)**:
+   - Added environment variable sharding: `prompts = prompts[int(os.environ.get("SHARD_IDX", "0")) :: int(os.environ.get("NUM_SHARDS", "1"))]`.
+   - Allows parallel Kaggle GPU generation workers to split the 25k prompt set cleanly without duplication.
+2. **Drafter Checkpoint Warm-Starting (`train_v3.py`)**:
+   - Added `--resume` CLI argument to `train_v3.py`.
+   - Loads `drafter_state_dict` from existing checkpoints (`strict=False`) before optimizer initialization.
+   - Verified with `train_v3.py --smoke_test --resume runs/smoke_v3/last.pt`: successfully warm-started drafter and converged $5.0450 \to 4.4892$ (`PASS`).
+
+
 
 
 

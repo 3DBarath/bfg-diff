@@ -197,6 +197,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
     p.add_argument("--data", default=None, help="path to onpolicy .pt dataset")
+    p.add_argument("--resume", default=None, help="checkpoint to warm-start drafter")
     p.add_argument("--out", default="runs/bfg_v3")
     p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--batch_size", type=int, default=4)
@@ -239,6 +240,11 @@ def main():
     print("Parameter Breakdown:")
     for k, v in bd.items():
         print(f"  {k}: {v}")
+
+    if args.resume and Path(args.resume).exists():
+        ck = torch.load(args.resume, map_location=device)
+        drafter.load_state_dict(ck["drafter_state_dict"], strict=False)
+        print(f"Warm-started drafter from {args.resume}")
 
     # Optimizer on drafter params only
     trainable_params = drafter.get_trainable_parameters()

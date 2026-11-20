@@ -776,6 +776,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 3. **Verification Suite Passing:**
    - Ran `test_v3_gates.py` (Unit Gates A, B, C, D ALL PASS, Gate D: max diff 2.10e-05, Argmax Token Parity: True).
 
+## 46. Multi-GPU Sharding & Drafter Checkpoint Warm-Starting (2026-11-20)
+
+1. **On-Policy Dataset Sharding (`generate_onpolicy.py`):**
+   - Added `SHARD_IDX` / `NUM_SHARDS` slicing across loaded diverse prompts.
+   - Verified via `SHARD_IDX=0 NUM_SHARDS=2 python generate_onpolicy.py --smoke_test`: processed 2 of 4 sequences cleanly.
+2. **Drafter Checkpoint Warm-Starting (`train_v3.py`):**
+   - Added `--resume` CLI parameter and state dict loading logic (`strict=False`) before optimizer initialization.
+   - Verified via `python train_v3.py --smoke_test --resume runs/smoke_v3/last.pt`: successfully warm-started drafter and converged $5.0450 \to 4.4892$ (`PASS`).
+3. **Verification:**
+   - Ran `test_v3_gates.py` (ALL PASS).
+   - Ran legacy `train.py --smoke_test` (PASS).
+
+
 
 
 

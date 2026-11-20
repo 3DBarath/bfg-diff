@@ -211,6 +211,7 @@ def generate_onpolicy_dataset(
         max_new_tokens = 32
 
     prompts = load_diverse_prompts(num_samples, prompt_source=prompt_source, smoke_test=smoke_test)
+    prompts = prompts[int(os.environ.get("SHARD_IDX", "0")) :: int(os.environ.get("NUM_SHARDS", "1"))]
     print(f"Loaded {len(prompts)} unique diverse prompts (source={prompt_source}). Generating responses at batch_size={batch_size}...")
 
     all_sequences = []
