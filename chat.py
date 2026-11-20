@@ -48,22 +48,22 @@ V3_CONFIGS = {
     "1.5b-instruct": {
         "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
         "checkpoint": "runs/bfg_v3_1.5b_15k/last.pt" if Path("runs/bfg_v3_1.5b_15k/last.pt").exists() else "runs/bfg_v3_1.5b_6k/last.pt",
-        "label": "Qwen2.5-1.5B-Instruct (15k v3 Drafter)",
-        "badge": "v3 · 1.5B-Inst",
+        "label": "Qwen2.5-1.5B-Instruct (15k v4 Drafter)",
+        "badge": "v4 · 1.5B-Inst",
         "params": "1.54B Base + 11.58M Drafter (0.75% PEFT)",
     },
     "1.5b": {
         "model_name": "Qwen/Qwen2.5-1.5B",
         "checkpoint": "runs/bfg_v3_1.5b_15k/last.pt" if Path("runs/bfg_v3_1.5b_15k/last.pt").exists() else "runs/bfg_v3_1.5b_6k/last.pt",
-        "label": "Qwen2.5-1.5B Base (15k v3 Drafter)",
-        "badge": "v3 · 1.5B Base",
+        "label": "Qwen2.5-1.5B Base (15k v4 Drafter)",
+        "badge": "v4 · 1.5B Base",
         "params": "1.54B Base + 11.58M Drafter (0.75% PEFT)",
     },
     "0.5b": {
         "model_name": "Qwen/Qwen2.5-0.5B",
         "checkpoint": "runs/smoke_v3/last.pt",
-        "label": "Qwen2.5-0.5B (v3 Drafter)",
-        "badge": "v3 · 0.5B",
+        "label": "Qwen2.5-0.5B (v4 Drafter)",
+        "badge": "v4 · 0.5B",
         "params": "0.49B Base + 6.61M Drafter",
     },
 }
@@ -312,7 +312,7 @@ def generate_v3_traced(
     temperature: float = 0.0,
     stop_tokens: Optional[List[str]] = None,
 ) -> dict:
-    """Generate tokens using BFG-Diff v3 speculative decoding with trace collection."""
+    """Generate tokens using BFG-Diff v4 speculative decoding with trace collection."""
     trace_steps = []
 
     def trace_cb(evt):
@@ -1416,13 +1416,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="header-left">
       <div class="header-brand" style="display:flex; align-items:center; gap:8px;">
         <span class="brand-title">BFG-Diff</span>
-        <span class="brand-tag" id="brandTag">v3 · 1.5B-Inst</span>
+        <span class="brand-tag" id="brandTag">v4 · 1.5B-Inst</span>
       </div>
       <div class="preset-select-wrapper" style="margin-left: 8px;">
         <select id="modelSelector" class="preset-dropdown" onchange="onModelChange(this.value)" title="Choose Active Model">
-          <option value="1.5b-instruct" selected>Qwen2.5-1.5B-Instruct (15k Drafter)</option>
-          <option value="1.5b">Qwen2.5-1.5B Base (15k Drafter)</option>
-          <option value="0.5b">Qwen2.5-0.5B (v3 Drafter)</option>
+          <option value="1.5b-instruct" selected>Qwen2.5-1.5B-Instruct (15k v4 Drafter)</option>
+          <option value="1.5b">Qwen2.5-1.5B Base (15k v4 Drafter)</option>
+          <option value="0.5b">Qwen2.5-0.5B (v4 Drafter)</option>
         </select>
         <span class="preset-caret">▼</span>
       </div>
@@ -1785,17 +1785,17 @@ function onModelChange(val) {
   const brand = document.getElementById('brandTag');
   if (brand) {
     if (val === '1.5b-instruct') {
-      brand.innerText = 'v3 · 1.5B-Inst';
+      brand.innerText = 'v4 · 1.5B-Inst';
     } else if (val === '1.5b') {
-      brand.innerText = 'v3 · 1.5B Base';
+      brand.innerText = 'v4 · 1.5B Base';
     } else {
-      brand.innerText = 'v3 · 0.5B';
+      brand.innerText = 'v4 · 0.5B';
     }
   }
 }
 
 let sessionChatHistory = [
-  { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v3 speculative decoding." }
+  { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v4 speculative decoding." }
 ];
 
 function escapeHtml(str) {
@@ -2354,7 +2354,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-in
     compare = getattr(args, "compare", True)
 
     print("=" * 70)
-    print(" BFG-Diff v3 Interactive Terminal Playground")
+    print(" BFG-Diff v4 Interactive Terminal Playground")
     print(f" Active Model: {bundle['config']['label']}")
     print(f" Device: {bundle['engine'].device} | Parameters: {bundle['config']['params']}")
     print(" Commands: /model 1.5b-instruct|1.5b|0.5b, /mode chat|complete, /vis, /compare, /c <len>, /temp <val>, /quit")
@@ -2425,7 +2425,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-in
                 print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
             print()
 
-        print(f"BFG-Diff v3 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
+        print(f"BFG-Diff v4 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])
 
         if compare:
@@ -2493,7 +2493,7 @@ def main():
             for st in res["trace"]:
                 print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
             print()
-        print(f"BFG-Diff v3 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
+        print(f"BFG-Diff v4 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])
         if args.compare:
             c_res = generate_causal(bundle["base_model"], bundle["tok"], args.prompt, max_new_tokens=args.canvas_len)
