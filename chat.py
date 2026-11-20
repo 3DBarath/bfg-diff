@@ -72,13 +72,16 @@ V3_CONFIGS = {
 class V3ModelManager:
     """Thread-safe manager that keeps a single BFG-Diff v4 model resident."""
 
-    def __init__(self, device: Optional[str] = None, cpu_quant: str = "int8"):
+    def __init__(self, device: Optional[str] = None, cpu_quant: str = "none"):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
-        self.cpu_quant = (cpu_quant or "int8").lower().strip() if self.device.type == "cpu" else "none"
-        # On CUDA: strictly fp16. On CPU: fp32 master load (then INT8 dynamic quantize if enabled).
-        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.cpu_quant = (cpu_quant or "none").lower().strip() if self.device.type == "cpu" else "none"
+        # On CUDA: strictly fp16. On CPU: bfloat16 (3.1 GB memory, zero quantization degradation), or fp32 if INT8 quantizing.
+        if self.device.type == "cuda":
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32 if self.cpu_quant in ("int8", "int4") else torch.bfloat16
         self._models: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -2497,7 +2500,7 @@ def main():
         "--device", default="auto", choices=["auto", "cuda", "cpu"], help="Compute device"
     )
     parser.add_argument(
-        "--cpu_quant", default="int8", choices=["int8", "int4", "none"], help="CPU quantization mode (default: int8)"
+        "--cpu_quant", default="none", choices=["none", "int8", "int4"], help="CPU quantization mode (default: none for bfloat16 full quality)"
     )
     args = parser.parse_args()
     args.checkpoint_specified = ("--checkpoint" in sys.argv)

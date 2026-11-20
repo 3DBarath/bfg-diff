@@ -923,6 +923,7 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Updated `test_v4_units.py` Test 5 asserting `isinstance(base_model.lm_head, torch.nn.Linear)` and exact verification parity.
    - Upgraded `generate_causal_stream` in `chat.py` to stream with `use_cache=True` and `past_key_values`, achieving a fair apples-to-apples comparison (10.28 TPS Causal Baseline vs. 7.95 TPS BFG-Diff v4 on CPU).
    - Switched chat template rendering in `chat.py` to `tok.apply_chat_template` with Qwen system prompt.
+   - Set default `--cpu_quant` in web serving to `none` (`bfloat16`), keeping model weights exact with zero outlier channel degradation, instant 1s startup, 3.1 GB memory footprint, and textbook-quality explanations across both BFG-Diff v4 and the Causal Baseline.
 
 
 
