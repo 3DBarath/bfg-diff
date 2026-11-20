@@ -901,11 +901,22 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
      - `python benchmark_v3.py --smoke_test`: 100.0% exact lossless consistency, PASS.
 
 3. **CPU/GPU Dynamic Auto-Adaptation & `v4` Branch Release:**
-   - Created and pushed dedicated branch `v4` to `origin/v4`.
+   - Branched `v4` from `cca989d`, implemented `device.type` CPU/GPU auto-adaptation in `sampler_v3.py`, verified `test_v4_units.py`, and pushed commit `c91967c` to `origin/v4`.
    - Updated `sampler_v3.py` to auto-detect execution device:
      - On CUDA: retains Power-of-2 Buckets + CUDA Graph capture and replay for deterministic tensor shapes.
      - On CPU: executes dynamic zero-padding KV slicing (`S_active = max_total_len` in verify, `S_active = max_prefix_len` in draft), eliminating memory-bus thrashing over empty `-1e4` padding slots while preserving WAL and in-place `[0:W]` scratch tail.
-   - Re-verified all four unit tests in `test_v4_units.py` (ALL PASS).
+   - Added in-place layer-by-layer dynamic INT8 quantization (`quantize_for_cpu`) with immediate `gc.collect()` in `model_v3.py` to prevent doubling weight memory and stay safely under `MemoryMax=9G`.
+   - Updated `chat.py` and `benchmark_v3.py` with physical-core thread pinning at module startup and `--cpu_quant` options.
+
+4. **Kaggle T4 GPU Benchmarks & Empirical Validation (2026-11-20):**
+   - Executed `test_v4_units.py` on NVIDIA Tesla T4 GPU (all 4 unit tests passed with exact bit-level parity).
+   - Ran 50-prompt T4 GPU ablation suite on `Qwen/Qwen2.5-1.5B` ($C=128, B=1, T=0.0$) using `runs/bfg_v3_1.5b_15k/last.pt`:
+     - **v4 Pure Systems (`hedge_margin = 0.0`):** $68.5\text{ TPS}$ ($2.64\times$ speedup vs. $26.0\text{ TPS}$ baseline), $T_{\text{draft}} = 7.95\text{ ms}$ (-33.5%), $T_{\text{verify}} = 33.59\text{ ms}$ (-2.9 ms).
+     - **v4 Full with `6+1` Leaf-Hedge (`hedge_margin = 1.0`):** **$70.3\text{ TPS}$ ($2.71\times$ speedup)**, $\alpha = 1.80$, $A_{+1} = 57.7\%$ (+7.9 pp), leaf-hedge hit rate **17.4%** (308 / 1,768 hits).
+   - Executed CPU in-place dynamic INT8 verification on Xeon Gold 5215:
+     - All 5 unit tests passed in `test_v4_units.py` (including exact 0.0 logit diff on INT8 prefill and $Q_A=8$ verify).
+     - CPU smoke benchmark demonstrated 3.44× speculative speedup (1.6 TPS FP32 → 5.5 TPS INT8) and 5.47× verification latency speedup (504.5 ms → 92.2 ms).
+   - Promoted `v4` as the headline production inference engine across both GPU and CPU serving configurations.
 
 
 

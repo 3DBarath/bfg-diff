@@ -185,6 +185,8 @@ class StaticDraftEngine:
         self.static_mask_A = torch.full((batch_size, 1, self.q_a, max_len), -1e4, dtype=dtype, device=device)
         # static_mask_B: (B, 1, W, W + max_len)
         self.static_mask_B = torch.full((batch_size, 1, self.w, self.w + max_len), -1e4, dtype=dtype, device=device)
+        self.causal_qa_block = torch.triu(torch.full((self.q_a, self.q_a), -1e4, dtype=dtype, device=device), diagonal=1)
+        self.causal_7x7_block = torch.triu(torch.full((7, 7), -1e4, dtype=dtype, device=device), diagonal=1)
 
         # Pre-allocate static output buffers
         vocab_size = config.vocab_size
@@ -589,24 +591,28 @@ class StaticDraftEngine:
             S_active = max(S_b, max_total_len)
         else:
             S_active = max_total_len  # CPU: dynamic zero-padding KV slicing
-        pos_ids = torch.zeros(B, Q_A, dtype=torch.long, device=self.device)
-        mask = torch.full((B, 1, Q_A, S_active), -1e4, dtype=self.dtype, device=self.device)
 
+        if B == 1 and S_active <= self.max_len:
+            mask = self.static_mask_A[:1, :, :, :S_active]
+            pos_ids = self.static_pos_verify[:1]
+        else:
+            pos_ids = torch.zeros(B, Q_A, dtype=torch.long, device=self.device)
+            mask = torch.full((B, 1, Q_A, S_active), -1e4, dtype=self.dtype, device=self.device)
+
+        mask.fill_(-1e4)
         for b in range(B):
             cp = cur_pos_list[b]
             if pos_verify_override is not None and b == 0:
-                pos_ids[b] = pos_verify_override[0]
+                pos_ids[b].copy_(pos_verify_override[0])
             else:
-                pos_ids[b] = torch.arange(cp, cp + Q_A, device=self.device)
+                pos_ids[b].copy_(torch.arange(cp, cp + Q_A, device=self.device))
             if cp > 0:
                 mask[b, 0, :, :cp] = 0.0
 
             if not is_hedge or b > 0:
-                causal_block = torch.triu(torch.full((Q_A, Q_A), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-                mask[b, 0, :, cp : cp + Q_A] = causal_block
+                mask[b, 0, :, cp : cp + Q_A] = self.causal_qa_block
             else:
-                causal_7x7 = torch.triu(torch.full((7, 7), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-                mask[b, 0, :7, cp : cp + 7] = causal_7x7
+                mask[b, 0, :7, cp : cp + 7] = self.causal_7x7_block
                 mask[b, 0, :7, cp + 7] = -1e4
                 mask[b, 0, 7, cp : cp + 8] = -1e4
                 mask[b, 0, 7, cp] = 0.0
@@ -719,21 +725,26 @@ class StaticDraftEngine:
 
         # Eager execution path (CPU or batched B > 1 on CUDA without graphs)
         y_star_emb = self.drafter.embed_tokens(y_star_ids)
-        mask_tensor = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
-        mask_emb = self.drafter.embed_tokens(mask_tensor)
+        mask_emb = self.drafter.embed_tokens(self.static_mask_token)
 
         h = self.drafter.bridge(y_star_emb, mask_emb, f_ctx_last, w=W)
-        pos_draft = torch.zeros(B, W, dtype=torch.long, device=self.device)
         max_prefix_len = max(cur_pos_list)
         if self.device.type == "cuda":
             S_active = max(S_b, max_prefix_len)
         else:
             S_active = max_prefix_len  # CPU: dynamic zero-padding KV slicing
-        attn_mask = torch.full((B, 1, W, W + S_active), -1e4, dtype=self.dtype, device=self.device)
 
+        if B == 1 and (W + S_active) <= (self.w + self.max_len):
+            pos_draft = self.static_pos_draft[:1]
+            attn_mask = self.static_mask_B[:1, :, :, :W + S_active]
+        else:
+            pos_draft = torch.zeros(B, W, dtype=torch.long, device=self.device)
+            attn_mask = torch.full((B, 1, W, W + S_active), -1e4, dtype=self.dtype, device=self.device)
+
+        attn_mask.fill_(-1e4)
         for b in range(B):
             cp = cur_pos_list[b]
-            pos_draft[b] = torch.arange(cp, cp + W, device=self.device)
+            pos_draft[b].copy_(torch.arange(cp, cp + W, device=self.device))
             attn_mask[b, 0, :, :W] = 0.0
             if cp > 0:
                 attn_mask[b, 0, :, W : W + cp] = 0.0
@@ -874,6 +885,10 @@ def generate_speculative_v3(
     hedge_attempts = 0
     hedge_hits = 0
 
+    # Pre-allocated reusable buffers for hot loop (zero per-step heap allocations)
+    verify_input_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
+    pos_override_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
+
     while not all(done) and any((cur_pos_list[b] - P) < max_new_tokens for b in range(B)):
         y_star = next_token  # (B, 1) concrete bonus token at position t
         t = cur_pos_list[0]
@@ -892,8 +907,10 @@ def generate_speculative_v3(
         d0_1, d0_2 = None, None
         if B == 1 and hedge_margin > 0.0:
             top2 = torch.topk(draft_logits[0, 0], k=2)
-            v1, v2 = top2.values[0].item(), top2.values[1].item()
-            d0_1, d0_2 = top2.indices[0].item(), top2.indices[1].item()
+            top2_vals = top2.values.tolist()
+            top2_inds = top2.indices.tolist()
+            v1, v2 = top2_vals[0], top2_vals[1]
+            d0_1, d0_2 = top2_inds[0], top2_inds[1]
             margin = v1 - v2
             if margin < hedge_margin:
                 is_hedge = True
@@ -902,21 +919,25 @@ def generate_speculative_v3(
         # Stage 1: Verify batch Q_A = 8 at positions [t .. t+7]
         if is_hedge:
             # Polymorphic 6+1 Micro-Tree Tile: [y*, d0_1, d1, d2, d3, d4, d5, d0_2]
-            verify_input = torch.tensor(
-                [[y_star[0, 0].item(), d0_1, draft_ids[0, 1].item(), draft_ids[0, 2].item(),
-                  draft_ids[0, 3].item(), draft_ids[0, 4].item(), draft_ids[0, 5].item(), d0_2]],
-                dtype=torch.long, device=engine.device,
-            )
-            pos_override = torch.tensor([[t, t + 1, t + 2, t + 3, t + 4, t + 5, t + 6, t + 1]], dtype=torch.long, device=engine.device)
+            verify_input_buf[0, 0] = y_star[0, 0]
+            verify_input_buf[0, 1] = d0_1
+            verify_input_buf[0, 2:7].copy_(draft_ids[0, 1:6])
+            verify_input_buf[0, 7] = d0_2
+
+            pos_override_buf[0, 0:7].copy_(torch.arange(t, t + 7, device=engine.device))
+            pos_override_buf[0, 7] = t + 1
             verify_logits, f_ctx_verify = engine.forward_verify_step(
-                verify_input, cur_pos_list=cur_pos_list, is_hedge=True, pos_verify_override=pos_override
+                verify_input_buf, cur_pos_list=cur_pos_list, is_hedge=True, pos_verify_override=pos_override_buf
             )
+            verify_input = verify_input_buf
         else:
             # Standard Linear Chain Tile: [y*, d0, d1, d2, d3, d4, d5, d6]
-            verify_input = torch.cat([y_star, draft_ids], dim=-1)
+            verify_input_buf[:, 0:1].copy_(y_star)
+            verify_input_buf[:, 1:].copy_(draft_ids)
             verify_logits, f_ctx_verify = engine.forward_verify_step(
-                verify_input, cur_pos_list=cur_pos_list, is_hedge=False
+                verify_input_buf, cur_pos_list=cur_pos_list, is_hedge=False
             )
+            verify_input = verify_input_buf
 
         # Verification matching logic
         if temperature == 0.0:

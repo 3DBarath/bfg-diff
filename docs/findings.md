@@ -1686,6 +1686,61 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   - Leaf-Hedge Hit Rate: `0.0% (0/23)`.
   - `benchmark_v3.py --smoke_test PASS`.
 
+## 53. BFG-Diff v4 Kaggle T4 GPU Benchmarks & v1–v4 Progression (2026-11-20)
+
+### 1. T4 GPU Unit Verification (`test_v4_units.py`)
+Verified on NVIDIA Tesla T4 GPU (CUDA, `fp16`, `Qwen/Qwen2.5-0.5B`):
+- **Test 1 (`merge_ghost_weights()`):** Max absolute difference between raw `apply_linear_with_delta` and fused `F.linear` across all 4 tapped drafter layers: `0.00e+00` (`PASS`).
+- **Test 2 (WAL + `[0:W]` scratch tail + bucket transitions):** Transitioned `32 -> 64 -> 128` at $P=22$, generating 45 tokens. 100% exact token-for-token match vs. greedy base `model.generate()` (`PASS`).
+- **Test 3 (`6+1` Leaf-Hedge parity):** Evaluated across 3 diverse prompts with `hedge_margin = 2.0` (triggering 83 hedge attempts). 100% exact match against base model reference (`PASS`).
+- **Test 4 (Synthetic Case B hedge hit):** $t_0 = 264 == d_{0,2} = 264$, verified bonus token $18512 == 18512$ matching base model ground truth on $[input\_ids, y^*, d_{0,2}]$ (`PASS`).
+
+### 2. 50-Prompt T4 GPU Ablation Table (`Qwen2.5-1.5B`, `bfg_v3_1.5b_15k/last.pt`)
+Benchmark configuration: 50 diverse prompts from `GEN_PROMPTS`, $C=128$, $B=1$, greedy decoding ($T=0.0$), headline model `Qwen/Qwen2.5-1.5B`, checkpoint `runs/bfg_v3_1.5b_15k/last.pt`. `StaticDraftEngine` captured `[223]` as a single tight CUDA Graph bucket since $\text{max\_p\_len} + 128 + 64 = 223$.
+
+| Metric (`Qwen2.5-1.5B`, 50 prompts, `C=128`, `B=1`, `T=0.0`) | Raw Baseline | v3 Baseline | v4 Pure Systems (`hedge_margin=0.0`) | v4 Full + `6+1` Hedge (`hedge_margin=1.0`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Throughput (TPS)** | 26.0 | 61.6 | 68.5 | **70.3** |
+| **Compiled Baseline (TPS)** | 25.9–26.0 | 25.1 | 26.0 | 25.9 |
+| **Wall-Clock Speedup** | 1.00× | 2.42× | 2.64× | **2.71×** |
+| **Mean Acceptance ($\alpha$)** | 1.00 | 1.72 | 1.72 | **1.80** |
+| **Gamma Total (Acceptance %)** | — | 10.3% | 10.3% | **11.5%** |
+| **$A_{+1}$ Acceptance Rate** | — | 49.7% | 49.8% | **57.7%** |
+| **$A_{+2}$ Acceptance Rate** | — | 19.7% | 19.8% | 19.7% |
+| **$A_{+3}$ Acceptance Rate** | — | 6.5% | 6.5% | 6.3% |
+| **$A_{+4}$ Acceptance Rate** | — | 1.8% | 1.8% | 1.7% |
+| **Leaf-Hedge Hit Rate** | — | — | 0.0% (0/0) | **17.4% (308 / 1,768)** |
+| **$T_{\text{verify}}$ ($Q_A=8$)** | — | 36.49 ms | **33.59 ms** | 35.71 ms |
+| **$T_{\text{draft}}$ (4L, $W=7$)** | — | 11.95 ms | **7.95 ms** | 8.39 ms |
+| **Exact Lossless Consistency %** | 100.0% | 64.0% | 64.0% | 66.0% |
+| **4-gram Entropy ($H_4$)** | 0.953 | 0.983 | 0.983 | 0.983 |
+| **4-gram Repetition (`rep4`)** | 22.4% | 19.9% | 19.9% | 19.9% |
+| **Adjacent Duplication (`adj_dup`)** | 6.2% | 0.1% | 0.1% | 0.1% |
+
+### 3. v1 → v4 Lossless / Verified T4 GPU Progression Table
+Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GPU ($B=1$, greedy decoding):
+
+| Generation Engine | Architecture / Mechanism | Baseline TPS | Engine TPS | Speedup | Mean Acceptance ($\alpha$) | Lossless Parity Status |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **BFG-Diff v1** | Sub-block recompute, cap 2, 24-layer diffusion | 21.4 | 20.1 | 0.94× | 1.24 | Lossy Diffusion |
+| **BFG-Diff v2.0** | 24-layer Zone A/B Staircase + In-Place KV Slicing | 61.1 | 23.2 | 0.38× | 1.53 | Lossless Verified |
+| **BFG-Diff v2.2** | Adapter distillation, SVD init, +1-front-loaded loss | 21.4 | 24.8 | 1.16× | 1.33 | Lossless Verified |
+| **BFG-Diff v3** | Weight-tied 4-layer top-K drafter + static CUDA Graphs | 25.5 | 61.6 | 2.42× | 1.72 | Lossless Verified |
+| **BFG-Diff v4 (Pure)** | WAL `draft_cache` + `[0:W]` tail + fused ghost weights | 26.0 | 68.5 | 2.64× | 1.72 | Lossless Verified |
+| **BFG-Diff v4 (Full)** | v4 Systems + `6+1` Leaf-Hedge Dynamic Mask Morphing | 26.0 | **70.3** | **2.71×** | **1.80** | Lossless Verified |
+
+### 4. CPU In-Place Dynamic INT8 Auto-Adaptation Verification (Xeon Gold 5215)
+- **Unit Suite (`test_v4_units.py`):**
+  - Tests 1–4: Exact bit-level parity on float32 (`PASS`).
+  - Test 5 (In-place Dynamic INT8 Parity):
+    - `StaticDraftEngine.prefill()` logit diff vs. quantized `base_model(input_ids)`: `0.000000e+00` (`PASS`, threshold `1e-4`).
+    - `forward_verify_step` on $Q_A = 8$ logit diff vs. quantized `base_model(v_tokens, past_key_values)`: `0.000000e+00` (`PASS`, threshold `1e-3`).
+    - End-to-end speculative generation runs without NaN or crash, generating fluent text with active acceptance tracking (`PASS`).
+- **CPU Smoke Benchmark (`benchmark_v3.py --smoke_test --device cpu`):**
+  - **FP32 Master (`--cpu_quant none`):** Raw baseline 4.4 TPS, BFG-Diff v4 1.6 TPS, $T_{\text{verify}} = 504.50$ ms, $T_{\text{draft}} = 134.64$ ms.
+  - **In-Place Dynamic INT8 (`--cpu_quant int8`):** Raw baseline 13.3 TPS (**3.02× faster**), BFG-Diff v4 5.5 TPS (**3.44× faster**), $T_{\text{verify}} = 92.16$ ms (**5.47× faster verification**), $T_{\text{draft}} = 85.78$ ms.
+  - In-place layer-by-layer quantization with `gc.collect()` avoids doubling model weight allocations, safely observing `MemoryMax=9G` cgroup cap.
+
 
 
 

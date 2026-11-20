@@ -90,7 +90,8 @@ class BottleneckFusion(nn.Module):
     def forward(self, tapped_states: List[torch.Tensor]) -> torch.Tensor:
         # tapped_states: list of 4 tensors (B, S, D)
         cat_h = torch.cat(tapped_states, dim=-1)  # (B, S, 4*D)
-        out = self.up(self.act(self.down(cat_h.to(self.down.weight.dtype))))
+        w_dtype = self.down.weight.dtype if isinstance(getattr(self.down, "weight", None), torch.Tensor) else cat_h.dtype
+        out = self.up(self.act(self.down(cat_h.to(w_dtype))))
         return self.norm(out).to(tapped_states[0].dtype)
 
 
@@ -124,7 +125,7 @@ class ManifoldAlignmentBridge(nn.Module):
         """Construct aligned draft block input of length W in Layer-(L-4) manifold."""
         B = y_star_emb.shape[0]
         dtype = y_star_emb.dtype
-        w_dtype = self.down.weight.dtype
+        w_dtype = self.down.weight.dtype if isinstance(getattr(self.down, "weight", None), torch.Tensor) else dtype
 
         # Slot 0 token embedding: y*
         norm_y = self.emb_norm(y_star_emb.to(w_dtype)) + self.slot_emb[0:1].unsqueeze(0).to(w_dtype)  # (B, 1, D)
@@ -552,3 +553,83 @@ def prepare_v3(
         p.requires_grad = True
 
     return base_model, drafter, tok, mask_id
+
+
+def quantize_for_cpu(
+    base_model: nn.Module,
+    drafter: WeightTiedTopKDrafter,
+    mode: str = "int8",
+) -> Tuple[nn.Module, WeightTiedTopKDrafter]:
+    """Auto-adapt model for CPU execution using dynamic INT8 (VNNI) or INT4 quantization.
+    
+    Strict order:
+    1. Merge ghost weights into drafter.ghost_layers on float32 master weights.
+    2. Quantize Linear layers in base_model (layers + lm_head) and drafter.ghost_layers
+       in-place layer-by-layer with immediate gc.collect() so peak startup RSS stays
+       safely under MemoryMax=9G cgroup cap.
+    Keeps embeddings and lightweight fusion/bridge modules unquantized for numerical stability.
+    """
+    import gc
+
+    mode = (mode or "none").lower().strip()
+    if mode in ("none", "fp32", "fp16", "bf16"):
+        return base_model, drafter
+
+    # 1. Merge ghost weights first on float32/master weights
+    if not getattr(drafter, "has_ghost_layers", False):
+        drafter.merge_ghost_weights(dtype=torch.float32)
+
+    # 2. Quantize Linear layers in-place layer by layer
+    if mode == "int8":
+        if hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
+            for i in range(len(base_model.model.layers)):
+                base_model.model.layers[i] = torch.ao.quantization.quantize_dynamic(
+                    base_model.model.layers[i], {nn.Linear}, dtype=torch.qint8
+                )
+                gc.collect()
+        if hasattr(base_model, "lm_head") and isinstance(base_model.lm_head, nn.Linear):
+            base_model.lm_head = torch.ao.quantization.quantize_dynamic(
+                nn.Sequential(base_model.lm_head), {nn.Linear}, dtype=torch.qint8
+            )[0]
+            gc.collect()
+
+        if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
+            for i in range(len(drafter.ghost_layers)):
+                drafter.ghost_layers[i] = torch.ao.quantization.quantize_dynamic(
+                    drafter.ghost_layers[i], {nn.Linear}, dtype=torch.qint8
+                )
+                gc.collect()
+        gc.collect()
+        print(f"[quantize_for_cpu] Applied in-place dynamic INT8 quantization to base model and ghost layers.")
+
+    elif mode == "int4":
+        try:
+            import torchao
+            from torchao.quantization import quantize_, int4_weight_only
+            quantize_(base_model, int4_weight_only())
+            if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
+                quantize_(drafter.ghost_layers, int4_weight_only())
+            print(f"[quantize_for_cpu] Applied torchao INT4 weight-only quantization.")
+        except Exception as e:
+            print(f"[quantize_for_cpu] torchao INT4 unavailable ({e}); falling back to in-place dynamic INT8.")
+            if hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
+                for i in range(len(base_model.model.layers)):
+                    base_model.model.layers[i] = torch.ao.quantization.quantize_dynamic(
+                        base_model.model.layers[i], {nn.Linear}, dtype=torch.qint8
+                    )
+                    gc.collect()
+            if hasattr(base_model, "lm_head") and isinstance(base_model.lm_head, nn.Linear):
+                base_model.lm_head = torch.ao.quantization.quantize_dynamic(
+                    nn.Sequential(base_model.lm_head), {nn.Linear}, dtype=torch.qint8
+                )[0]
+                gc.collect()
+            if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
+                for i in range(len(drafter.ghost_layers)):
+                    drafter.ghost_layers[i] = torch.ao.quantization.quantize_dynamic(
+                        drafter.ghost_layers[i], {nn.Linear}, dtype=torch.qint8
+                    )
+                    gc.collect()
+            gc.collect()
+
+    return base_model, drafter
+

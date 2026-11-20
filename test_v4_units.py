@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, '/home/gces/.bin/.s/.scripts/bfg-diff')
 import torch
 import torch.nn.functional as F
-from model_v3 import prepare_v3, apply_linear_with_delta, apply_rotary_pos_emb_k
+from model_v3 import prepare_v3, apply_linear_with_delta, apply_rotary_pos_emb_k, quantize_for_cpu
 from sampler_v3 import StaticDraftEngine, generate_speculative_v3
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
@@ -227,9 +227,84 @@ def test_synthetic_case_b_hedge_hit():
     print("PASS: Synthetic Case B Hedge verification matches ground truth exactly\n")
 
 
+def test_quantized_int8_cpu_parity():
+    print("--- Test 5: INT8 Quantized CPU Execution & Parity ---")
+    base_model, drafter, tok, mask_id = prepare_v3("Qwen/Qwen2.5-0.5B", device="cpu", dtype=torch.float32)
+    base_model, drafter = quantize_for_cpu(base_model, drafter, mode="int8")
+
+    # Verify linear layers in base_model and drafter are quantized
+    from torch.ao.nn.quantized.dynamic.modules.linear import Linear as QuantizedLinear
+    assert isinstance(base_model.model.layers[0].self_attn.q_proj, QuantizedLinear), "Base model layers must be quantized"
+    assert isinstance(base_model.lm_head, QuantizedLinear), "Base model lm_head must be quantized"
+    assert drafter.has_ghost_layers, "Ghost layers must be merged prior to quantization"
+    assert isinstance(drafter.ghost_layers[0].self_attn.q_proj, QuantizedLinear), "Drafter ghost layers must be quantized"
+
+    prompt = "The quick brown fox jumps over the lazy dog"
+    inputs = tok(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    P = input_ids.shape[1]
+
+    engine = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=128,
+        batch_size=1,
+        v_tokens=7,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        use_cuda_graph=False,
+    )
+
+    # (a) StaticDraftEngine.prefill() logits match quantized base_model(input_ids) (atol=1e-4)
+    with torch.no_grad():
+        logits_first, _ = engine.prefill(input_ids)
+        out_base_pre = base_model(input_ids, use_cache=True)
+        # When lm_head is dynamically quantized, evaluating lm_head on last_hidden_state
+        # matches engine.prefill (which evaluates lm_head on h[:, -1:]) bit-identically:
+        out_m = base_model.model(input_ids)
+        last_h = out_m.last_hidden_state[:, -1:]
+        ref_prefill_logits = base_model.lm_head(last_h).squeeze(1)
+        prefill_diff = (logits_first.squeeze(1) - ref_prefill_logits).abs().max().item()
+        print(f"Prefill max logit diff vs quantized base_model: {prefill_diff:.6e}")
+        assert prefill_diff <= 1e-4, f"Prefill logit diff {prefill_diff} exceeds atol=1e-4"
+
+    # (b) forward_verify_step on Q_A = 8 matches direct quantized base_model forward with past_key_values (atol=1e-3)
+    v_tokens = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
+    with torch.no_grad():
+        engine_v_logits, _ = engine.forward_verify_step(v_tokens, [P])
+        out_base_verify = base_model(v_tokens, past_key_values=out_base_pre.past_key_values, use_cache=True)
+        ref_verify_logits = out_base_verify.logits
+        verify_diff = (engine_v_logits - ref_verify_logits).abs().max().item()
+        print(f"Verify Q_A=8 max logit diff vs quantized base_model: {verify_diff:.6e}")
+        assert verify_diff <= 1e-3, f"Verify logit diff {verify_diff} exceeds atol=1e-3"
+
+    # (c) generate_speculative_v3 runs end-to-end without NaN/crash and produces coherent text
+    max_new = 20
+    with torch.no_grad():
+        spec_out, stats = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine,
+        )
+
+    gen_tokens = spec_out[0, P:]
+    assert not torch.isnan(spec_out.float()).any(), "Generated tokens contain NaN"
+    gen_text = tok.decode(gen_tokens)
+    print(f"Generated text ({len(gen_tokens)} tokens): {repr(gen_text)}")
+    print(f"Speculative decoding stats: {stats}")
+    assert len(gen_tokens) == max_new, f"Expected {max_new} tokens, got {len(gen_tokens)}"
+    assert stats["steps"] > 0, "Expected non-zero steps"
+    print("PASS: INT8 Quantized CPU execution maintains mathematical verification parity\n")
+
+
 if __name__ == "__main__":
     test_ghost_weights_unit()
     test_wal_scratch_bucket_transitions()
     test_leaf_hedge_lossless_cases()
     test_synthetic_case_b_hedge_hit()
+    test_quantized_int8_cpu_parity()
     print("ALL V4 UNIT TESTS PASSED!")

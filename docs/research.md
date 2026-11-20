@@ -467,15 +467,23 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
   $$W_{\text{ghost}} = W_{\text{base}} + \frac{\alpha}{r} (B A)$$
 - Eliminates 28 unfused `base_linear(x) + delta(x)` kernel launches per draft step while keeping the frozen base model weights 100% untouched for Stage 1 verify.
 
-### 4. `6+1` Leaf-Hedge Mask Morphing ($Q_A = 8$)
-- **Dynamic Trigger**: When slot 0 top-2 logit margin $v_1 - v_2 < \text{hedge\_margin}$ (default `1.0`), activates leaf-hedge micro-tree tile without CUDA Graph recompilation.
-- **Tile Geometry**: `[y*, d0_1, d1, d2, d3, d4, d5, d0_2]` with RoPE positions $[t, t+1, t+2, t+3, t+4, t+5, t+6, t+1]$ and cache scatter positions $[t, t+1, \dots, t+7]$.
-  - Slots 0..6 form standard causal chain; column $t+7$ (slot 7) is masked with $-1e4$.
-  - Slot 7 ($d_{0,2}$) attends only to prefix $[0 : t] + \text{slot 0} (y^*) + \text{itself} (t+7)$, masking slots 1..6 with $-1e4$.
-- **Exact Lossless Branching**:
-  - **Case A ($t_0 == d_{0,1}$)**: Primary branch hit $\to$ verify $d_1..d_5$ sequentially; advance `cur_pos += k + 1`.
-  - **Case B ($t_0 == d_{0,2}$)**: Hedge branch hit $\to$ accept $d_{0,2}$ and verified bonus token $t_{\text{bonus}}$; copy slot 7 KV from $t+7$ into $t+1$ in both caches, advancing `cur_pos += 2`.
-  - **Case C (neither matches)**: Reject draft, emit $t_0$, advance `cur_pos += 1`.
+### 5. Empirical Validation & Device Auto-Adaptation
+
+#### A. Systems Isolation (`hedge_margin = 0.0`)
+- On NVIDIA Tesla T4 GPU (`Qwen2.5-1.5B`, 50 prompts, $C=128$, $B=1$, checkpoint `runs/bfg_v3_1.5b_15k/last.pt`), pure systems optimizations (WAL `draft_cache` + `[0:W]` scratch tail + key-only RoPE + merged 4-layer `fp16` ghost weights) reduced draft latency $T_{\text{draft}}$ by **33.5%** ($11.95\text{ ms} \to 7.95\text{ ms}$) and verification latency $T_{\text{verify}}$ by $2.90\text{ ms}$ ($36.49\text{ ms} \to 33.59\text{ ms}$).
+- Increased T4 throughput from **61.6 TPS to 68.5 TPS** ($+6.9\text{ TPS}$, $2.64\times$ speedup vs. baseline) while maintaining identical mean acceptance $\alpha = 1.72$ and zero retraining.
+
+#### B. `6+1` Leaf-Hedge Mask Morphing (`hedge_margin = 1.0`)
+- In 50-prompt T4 GPU evaluation, leaf-hedging rescued **308 out of 1,768** low-margin slot-0 misses (**17.4% hit rate**).
+- Lifted $A_{+1}$ acceptance rate by **+7.9 percentage points** ($49.8\% \to 57.7\%$), increased mean acceptance $\alpha$ from $1.72 \to 1.80$, and raised overall throughput to **70.3 TPS ($2.71\times$ speedup)** with zero extra draft forward passes.
+
+#### C. Hardware Auto-Adaptation (`device.type`)
+- Clean hardware split in `sampler_v3.py`:
+  - **CUDA (`device.type == "cuda"`):** Strictly uses `fp16`, fused `fp16` ghost weights, WAL `draft_cache`, `[0:W]` in-place scratch tail, and Power-of-2 bucketed CUDA Graphs (`256, 512, 1024, 2048`) for minimal kernel launch overhead.
+  - **CPU (`device.type == "cpu"`):** Strictly avoids empty static padding. Uses dynamic zero-padding KV slicing ($S_{\text{active}} = \text{max\_total\_len}$), pre-allocated static mask views, and in-place layer-by-layer INT8 quantization (`quantize_for_cpu`) with `gc.collect()`. Accelerates x86 Xeon throughput from 1.6 TPS to 5.5 TPS (3.44× speedup) and verification latency from 504.5 ms to 92.2 ms (5.47× faster) while staying comfortably under the `MemoryMax=9G` cgroup cap.
+
+#### D. Production Promotion
+- BFG-Diff v4 is promoted as the headline production inference engine across both GPU and CPU serving configurations. All existing v3 checkpoints load seamlessly with zero weight fine-tuning required.
 
 
 

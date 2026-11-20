@@ -25,8 +25,25 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 
-from model_v3 import prepare_v3
+from model_v3 import prepare_v3, quantize_for_cpu
 from sampler_v3 import generate_speculative_v3, StaticDraftEngine
+
+def setup_cpu_threads():
+    """Auto-detect physical core count and pin PyTorch CPU execution once at startup."""
+    if not torch.cuda.is_available():
+        omp_threads = os.environ.get("OMP_NUM_THREADS")
+        if omp_threads:
+            n_threads = int(omp_threads)
+        else:
+            n_threads = max(1, (os.cpu_count() or 2) // 2)
+        torch.set_num_threads(n_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        print(f"[setup_cpu_threads] Pinned CPU execution to {n_threads} physical threads (interop=1)")
+
+setup_cpu_threads()
 
 # 50 unique diverse prompts
 GEN_PROMPTS = [
@@ -143,6 +160,7 @@ def run_benchmark(
     batch_size: int = 1,
     temperature: float = 0.0,
     hedge_margin: float = 1.0,
+    cpu_quant: str = "int8",
     device: str = "auto",
     smoke_test: bool = False,
 ):
@@ -154,8 +172,9 @@ def run_benchmark(
         max_new_tokens = 16
         batch_size = 1
 
+    cpu_quant_mode = cpu_quant if device == "cpu" else "none"
     print("=" * 80)
-    print(f"BFG-Diff v3 Benchmark | Model: {model_name} | Device: {device} | Prompts: {num_prompts} | C: {max_new_tokens} | B: {batch_size}")
+    print(f"BFG-Diff v4 Benchmark | Model: {model_name} | Device: {device} (CPU Quant: {cpu_quant_mode}) | Prompts: {num_prompts} | C: {max_new_tokens} | B: {batch_size}")
     print("=" * 80)
 
     base_dtype = torch.float16 if device == "cuda" else torch.float32
@@ -168,6 +187,10 @@ def run_benchmark(
         print("Loaded drafter weights successfully.")
 
     drafter.merge_ghost_weights(dtype=base_dtype)
+
+    if device == "cpu" and cpu_quant in ("int8", "int4"):
+        print(f"Auto-adapting for CPU: applying {cpu_quant.upper()} quantization...")
+        base_model, drafter = quantize_for_cpu(base_model, drafter, mode=cpu_quant)
 
     prompts = GEN_PROMPTS[:num_prompts]
     tok.padding_side = "left"
@@ -403,6 +426,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--hedge_margin", type=float, default=1.0)
+    p.add_argument("--cpu_quant", default="int8", choices=["int8", "int4", "none"], help="CPU quantization mode (default: int8)")
     p.add_argument("--device", default="auto")
     p.add_argument("--smoke_test", action="store_true")
     args = p.parse_args()
@@ -415,6 +439,7 @@ def main():
         batch_size=args.batch_size,
         temperature=args.temperature,
         hedge_margin=args.hedge_margin,
+        cpu_quant=args.cpu_quant,
         device=args.device,
         smoke_test=args.smoke_test,
     )

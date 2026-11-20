@@ -23,9 +23,26 @@ import torch
 from peft import set_peft_model_state_dict
 
 from model import LORA_TARGETS, apply_lora, prepare
-from model_v3 import prepare_v3
+from model_v3 import prepare_v3, quantize_for_cpu
 from sampler import sample_canvas
 from sampler_v3 import StaticDraftEngine
+
+def setup_cpu_threads():
+    """Auto-detect physical core count and pin PyTorch CPU execution once at startup."""
+    if not torch.cuda.is_available():
+        omp_threads = os.environ.get("OMP_NUM_THREADS")
+        if omp_threads:
+            n_threads = int(omp_threads)
+        else:
+            n_threads = max(1, (os.cpu_count() or 2) // 2)
+        torch.set_num_threads(n_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        print(f"[setup_cpu_threads] Pinned CPU execution to {n_threads} physical threads (interop=1)")
+
+setup_cpu_threads()
 
 V3_CONFIGS = {
     "1.5b-instruct": {
@@ -53,16 +70,15 @@ V3_CONFIGS = {
 
 
 class V3ModelManager:
-    """Thread-safe manager that keeps a single BFG-Diff v3 model resident."""
+    """Thread-safe manager that keeps a single BFG-Diff v4 model resident."""
 
-    def __init__(self, device: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None, cpu_quant: str = "int8"):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
-        # bf16 halves the memory of the 1.5B weights on CPU (no native AVX512-BF16
-        # on this Xeon, so compute is converted to fp32 internally -- same speed
-        # class as fp32, less RAM).
-        self.dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
+        self.cpu_quant = (cpu_quant or "int8").lower().strip() if self.device.type == "cpu" else "none"
+        # On CUDA: strictly fp16. On CPU: fp32 master load (then INT8 dynamic quantize if enabled).
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
         self._models: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -109,6 +125,11 @@ class V3ModelManager:
             drafter.eval()
             base_model.eval()
 
+            # Auto-adapt for CPU if quantization mode is active
+            if self.device.type == "cpu" and self.cpu_quant in ("int8", "int4"):
+                print(f"[V3ModelManager] Auto-adapting for CPU: applying {self.cpu_quant.upper()} quantization...")
+                base_model, drafter = quantize_for_cpu(base_model, drafter, mode=self.cpu_quant)
+
             engine = StaticDraftEngine(
                 base_model=base_model,
                 drafter=drafter,
@@ -142,10 +163,9 @@ def generate_v3_stream(
     stop_tokens: Optional[List[str]] = None,
     step_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
-    """100% Lossless Speculative Streaming with BFG-Diff v3 Drafter.
+    """100% Lossless Speculative Streaming with BFG-Diff v4 Drafter.
     Streams accepted tokens and verification metrics step-by-step.
     """
-    torch.set_num_threads(10)
     tok = bundle["tok"]
     mask_id = bundle["mask_id"]
     engine = bundle["engine"]
@@ -237,16 +257,9 @@ def generate_v3_stream(
         cur_pos_prev = cur_pos
         cur_pos += num_committed
 
-        # Update bonus token and feature for next step
+        # Update bonus token and feature for next step (WAL already wrote KV ahead)
         next_token = target_tokens[0:1, k : k + 1]
         f_ctx_last = f_ctx_verify[0:1, k : k + 1]
-
-        # Commit accepted vectors into draft cache
-        engine.commit_accepted_tokens(
-            f_ctx_new=f_ctx_verify,
-            cur_pos_prev_list=[cur_pos_prev],
-            k_list=[num_committed],
-        )
 
         elapsed = time.perf_counter() - start_time
         current_text = tok.decode(generated_tokens, skip_special_tokens=False)
@@ -328,7 +341,6 @@ def generate_v3_traced(
 
 def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B", device=None):
     """Load base Qwen model and apply checkpoint adapters."""
-    torch.set_num_threads(10)
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
@@ -393,7 +405,6 @@ def generate_bfg_stream(
     tau=0.8,
 ):
     """Generate tokens using sample_canvas while streaming step-by-step updates via callback."""
-    torch.set_num_threads(10)
     with torch.no_grad():
         prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
 
@@ -490,7 +501,6 @@ def generate_bfg_traced(
     tau=0.8,
 ):
     """Generate tokens using unified sampler.py while capturing step-by-step traces."""
-    torch.set_num_threads(10)
     with torch.no_grad():
         prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
 
@@ -2445,6 +2455,9 @@ def main():
     parser.add_argument(
         "--device", default="auto", choices=["auto", "cuda", "cpu"], help="Compute device"
     )
+    parser.add_argument(
+        "--cpu_quant", default="int8", choices=["int8", "int4", "none"], help="CPU quantization mode (default: int8)"
+    )
     args = parser.parse_args()
     args.checkpoint_specified = ("--checkpoint" in sys.argv)
     ckpt_override = None
@@ -2455,7 +2468,7 @@ def main():
             print(f"[Notice] Legacy checkpoint argument '{args.checkpoint}' ignored in v3; using production v3 checkpoint.")
 
     device = "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
-    model_mgr = V3ModelManager(device=device)
+    model_mgr = V3ModelManager(device=device, cpu_quant=args.cpu_quant)
 
     if args.server:
         print(f"Pre-warming production default model ({args.model})...")
