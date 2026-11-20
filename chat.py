@@ -25,7 +25,7 @@ from peft import set_peft_model_state_dict
 from model import LORA_TARGETS, apply_lora, prepare
 from model_v3 import prepare_v3, quantize_for_cpu
 from sampler import sample_canvas
-from sampler_v3 import StaticDraftEngine
+from sampler_v3 import StaticDraftEngine, generate_speculative_v3
 
 def setup_cpu_threads():
     """Auto-detect physical core count and pin PyTorch CPU execution once at startup."""
@@ -138,7 +138,7 @@ class V3ModelManager:
                 drafter=drafter,
                 max_len=2048,
                 batch_size=1,
-                v_tokens=7,
+                v_tokens=7 if self.device.type == "cuda" else 3,
                 device=self.device,
                 dtype=self.dtype,
                 use_cuda_graph=(self.device.type == "cuda"),
@@ -161,13 +161,14 @@ def generate_v3_stream(
     bundle: dict,
     prompt_text: str,
     max_new_tokens: int = 64,
-    v_tokens: int = 7,  # Q_A = 8
+    v_tokens: Optional[int] = None,
     temperature: float = 0.0,
+    hedge_margin: float = 1.0,
     stop_tokens: Optional[List[str]] = None,
     step_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """100% Lossless Speculative Streaming with BFG-Diff v4 Drafter.
-    Streams accepted tokens and verification metrics step-by-step.
+    Streams accepted tokens and verification metrics step-by-step using generate_speculative_v3.
     """
     tok = bundle["tok"]
     mask_id = bundle["mask_id"]
@@ -180,130 +181,92 @@ def generate_v3_stream(
     B, P = input_ids.shape
     assert B == 1, "Streaming generation currently requires B=1"
 
-    start_time = time.perf_counter()
-
-    # Capture CUDA Graph if on CUDA and not yet captured
-    if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
-        if engine.cuda_graph_verify is None or engine.cuda_graph_draft is None:
-            engine.capture_cuda_graphs(mask_id)
-
-    # 1. Prefill
-    logits_0, f_ctx_last = engine.prefill(input_ids)
-    if temperature == 0.0:
-        next_token = torch.argmax(logits_0[:, -1:], dim=-1)
-    else:
-        probs = torch.softmax(logits_0[:, -1:] / max(1e-4, temperature), dim=-1)
-        next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
-
-    generated_tokens = [int(next_token[0, 0])]
-    cur_pos = P
-    accepted_draft_tokens = 0
-    steps = 0
-    total_draft_tokens = 0
-
     stop_token_ids = set()
     if tok.eos_token_id is not None:
         stop_token_ids.add(tok.eos_token_id)
     if stop_tokens:
         for st in stop_tokens:
+            ids = tok.encode(st, add_special_tokens=False)
+            if ids:
+                stop_token_ids.add(ids[0])
             tid = tok.convert_tokens_to_ids(st)
-            if tid is not None and tid != tok.unk_token_id:
+            if tid is not None and tid != getattr(tok, "unk_token_id", None):
                 stop_token_ids.add(tid)
 
-    hit_stop = generated_tokens[-1] in stop_token_ids
+    start_time = time.perf_counter()
+    accumulated_tokens = []
 
-    # Step-by-step speculative verification loop
-    while not hit_stop and len(generated_tokens) < max_new_tokens:
-        y_star = next_token  # (1, 1) concrete bonus token at position cur_pos
-
-        # Stage 2: Draft W=7 tokens
-        draft_ids = engine.forward_draft_step(
-            y_star_ids=y_star,
-            mask_token_id=mask_id,
-            f_ctx_last=f_ctx_last,
-            cur_pos_list=[cur_pos],
-        )
-
-        # Stage 1: Verify Q_A=8 tokens: [y*, d_0..d_6] at positions [cur_pos .. cur_pos+7]
-        verify_input = torch.cat([y_star, draft_ids], dim=-1)
-        verify_logits, f_ctx_verify = engine.forward_verify_step(verify_input, cur_pos_list=[cur_pos])
-
-        target_tokens = torch.argmax(verify_logits, dim=-1)  # (1, 8)
-
-        # Match draft against target
-        k = 0
-        for j in range(v_tokens):
-            if draft_ids[0, j] == target_tokens[0, j]:
-                k += 1
-            else:
-                break
-
-        if k > 0:
-            step_committed_tensors = torch.cat([draft_ids[0, :k], target_tokens[0, k : k + 1]], dim=0)
-        else:
-            step_committed_tensors = target_tokens[0, 0:1]
-
-        step_committed = [int(t) for t in step_committed_tensors]
-
-        for idx_c, tid in enumerate(step_committed):
-            if tid in stop_token_ids:
-                step_committed = step_committed[: idx_c]
-                hit_stop = True
-                break
-
-        generated_tokens.extend(step_committed)
-        accepted_draft_tokens += k
-        total_draft_tokens += v_tokens
-        steps += 1
-
-        num_committed = k + 1
-        cur_pos_prev = cur_pos
-        cur_pos += num_committed
-
-        # Update bonus token and feature for next step (WAL already wrote KV ahead)
-        next_token = target_tokens[0:1, k : k + 1]
-        f_ctx_last = f_ctx_verify[0:1, k : k + 1]
-
+    def on_step(evt):
+        if not step_callback:
+            return
+        c_tokens = evt["committed_tokens"]
+        accumulated_tokens.extend(c_tokens)
         elapsed = time.perf_counter() - start_time
-        current_text = tok.decode(generated_tokens, skip_special_tokens=False)
+        current_text = tok.decode(accumulated_tokens, skip_special_tokens=False)
         for st in (stop_tokens or []):
             if st in current_text:
                 current_text = current_text.split(st)[0]
         current_text = current_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-        tps = len(generated_tokens) / max(1e-5, elapsed)
+        tps = len(accumulated_tokens) / max(1e-5, elapsed)
+        token_strs = [tok.decode([t]) for t in c_tokens] if c_tokens else ["░"]
+        step_callback({
+            "type": "bfg_step",
+            "block_idx": evt["step"] - 1,
+            "step": evt["step"],
+            "tokens": token_strs,
+            "text": current_text,
+            "unmasked": len(c_tokens),
+            "tps": tps,
+            "elapsed": elapsed,
+            "accepted": evt.get("accepted", 0),
+            "is_hedge": evt.get("is_hedge", False),
+            "hedge_hit": evt.get("hedge_hit", False),
+            "q_a": evt.get("q_a", engine.q_a),
+        })
 
-        if step_callback:
-            token_strs = [tok.decode([t]) for t in step_committed] if step_committed else ["░"]
-            step_callback({
-                "type": "bfg_step",
-                "block_idx": steps - 1,
-                "step": steps,
-                "tokens": token_strs,
-                "text": current_text,
-                "unmasked": len(step_committed),
-                "tps": tps,
-                "elapsed": elapsed,
-                "accepted": k,
-                "q_a": 8,
-            })
+    with torch.no_grad():
+        out_ids, stats = generate_speculative_v3(
+            base_model=bundle["base_model"],
+            drafter=bundle["drafter"],
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new_tokens,
+            v_tokens=v_tokens if v_tokens is not None else engine.v_tokens,
+            temperature=temperature,
+            eos_token_id=tok.eos_token_id,
+            stop_token_ids=stop_token_ids,
+            use_cuda_graph=(device.type == "cuda"),
+            engine=engine,
+            hedge_margin=hedge_margin,
+            step_callback=on_step if step_callback is not None else None,
+        )
 
     elapsed = time.perf_counter() - start_time
-    full_text = tok.decode(generated_tokens, skip_special_tokens=False)
+    gen_tokens = out_ids[0, P:].tolist()
+    for idx_t, tid in enumerate(gen_tokens):
+        if tid in stop_token_ids:
+            gen_tokens = gen_tokens[:idx_t]
+            break
+
+    full_text = tok.decode(gen_tokens, skip_special_tokens=False)
     for st in (stop_tokens or []):
         if st in full_text:
             full_text = full_text.split(st)[0]
     full_text = full_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-    tps = len(generated_tokens) / max(1e-5, elapsed)
-    alpha = (accepted_draft_tokens + steps) / max(1, steps)
+
+    tps = len(gen_tokens) / max(1e-5, elapsed)
+    alpha = stats.get("alpha", 1.0)
+    steps = stats.get("steps", len(gen_tokens))
 
     return {
         "text": full_text,
-        "tokens": len(generated_tokens),
+        "tokens": len(gen_tokens),
         "elapsed": elapsed,
         "tps": tps,
         "alpha": alpha,
         "steps": steps,
         "badge": f"{tps:.1f} TPS | α={alpha:.2f} tok/step",
+        "stats": stats,
     }
 
 
@@ -582,7 +545,7 @@ def generate_bfg_traced(
     }
 
 
-def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=None, stop_tokens=None):
+def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=None, stop_tokens=None, temperature: float = 0.0):
     """Generate baseline response using causal next-token loop with KV cache streaming callback."""
     prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
     start_time = time.perf_counter()
@@ -597,7 +560,12 @@ def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=
     with torch.no_grad():
         out = model(prefix_ids, use_cache=True)
         past_key_values = out.past_key_values
-        next_id = int(out.logits[0, -1].argmax())
+        logits_step = out.logits[0, -1]
+        if temperature > 0.0:
+            probs = torch.softmax(logits_step / max(1e-4, temperature), dim=-1)
+            next_id = int(torch.multinomial(probs, 1))
+        else:
+            next_id = int(logits_step.argmax())
 
         for _ in range(max_new_tokens):
             if next_id == tok.eos_token_id or (tok.pad_token_id and next_id == tok.pad_token_id) or next_id in stop_token_ids:
@@ -615,7 +583,12 @@ def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=
             curr_id = torch.tensor([[next_id]], device=model.device)
             out = model(curr_id, past_key_values=past_key_values, use_cache=True)
             past_key_values = out.past_key_values
-            next_id = int(out.logits[0, -1].argmax())
+            logits_step = out.logits[0, -1]
+            if temperature > 0.0:
+                probs = torch.softmax(logits_step / max(1e-4, temperature), dim=-1)
+                next_id = int(torch.multinomial(probs, 1))
+            else:
+                next_id = int(logits_step.argmax())
 
     elapsed = time.perf_counter() - start_time
     full_text = tok.decode(generated_ids, skip_special_tokens=True)
@@ -1485,43 +1458,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="custom-menu-item selected" onclick="pickCustomPreset('balanced', 'Balanced Standard', this)">
                 <div>
                   <div style="font-weight:500;">Balanced Standard</div>
-                  <div class="item-sub">T=0.3 · 4 passes · calibrated lookahead</div>
+                  <div class="item-sub">T=0.0 · Hedge Margin=1.0 · high speculative throughput</div>
+                </div>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Pure Argmax (Greedy)', this)">
+                <div>
+                  <div style="font-weight:500;">Pure Argmax</div>
+                  <div class="item-sub">T=0.0 · exact greedy decoding for benchmarks</div>
+                </div>
+              </div>
+              <div class="custom-menu-item" onclick="pickCustomPreset('code', 'Code & Exact Syntax', this)">
+                <div>
+                  <div style="font-weight:500;">Code & Exact Syntax</div>
+                  <div class="item-sub">T=0.0 · strict hedge margin=0.5 · zero hallucinations</div>
                 </div>
               </div>
               <div class="custom-menu-item" onclick="pickCustomPreset('snappy', 'Snappy Low-Latency', this)">
                 <div>
                   <div style="font-weight:500;">Snappy Low-Latency</div>
-                  <div class="item-sub">T=0.2 · 2 passes · immediate stop termination</div>
+                  <div class="item-sub">T=0.0 · C=24 · immediate stop termination</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('branching', 'Multi-Branch Speculative', this)">
+              <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative Dialogue', this)">
                 <div>
-                  <div style="font-weight:500;">Multi-Branch Speculative</div>
-                  <div class="item-sub">2-branch micro-tree · parallel runner-up exploration</div>
-                </div>
-              </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('code', 'Code & Strict Syntax', this)">
-                <div>
-                  <div style="font-weight:500;">Code & Strict Syntax</div>
-                  <div class="item-sub">T=0.0 · strict tau=0.4 · zero hallucinations</div>
-                </div>
-              </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('infill', 'High-Throughput Infilling', this)">
-                <div>
-                  <div style="font-weight:500;">High-Throughput Infilling</div>
-                  <div class="item-sub">C=48 · sub-blocks=16 · parallel span completion</div>
-                </div>
-              </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('creative', 'Creative Narrative', this)">
-                <div>
-                  <div style="font-weight:500;">Creative Narrative</div>
-                  <div class="item-sub">T=0.7 · anti-loop frequency suppression</div>
-                </div>
-              </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Pure Deterministic', this)">
-                <div>
-                  <div style="font-weight:500;">Pure Argmax</div>
-                  <div class="item-sub">T=0.0 · exact greedy decoding for benchmarks</div>
+                  <div style="font-weight:500;">Creative Dialogue</div>
+                  <div class="item-sub">T=0.7 · Hedge Margin=1.5 · sampled speculative</div>
                 </div>
               </div>
             </div>
@@ -1537,27 +1498,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
           <div class="modal-field">
             <label>Temperature</label>
-            <input type="number" id="cfgTemp" value="0.3" min="0.0" max="1.5" step="0.1">
+            <input type="number" id="cfgTemp" value="0.0" min="0.0" max="1.5" step="0.1">
           </div>
           <div class="modal-field">
-            <label>Canvas Tokens</label>
-            <input type="number" id="cfgCanvas" value="32" min="8" max="256" step="8">
+            <label>Canvas Tokens (Max)</label>
+            <input type="number" id="cfgCanvas" value="48" min="8" max="256" step="8">
           </div>
           <div class="modal-field">
-            <label>Sub-Block Size</label>
-            <input type="number" id="cfgSubCanvas" value="8" min="4" max="32" step="4">
+            <label>Hedge Margin (&Delta; top-2)</label>
+            <input type="number" id="cfgHedgeMargin" value="1.0" min="0.0" max="5.0" step="0.2">
           </div>
-          <div class="modal-field">
-            <label>Diffusion Sub-Steps</label>
-            <input type="number" id="cfgSubSteps" value="4" min="1" max="16" step="1">
-          </div>
-          <div class="modal-field">
-            <label>Lookahead Tau</label>
-            <input type="number" id="cfgTau" value="0.8" min="0.1" max="2.0" step="0.1">
-          </div>
-          <div class="modal-field" style="grid-column: span 2; display:flex; flex-direction:row; align-items:center; justify-content:space-between; padding-top:4px;">
-            <label style="cursor:pointer;" for="cfgBranching">2-Branch Micro-Tree (Pillar 4)</label>
-            <input type="checkbox" id="cfgBranching" style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">
+          <div class="modal-field" style="grid-column: span 2;">
+            <label>Draft Window W (v_tokens)</label>
+            <select id="cfgVTokens">
+              <option value="auto" selected>Auto (3 on CPU, 7 on CUDA)</option>
+              <option value="3">W = 3 (Fast CPU · 2+1 Leaf-Hedge)</option>
+              <option value="7">W = 7 (High Speculative · 6+1 Leaf-Hedge)</option>
+            </select>
           </div>
         </div>
       </div>
@@ -1638,24 +1595,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="vis-card">
         <div class="vis-header">
           <span class="vis-title">Architecture Overview</span>
-          <span class="vis-meta">BFG-Diff v2 · Fused Staircase Engine</span>
+          <span class="vis-meta">BFG-Diff v4 · Dual-Engine Speculative Transformer</span>
         </div>
         <div style="padding: 18px 20px; font-size: 13.5px; line-height: 1.65; color: var(--text-primary); display: flex; flex-direction: column; gap: 12px;">
           <p>
-            Standard language models generate text strictly sequentially (one forward pass per token). 
-            <strong>BFG-Diff</strong> transforms a pretrained causal transformer into a discrete block-diffusion engine, evaluating and verifying multiple tokens in parallel blocks across 2 to 4 forward steps.
+            Standard autoregressive language models generate text sequentially (one forward pass per token, bound by memory bandwidth). 
+            <strong>BFG-Diff v4</strong> couples the pretrained base model with a lightweight weight-tied 4-layer drafter, verifying multi-token candidate blocks in parallel with 100% lossless parity.
           </p>
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 6px;">
             <div style="background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px;">
-              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #38bdf8; margin-bottom: 4px;">Zone A: Causal Verification</div>
+              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #38bdf8; margin-bottom: 4px;">Fused Ghost Weights (Zero Overhead)</div>
               <p style="font-size: 12.5px; color: var(--text-secondary);">
-                Evaluates prior draft tokens under a strictly causal attention mask. Completely isolated from trailing mask tokens (zero attention leakage).
+                Tapped layers fold LoRA deltas directly into base weights at startup: W = W_base + (&alpha;/r)(B &times; A). Eliminates 28 kernel launches per draft step with zero runtime FLOP waste.
               </p>
             </div>
             <div style="background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px;">
-              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #a855f7; margin-bottom: 4px;">Zone B: Lookahead Diffusion</div>
+              <div style="font-family: var(--mono-font); font-size: 11px; font-weight: 600; color: #a855f7; margin-bottom: 4px;">WAL on GPU / Lazy Commit on CPU</div>
               <p style="font-size: 12.5px; color: var(--text-secondary);">
-                Simultaneously diffuses future tokens on lookahead positions using bidirectional attention in the exact same forward pass.
+                On CUDA: 100% CUDA-Graph bound with Power-of-2 Bucketed Graphs (256..2048) and [0:W] scratch tail. On CPU: zero-padding dynamic slicing and Lazy Commit projecting only accepted tokens.
               </p>
             </div>
           </div>
@@ -1673,46 +1630,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
               1. Canvas Tokens (<code style="color:#38bdf8;">canvas_len</code>)
             </div>
             <p>
-              The maximum total length of output text to generate (e.g., 24, 32, 48 tokens). When stop tokens like <code>&lt;|im_end|&gt;</code> are carrier-verified in chat mode, generation terminates early to save latency.
+              The maximum total length of output tokens to generate. Generation terminates early upon encountering ChatML delimiters (<code>&lt;|im_end|&gt;</code>) in chat mode.
             </p>
           </div>
 
           <div>
             <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
-              2. Sub-Block Size (<code style="color:#38bdf8;">sub_canvas_len</code>)
+              2. Temperature (<code style="color:#38bdf8;">temperature</code>)
             </div>
             <p>
-              The size of the sliding parallel attention window. A size of <strong>8</strong> offers tight left-carrier grounding and lowest repetition. Larger windows (<strong>16</strong> or <strong>32</strong>) increase throughput for span infilling by batching more positions into GPU matrix multiplications.
+              Sampling temperature. <strong>0.0</strong> enforces strict deterministic argmax decoding (exact mathematical parity with greedy base model). Values &gt; 0.0 enable multinomial sampling across both speculative verification and causal baseline.
             </p>
           </div>
 
           <div>
             <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
-              3. Diffusion Sub-Steps (<code style="color:#38bdf8;">sub_steps</code>)
+              3. Leaf-Hedge Margin (<code style="color:#38bdf8;">hedge_margin</code> &middot; 6+1 Micro-Tree)
             </div>
             <p>
-              The number of iterative forward passes allowed per sub-block. 
-              <strong>4 steps</strong> provides maximum token precision and grammar stability. 
-              <strong>2 steps</strong> cuts latency in half for snappy, sub-second responses.
+              When runner-up draft confidence is close to the top candidate (&Delta; top-2 &le; margin), the verification tile morphs slot Q_A-1 into a parallel hedge branch. Rescues near-tie draft misses without any additional forward passes (+7.9 pp acceptance lift).
             </p>
           </div>
 
           <div>
             <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
-              4. Lookahead Tau (<code style="color:#38bdf8;">tau</code>)
+              4. Draft Window W (<code style="color:#38bdf8;">v_tokens</code>)
             </div>
             <p>
-              Calibrated energy difference tolerance: <code>(z_top - z_draft) &le; &tau;</code>. 
-              Controls how confident the model must be to accept speculative lookahead tokens. Lower values (<strong>0.4</strong>) enforce strict conservative acceptance (ideal for code). Higher values (<strong>0.8 &ndash; 1.0</strong>) accept more tokens in parallel.
-            </p>
-          </div>
-
-          <div>
-            <div style="font-family: var(--mono-font); font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
-              5. 2-Branch Micro-Tree Verification (<code style="color:#38bdf8;">enable_branching</code> &middot; Pillar 4)
-            </div>
-            <p>
-              When the primary draft token has a narrow margin over runner-up candidates, the engine forks Zone A into two parallel hypothesis branches evaluated under a 2D tree mask. If branch 2 wins, its KV states are copied in-place, preventing draft rejections.
+              Number of speculative draft tokens generated per step. Defaults to <strong>W = 7</strong> (Q_A = 8) on CUDA for maximum parallel saturation, and <strong>W = 3</strong> (Q_A = 4, 2+1 micro-tree) on CPU to balance verification compute vs. acceptance rate.
             </p>
           </div>
         </div>
@@ -1729,60 +1674,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <tr style="border-bottom: 1px solid var(--border); color: var(--text-primary); font-family: var(--mono-font);">
                 <th style="padding: 8px 6px;">Preset</th>
                 <th style="padding: 8px 6px;">Temp</th>
-                <th style="padding: 8px 6px;">Steps</th>
-                <th style="padding: 8px 6px;">&tau;</th>
+                <th style="padding: 8px 6px;">Hedge Margin</th>
+                <th style="padding: 8px 6px;">W (Draft)</th>
                 <th style="padding: 8px 6px;">Best Use Case</th>
               </tr>
             </thead>
             <tbody>
               <tr style="border-bottom: 1px solid var(--border-subtle);">
                 <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Balanced Standard</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.3</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
-                <td style="padding: 8px 6px;">General dialogue, high fluency, low repetition.</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">Auto</td>
+                <td style="padding: 8px 6px;">General dialogue, high fluency, optimal throughput.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Pure Argmax (Greedy)</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">Auto</td>
+                <td style="padding: 8px 6px;">Exact greedy decoding for formal benchmarks & testing.</td>
+              </tr>
+              <tr style="border-bottom: 1px solid var(--border-subtle);">
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Code & Exact Syntax</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.5</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">Auto</td>
+                <td style="padding: 8px 6px;">JSON, Python, syntax precision, zero hallucinations.</td>
               </tr>
               <tr style="border-bottom: 1px solid var(--border-subtle);">
                 <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Snappy Low-Latency</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.2</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">2</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">3</td>
                 <td style="padding: 8px 6px;">Sub-second answers with aggressive stop termination.</td>
               </tr>
-              <tr style="border-bottom: 1px solid var(--border-subtle);">
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Multi-Branch (Pillar 4)</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.2</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.9</td>
-                <td style="padding: 8px 6px;">Speculative 2-branch micro-tree exploration.</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--border-subtle);">
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Code & Strict Syntax</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.4</td>
-                <td style="padding: 8px 6px;">JSON, Python, brackets, and deterministic code logic.</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--border-subtle);">
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">High-Throughput Infilling</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.1</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
-                <td style="padding: 8px 6px;">Parallel span completion (200+ TPS on GPU).</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--border-subtle);">
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Creative Narrative</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.7</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
-                <td style="padding: 8px 6px;">Maximum lexical variety and open-ended writing.</td>
-              </tr>
               <tr>
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Pure Argmax</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">4</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.8</td>
-                <td style="padding: 8px 6px;">Exact greedy decoding for formal benchmarks.</td>
+                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Creative Dialogue</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.7</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.5</td>
+                <td style="padding: 8px 6px; font-family: var(--mono-font);">Auto</td>
+                <td style="padding: 8px 6px;">Maximum lexical variety and open-ended writing.</td>
               </tr>
             </tbody>
           </table>
@@ -1873,37 +1804,31 @@ document.addEventListener('click', function(e) {
 
 function onSelectPreset(preset) {
   const cLen = document.getElementById('cfgCanvas');
-  const scLen = document.getElementById('cfgSubCanvas');
-  const scSteps = document.getElementById('cfgSubSteps');
   const scTemp = document.getElementById('cfgTemp');
-  const scTau = document.getElementById('cfgTau');
-  const scBranch = document.getElementById('cfgBranching');
+  const scMargin = document.getElementById('cfgHedgeMargin');
+  const scVTokens = document.getElementById('cfgVTokens');
 
   if (preset === 'balanced') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.3; scTau.value = 0.8; scBranch.checked = false;
+    cLen.value = 48; scTemp.value = 0.0; scMargin.value = 1.0; scVTokens.value = "auto";
   } else if (preset === 'snappy') {
-    cLen.value = 24; scLen.value = 8; scSteps.value = 2; scTemp.value = 0.2; scTau.value = 0.8; scBranch.checked = false;
-  } else if (preset === 'branching') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.2; scTau.value = 0.9; scBranch.checked = true;
+    cLen.value = 24; scTemp.value = 0.0; scMargin.value = 1.0; scVTokens.value = "3";
   } else if (preset === 'code') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0; scTau.value = 0.4; scBranch.checked = false;
-  } else if (preset === 'infill') {
-    cLen.value = 48; scLen.value = 16; scSteps.value = 4; scTemp.value = 0.1; scTau.value = 0.8; scBranch.checked = false;
+    cLen.value = 48; scTemp.value = 0.0; scMargin.value = 0.5; scVTokens.value = "auto";
   } else if (preset === 'creative') {
-    cLen.value = 48; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.7; scTau.value = 1.0; scBranch.checked = false;
+    cLen.value = 64; scTemp.value = 0.7; scMargin.value = 1.5; scVTokens.value = "auto";
   } else if (preset === 'greedy') {
-    cLen.value = 32; scLen.value = 8; scSteps.value = 4; scTemp.value = 0.0; scTau.value = 0.8; scBranch.checked = false;
+    cLen.value = 48; scTemp.value = 0.0; scMargin.value = 1.0; scVTokens.value = "auto";
   }
 }
 
 function clearConversation() {
   sessionChatHistory = [
-    { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
+    { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v4 speculative decoding." }
   ];
   document.getElementById('conversationFlow').innerHTML = `
     <div class="chat-welcome" id="chatWelcome">
       <div class="welcome-logo">BD</div>
-      <div class="welcome-title">BFG-Diff Discrete Diffusion</div>
+      <div class="welcome-title">BFG-Diff Speculative Engine</div>
       <div class="welcome-sub">Ask a question or brainstorm ideas. Previous turns are remembered across messages.</div>
     </div>
   `;
@@ -1968,15 +1893,14 @@ async function transmitChatMessage() {
   const replySpan = document.getElementById(replySpanId);
   const replyMeta = document.getElementById(replyMetaId);
 
+  const vtok = document.getElementById('cfgVTokens').value;
   const payload = {
     model: currentSelectedModel,
     messages: sessionChatHistory,
     canvas_len: parseInt(document.getElementById('cfgCanvas').value) || 32,
-    sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value) || 8,
-    sub_steps: parseInt(document.getElementById('cfgSubSteps').value) || 4,
-    temp: parseFloat(document.getElementById('cfgTemp').value) || 0.3,
-    branching: document.getElementById('cfgBranching').checked,
-    tau: parseFloat(document.getElementById('cfgTau').value) || 0.8,
+    temp: parseFloat(document.getElementById('cfgTemp').value) || 0.0,
+    hedge_margin: parseFloat(document.getElementById('cfgHedgeMargin').value) || 1.0,
+    v_tokens: vtok === "auto" ? null : parseInt(vtok),
   };
 
   try {
@@ -2054,16 +1978,15 @@ async function runVisualizerComparison() {
   causalMeta.innerText = '0.0 TPS';
   traceFeed.innerHTML = '';
 
+  const vtok = document.getElementById('cfgVTokens').value;
   const payload = {
     model: currentSelectedModel,
     prompt: document.getElementById('visPrompt').value,
     mode: document.getElementById('cfgMode').value,
-    canvas_len: parseInt(document.getElementById('cfgCanvas').value),
-    sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value),
-    sub_steps: parseInt(document.getElementById('cfgSubSteps').value),
-    temp: parseFloat(document.getElementById('cfgTemp').value),
-    branching: document.getElementById('cfgBranching').checked,
-    tau: parseFloat(document.getElementById('cfgTau').value) || 0.8,
+    canvas_len: parseInt(document.getElementById('cfgCanvas').value) || 32,
+    temp: parseFloat(document.getElementById('cfgTemp').value) || 0.0,
+    hedge_margin: parseFloat(document.getElementById('cfgHedgeMargin').value) || 1.0,
+    v_tokens: vtok === "auto" ? null : parseInt(vtok),
   };
 
   const blockMap = {};
@@ -2116,9 +2039,11 @@ async function runVisualizerComparison() {
           if (!blockMap[evt.block_idx]) {
             const bDiv = document.createElement('div');
             bDiv.className = 'trace-block';
+            const draftW = evt.q_a ? (evt.q_a - 1) : 7;
+            const hedgeBadge = evt.hedge_hit ? ' <span style="color:#10b981; font-weight:600;">[Hedge Hit]</span>' : (evt.is_hedge ? ' <span style="color:#eab308;">[Hedge]</span>' : '');
             bDiv.innerHTML = `
               <div class="trace-block-header">
-                <span class="trace-block-tag">Step ${evt.block_idx + 1} (${evt.accepted !== undefined ? evt.accepted + '/7 accepted' : 'Speculative Pass'})</span>
+                <span class="trace-block-tag">Step ${evt.block_idx + 1} (${evt.accepted !== undefined ? evt.accepted + '/' + draftW + ' accepted' : 'Speculative Pass'}${hedgeBadge})</span>
                 <span class="trace-block-stats" id="blockStats_${evt.block_idx}"></span>
               </div>
               <div class="trace-steps-container" id="stepsContainer_${evt.block_idx}"></div>
@@ -2212,7 +2137,11 @@ class VisualizerHandler(BaseHTTPRequestHandler):
 
             messages = req.get("messages", [])
             canvas_len = req.get("canvas_len", 32)
-            temp = req.get("temp", 0.0)
+            temp = float(req.get("temp", 0.0))
+            hedge_margin = float(req.get("hedge_margin", 1.0))
+            v_tokens = req.get("v_tokens", None)
+            if v_tokens is not None:
+                v_tokens = int(v_tokens)
 
             # Apply Jinja2/ChatML template if available, else format cleanly
             try:
@@ -2249,7 +2178,9 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 bundle=bundle,
                 prompt_text=formatted_prompt,
                 max_new_tokens=canvas_len,
+                v_tokens=v_tokens,
                 temperature=temp,
+                hedge_margin=hedge_margin,
                 stop_tokens=stop_tokens,
                 step_callback=lambda evt: send_chat_sse({
                     "type": "chat_step",
@@ -2284,7 +2215,11 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             prompt = req.get("prompt", "")
             mode = req.get("mode", "completion")
             canvas_len = req.get("canvas_len", 32)
-            temp = req.get("temp", 0.0)
+            temp = float(req.get("temp", 0.0))
+            hedge_margin = float(req.get("hedge_margin", 1.0))
+            v_tokens = req.get("v_tokens", None)
+            if v_tokens is not None:
+                v_tokens = int(v_tokens)
 
             if mode == "chat" and "<|im_start|>" not in prompt:
                 if hasattr(tok, "apply_chat_template"):
@@ -2326,12 +2261,14 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            # 1. Stream BFG v3 speculative generation
+            # 1. Stream BFG v4 speculative generation
             bfg_res = generate_v3_stream(
                 bundle=bundle,
                 prompt_text=prompt,
                 max_new_tokens=canvas_len,
+                v_tokens=v_tokens,
                 temperature=temp,
+                hedge_margin=hedge_margin,
                 stop_tokens=stop_tokens,
                 step_callback=lambda evt: send_sse(evt),
             )
@@ -2343,6 +2280,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 tok,
                 prompt,
                 max_new_tokens=canvas_len,
+                temperature=temp,
                 stop_tokens=stop_tokens,
                 callback=lambda tok_str, total, tps, elap: send_sse({
                     "type": "causal_token",

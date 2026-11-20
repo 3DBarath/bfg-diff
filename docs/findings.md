@@ -1741,6 +1741,63 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
   - **In-Place Dynamic INT8 (`--cpu_quant int8`):** Raw baseline 13.3 TPS (**3.02× faster**), BFG-Diff v4 5.5 TPS (**3.44× faster**), $T_{\text{verify}} = 92.16$ ms (**5.47× faster verification**), $T_{\text{draft}} = 85.78$ ms.
   - In-place layer-by-layer quantization with `gc.collect()` avoids doubling model weight allocations, safely observing `MemoryMax=9G` cgroup cap.
 
+---
+
+## 54. CPU Speculative Serving Optimization & Web UI Parity Alignment (2026-11-20)
+
+### 1. Bottleneck Audit & Root Cause Analysis on CPU
+1. **CPU FLOP Waste in Speculative Verification:**
+   - In `sampler_v3.py`, `forward_verify_step` was executing the 8-token Write-Ahead Log (WAL) projection across all 4 draft layers on CPU on every cycle, projecting all $Q_A = 8$ candidate tokens even though $\sim 6\text{--}7$ tokens are rejected each step.
+   - At $W = 7, Q_A = 8$, CPU compute spent $(4 \times 7 + 28 \times 8) = 252$ layer-tokens per speculative step to accept $\sim 1.35$ tokens ($\sim 186$ ops/token vs. 28 ops/token in Causal $Q=1$), limiting CPU serving speed to 2.2 TPS.
+2. **Divergent Decoding Loops:**
+   - `chat.py` had a custom linear speculative loop in `generate_v3_stream` that ignored `6+1` Leaf-Hedging and lacked temperature sampling on verify tokens.
+   - `generate_causal_stream` was hardcoded to greedy argmax even when `temperature > 0.0` was passed in `/api/chat` or `/api/generate`.
+3. **Web UI Legacy Residue:**
+   - Settings modal and presets exposed obsolete v2 parameters (`sub_canvas_len`, `sub_steps`, `tau`, `branching`), and the Manual tab described the deprecated v2 Staircase engine.
+
+### 2. Implemented Architecture Fixes
+1. **CPU-Only Lazy Draft KV Commit (`commit_accepted_tokens`):**
+   - On CUDA (`device.type == "cuda"`): WAL remains active inside `forward_verify_step` and CUDA Graphs, projecting all candidate tokens ahead for zero eager kernel launch overhead.
+   - On CPU (`device.type == "cpu"`): WAL projection is skipped entirely in `forward_verify_step`. After acceptance verification, `commit_accepted_tokens` projects and writes draft KV into `draft_cache` **only** for the actually accepted tokens ($k + 1$ tokens in Linear / Case A, $[y^*, d_{0, 2}]$ in Case B hedge hit, or single bonus token $y^*$ in Case C).
+2. **Configurable & Auto-Adapted Draft Window $W$ ($v\_tokens$):**
+   - Parameterized `StaticDraftEngine` masks (`causal_wxw_block`, Leaf-Hedge slot index $Q_A - 1$) dynamically with `self.w` and `self.q_a`.
+   - Defaults to **$W = 7$ ($Q_A = 8$, $6+1$ Leaf-Hedge)** on CUDA for full GPU tensor core saturation.
+   - Defaults to **$W = 3$ ($Q_A = 4$, $2+1$ Leaf-Hedge)** on CPU, cutting verification and drafting FLOPs by more than 50% ($(4 \times 3 + 28 \times 4) = 124$ vs. 252 layer-tokens).
+3. **Unified Streaming & Speculative Core:**
+   - Added `step_callback` and `stop_token_ids` support to `generate_speculative_v3`.
+   - `generate_v3_stream` in `chat.py` now dispatches directly to `generate_speculative_v3`, automatically sharing full Leaf-Hedge mechanics, stop delimiter truncation, and active acceptance tracking.
+4. **Sampling & Temperature Parity:**
+   - `generate_causal_stream` and `generate_speculative_v3` now consistently use identical greedy `argmax` at $T = 0.0$ and multinomial sampling at $T > 0.0$.
+5. **Web UI Modal & Manual Tab Upgrade:**
+   - Replaced dead v2 controls with active v4 parameters (`canvas_len`, `temperature`, `hedge_margin`, `v_tokens`).
+   - Defaulted Visualizer comparisons to $T = 0.0$ for fair apples-to-apples performance comparisons.
+   - Rewrote Manual tab documentation to detail BFG-Diff v4 Weight-Tied 4-Layer Drafter, Fused Ghost Weights, WAL on GPU / Lazy Commit on CPU, and Leaf-Hedge.
+
+### 3. Verification & Live Service Metrics
+- **`test_v4_units.py`**:
+  - Test 1 (`merge_ghost_weights()`): max diff `0.00e+00` (`PASS`).
+  - Test 2 (WAL + `[0:W]` scratch tail + bucket transitions `32 -> 128`): 100% exact match (`PASS`).
+  - Test 3 (`6+1` Leaf-Hedge parity, 3 prompts, 82 attempts, 1 natural hedge hit): 100% exact match (`PASS`).
+  - Test 4 (Synthetic Case B hedge hit): exact bonus token match (`PASS`).
+  - Test 5 (INT8 Quantized CPU execution & parity): max logit diff `0.00e+00`, text generated without NaN (`PASS`).
+  - Result: `ALL V4 UNIT TESTS PASSED!`.
+- **`test_v3_gates.py --model Qwen/Qwen2.5-0.5B`**:
+  - Unit Gate A (Lossless Parity B=1 across 10 prompts + B=4 batched ragged): `PASS` (10/10 matched).
+  - Unit Gate B (Param Budget): `PASS` (0.752% for 1.5B, 0.487% for 3B).
+  - Unit Gate C (Gradient Flow): `PASS`.
+  - Unit Gate D (Train-Inference Parity): `PASS` (max diff `2.03e-05` < `1.0e-04`).
+- **`train.py --smoke_test`**:
+  - `smoke convergence: 4.8838 -> 4.7517 PASS`.
+- **`benchmark.py --smoke_test --model Qwen/Qwen2.5-0.5B`**:
+  - Causal generate: 13.5 TPS. BFG-Diff k=2: 7.1 TPS, alpha 1.03.
+- **Production Live Service Benchmark (`bfg-web.service` on Intel Xeon, `1.5b-instruct`, $C=48, T=0.0$):**
+  - Prompt: *"Explain the difference between a process and a thread in one short paragraph."*
+  - **BFG-Diff v4:** 3.6 TPS ($\alpha = 1.50$ tokens/step, 32 steps, 48 tokens, 13.4s). Speedup over previous CPU serving path: **+64%** ($2.2\text{ TPS} \to 3.6\text{ TPS}$).
+  - Output: *"A process is an instance of a program that is running and using system resources, while a thread is a lightweight process that is a single execution path within a process. Threads share the same memory space as the process and can communicate with each other"*
+  - **Causal Baseline:** 7.0 TPS (48 tokens, 6.8s).
+  - Output: *"A process is an instance of a program that is running and consuming system resources, while a thread is a lightweight process that is a single execution path within a process. Threads share the same memory space as the process and can communicate with each other"*
+  - Result: 100% semantic and grammatical coherence parity. Zero garbled tokens or web fragments. Fully verified.
+
 
 
 

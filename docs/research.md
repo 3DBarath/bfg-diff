@@ -485,6 +485,21 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
 #### D. Production Promotion
 - BFG-Diff v4 is promoted as the headline production inference engine across both GPU and CPU serving configurations. All existing v3 checkpoints load seamlessly with zero weight fine-tuning required.
 
+#### E. CPU Lazy Draft KV Commit & Unified Speculative Streaming
+- **CPU Lazy Commit (`commit_accepted_tokens`)**:
+  - On CUDA, WAL writes all $Q_A$ candidates directly inside the verify CUDA graph for zero-overhead execution.
+  - On CPU, WAL inside `forward_verify_step` is skipped. Instead, `commit_accepted_tokens(f_ctx_accepted, pos_accepted, scatter_pos)` projects draft K/V strictly for accepted tokens ($k + 1$ tokens on linear/Case A, $[y^*, d_{0, 2}]$ on Case B hedge hits, or $y^*$ on Case C misses), eliminating unneeded projections on CPU.
+- **Auto-Adapted Draft Window $W$ ($v\_tokens$)**:
+  - Parameterized `StaticDraftEngine` masks dynamically for arbitrary $W$:
+    - CUDA defaults to $W = 7$ ($Q_A = 8$, $6+1$ Leaf-Hedge).
+    - CPU defaults to $W = 3$ ($Q_A = 4$, $2+1$ Leaf-Hedge), cutting verification/draft FLOPs in half ($(4 \times 3 + 28 \times 4) = 124$ vs. 252 layer-tokens) and accelerating CPU serving throughput by +64% ($2.2 \to 3.6$ TPS).
+- **Unified Streaming & Sampling Parity**:
+  - `generate_v3_stream` directly invokes `generate_speculative_v3`, unifying streaming Web UI / CLI serving with full Leaf-Hedge support and stop delimiter handling.
+  - Both speculative decoding and causal baseline share consistent temperature decoding (exact greedy `argmax` at $T=0.0$, multinomial sampling at $T>0.0$).
+- **Modernized Web UI**:
+  - Replaced legacy v2 parameters (`sub_canvas_len`, `sub_steps`, `tau`, `branching`) in settings modal and presets with active v4 parameters (`canvas_len`, `temperature`, `hedge_margin`, `v_tokens`).
+  - Updated Manual tab documentation to detail the v4 speculative architecture.
+
 
 
 

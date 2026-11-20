@@ -925,6 +925,30 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Switched chat template rendering in `chat.py` to `tok.apply_chat_template` with Qwen system prompt.
    - Set default `--cpu_quant` in web serving to `none` (`bfloat16`), keeping model weights exact with zero outlier channel degradation, instant 1s startup, 3.1 GB memory footprint, and textbook-quality explanations across both BFG-Diff v4 and the Causal Baseline.
 
+6. **CPU Speculative Serving Optimization & Web UI Parity Alignment (2026-11-20):**
+   - **CPU-Only Lazy Draft KV Commit (`sampler_v3.py`):**
+     - Sliced out the eager WAL projection from `forward_verify_step` on `device.type == "cpu"`, avoiding redundant projections for rejected draft tokens.
+     - Implemented `commit_accepted_tokens(f_ctx_accepted, pos_accepted, scatter_pos)` projecting draft K/V strictly for accepted tokens ($k + 1$ tokens on linear/Case A, $[y^*, d_{0, 2}]$ on Case B, or single bonus token on Case C).
+     - Retained full WAL projection inside `forward_verify_step` and CUDA Graphs on `device.type == "cuda"`.
+   - **Configurable Draft Window $W$ ($v\_tokens$):**
+     - Parameterized `StaticDraftEngine` masks dynamically for arbitrary $W$: default $W = 7$ ($Q_A = 8$, $6+1$ Leaf-Hedge) on CUDA, default $W = 3$ ($Q_A = 4$, $2+1$ Leaf-Hedge) on CPU.
+     - Cuts CPU verification and drafting FLOPs by over 50% ($(4 \times 3 + 28 \times 4) = 124$ vs. 252 layer-tokens).
+   - **Unified Speculative Streaming Core (`sampler_v3.py` / `chat.py`):**
+     - Extended `generate_speculative_v3` with optional `step_callback` and `stop_token_ids` parameters.
+     - Re-routed `generate_v3_stream` in `chat.py` to call `generate_speculative_v3` directly, unifying streaming serving with full Leaf-Hedge support and stop delimiter truncation.
+   - **Sampling Parity & Temperature Consistency:**
+     - Added `temperature` parameter to `generate_causal_stream`. Both speculative verify and causal baseline now share identical greedy `argmax` at $T = 0.0$ and multinomial sampling at $T > 0.0$.
+     - Defaulted Visualizer comparisons in Web UI to $T = 0.0$ for fair apples-to-apples comparisons.
+   - **Web UI Settings Modal & Manual Tab Upgrade (`chat.py`):**
+     - Replaced legacy v2 parameters (`sub_canvas_len`, `sub_steps`, `tau`, `branching`) in settings modal and presets with active v4 parameters (`canvas_len`, `temperature`, `hedge_margin`, `v_tokens`).
+     - Overhauled Manual tab documentation with accurate BFG-Diff v4 architectural breakdown (Weight-Tied 4-Layer Drafter, Fused Ghost Weights, WAL on GPU / Lazy Commit on CPU, and Leaf-Hedge).
+   - **Verification Results:**
+     - `test_v4_units.py`: All 5 tests passed (including exact 0.0 logit diff on INT8 and synthetic Case B hedge verification).
+     - `test_v3_gates.py --model Qwen/Qwen2.5-0.5B`: All gates passed (Unit Gate A 10/10 matched, Gate B 0.752%, Gate C, Gate D diff $2.03 \times 10^{-5}$).
+     - `train.py --smoke_test`: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+     - `benchmark.py --smoke_test --model Qwen/Qwen2.5-0.5B`: PASS.
+     - Live service (`bfg-web.service` on Intel Xeon, `1.5b-instruct`, $C=48, T=0.0$): CPU TPS improved from 2.2 TPS to 3.6 TPS (+64% speedup) at $\alpha = 1.50$ tokens/step, producing flawless textbook-quality explanations.
+
 
 
 

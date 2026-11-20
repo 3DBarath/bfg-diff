@@ -25,7 +25,7 @@ Systems Optimizations:
 
 import math
 import os
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -103,7 +103,7 @@ class StaticDraftEngine:
         drafter: WeightTiedTopKDrafter,
         max_len: int = 2048,
         batch_size: int = 1,
-        v_tokens: int = 7,  # Q_A = 8, W = 7
+        v_tokens: Optional[int] = None,  # None -> auto: 7 on CUDA, 3 on CPU
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         use_cuda_graph: bool = True,
@@ -114,11 +114,6 @@ class StaticDraftEngine:
         self.drafter = drafter
         self.max_len = max_len
         self.batch_size = batch_size
-        self.v_tokens = v_tokens
-        self.q_a = v_tokens + 1  # 8
-        self.w = v_tokens        # 7
-        self.use_cuda_graph = use_cuda_graph
-        self.hedge_margin = float(hedge_margin)
 
         if device is None:
             device = next(base_model.parameters()).device
@@ -126,6 +121,14 @@ class StaticDraftEngine:
             dtype = next(base_model.parameters()).dtype
         self.device = torch.device(device)
         self.dtype = dtype
+
+        if v_tokens is None:
+            v_tokens = 7 if self.device.type == "cuda" else 3
+        self.v_tokens = v_tokens
+        self.q_a = v_tokens + 1
+        self.w = v_tokens
+        self.use_cuda_graph = use_cuda_graph
+        self.hedge_margin = float(hedge_margin)
 
         # Ensure drafter is cast to self.dtype in inference
         if self.device.type == "cuda" or self.dtype in (torch.float16, torch.bfloat16):
@@ -186,7 +189,8 @@ class StaticDraftEngine:
         # static_mask_B: (B, 1, W, W + max_len)
         self.static_mask_B = torch.full((batch_size, 1, self.w, self.w + max_len), -1e4, dtype=dtype, device=device)
         self.causal_qa_block = torch.triu(torch.full((self.q_a, self.q_a), -1e4, dtype=dtype, device=device), diagonal=1)
-        self.causal_7x7_block = torch.triu(torch.full((7, 7), -1e4, dtype=dtype, device=device), diagonal=1)
+        self.causal_wxw_block = torch.triu(torch.full((self.w, self.w), -1e4, dtype=dtype, device=device), diagonal=1)
+        self.causal_7x7_block = self.causal_wxw_block  # alias for backward compatibility
 
         # Pre-allocate static output buffers
         vocab_size = config.vocab_size
@@ -570,15 +574,15 @@ class StaticDraftEngine:
                 causal_block = torch.triu(torch.full((Q_A, Q_A), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
                 mask_A_view[0, 0, :, t : t + Q_A] = causal_block
             else:
-                # 6+1 Leaf-Hedge Micro-Tree:
-                # Slots 0..6: causal chain over [y*, d0_1, d1, d2, d3, d4, d5]
-                causal_7x7 = torch.triu(torch.full((7, 7), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-                mask_A_view[0, 0, :7, t : t + 7] = causal_7x7
-                mask_A_view[0, 0, :7, t + 7] = -1e4
-                # Slot 7 (d0_2): attends ONLY to prefix [0:t] + slot 0 (y*) + slot 7 (itself). Slots 1..6 masked out!
-                mask_A_view[0, 0, 7, t : t + 8] = -1e4
-                mask_A_view[0, 0, 7, t] = 0.0      # slot 0 (y*)
-                mask_A_view[0, 0, 7, t + 7] = 0.0  # slot 7 (itself)
+                # Leaf-Hedge Micro-Tree:
+                # Slots 0..W-1: causal chain over [y*, d0_1, ..., d_{W-2}]
+                causal_wxw = torch.triu(torch.full((self.w, self.w), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
+                mask_A_view[0, 0, :self.w, t : t + self.w] = causal_wxw
+                mask_A_view[0, 0, :self.w, t + self.w] = -1e4
+                # Slot Q_A-1 (d0_2): attends ONLY to prefix [0:t] + slot 0 (y*) + slot Q_A-1 (itself). Slots 1..W-1 masked out!
+                mask_A_view[0, 0, self.q_a - 1, t : t + self.q_a] = -1e4
+                mask_A_view[0, 0, self.q_a - 1, t] = 0.0          # slot 0 (y*)
+                mask_A_view[0, 0, self.q_a - 1, t + self.w] = 0.0  # slot Q_A-1 (itself)
 
             g_verify, _ = self.cuda_graphs[S_b]
             self.cuda_graph_verify = g_verify
@@ -612,11 +616,11 @@ class StaticDraftEngine:
             if not is_hedge or b > 0:
                 mask[b, 0, :, cp : cp + Q_A] = self.causal_qa_block
             else:
-                mask[b, 0, :7, cp : cp + 7] = self.causal_7x7_block
-                mask[b, 0, :7, cp + 7] = -1e4
-                mask[b, 0, 7, cp : cp + 8] = -1e4
-                mask[b, 0, 7, cp] = 0.0
-                mask[b, 0, 7, cp + 7] = 0.0
+                mask[b, 0, :self.w, cp : cp + self.w] = self.causal_wxw_block
+                mask[b, 0, :self.w, cp + self.w] = -1e4
+                mask[b, 0, self.q_a - 1, cp : cp + self.q_a] = -1e4
+                mask[b, 0, self.q_a - 1, cp] = 0.0
+                mask[b, 0, self.q_a - 1, cp + self.w] = 0.0
 
         h = self.base_model.model.embed_tokens(verify_tokens)
         cos, sin = self.base_model.model.rotary_emb(h, pos_ids)
@@ -660,28 +664,29 @@ class StaticDraftEngine:
         logits = self.base_model.lm_head(h_norm)
         f_ctx = self.drafter.fuse_stage1_features(tuple(all_hidden_states))
 
-        # WAL: Project and write draft KV states ahead to draft_cache at W + pos_ids
-        cos_d_k, sin_d_k = self.drafter.rotary_emb(f_ctx, pos_ids)
-        for d_l_idx in range(self.k_layers):
-            if self.drafter.has_ghost_layers:
-                ghost_l = self.drafter.ghost_layers[d_l_idx]
-                k_d = ghost_l.self_attn.k_proj(f_ctx)
-                v_d = ghost_l.self_attn.v_proj(f_ctx)
-            else:
-                base_l = self.drafter.draft_layers[d_l_idx]
-                deltas = self.drafter.layer_deltas[d_l_idx]
-                k_d = apply_linear_with_delta(base_l.self_attn.k_proj, f_ctx, deltas.k_proj)
-                v_d = apply_linear_with_delta(base_l.self_attn.v_proj, f_ctx, deltas.v_proj)
+        # WAL: Project and write draft KV states ahead to draft_cache at W + pos_ids (CUDA only)
+        if self.device.type == "cuda":
+            cos_d_k, sin_d_k = self.drafter.rotary_emb(f_ctx, pos_ids)
+            for d_l_idx in range(self.k_layers):
+                if self.drafter.has_ghost_layers:
+                    ghost_l = self.drafter.ghost_layers[d_l_idx]
+                    k_d = ghost_l.self_attn.k_proj(f_ctx)
+                    v_d = ghost_l.self_attn.v_proj(f_ctx)
+                else:
+                    base_l = self.drafter.draft_layers[d_l_idx]
+                    deltas = self.drafter.layer_deltas[d_l_idx]
+                    k_d = apply_linear_with_delta(base_l.self_attn.k_proj, f_ctx, deltas.k_proj)
+                    v_d = apply_linear_with_delta(base_l.self_attn.v_proj, f_ctx, deltas.v_proj)
 
-            k_d = k_d.view(B, Q_A, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v_d = v_d.view(B, Q_A, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            k_d = apply_rotary_pos_emb_k(k_d, cos_d_k, sin_d_k, unsqueeze_dim=1)
+                k_d = k_d.view(B, Q_A, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_d = v_d.view(B, Q_A, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                k_d = apply_rotary_pos_emb_k(k_d, cos_d_k, sin_d_k, unsqueeze_dim=1)
 
-            for b in range(B):
-                cp = cur_pos_list[b]
-                draft_positions = self.w + torch.arange(cp, cp + Q_A, device=self.device)
-                self.draft_cache.k[d_l_idx][b, :, draft_positions] = k_d[b]
-                self.draft_cache.v[d_l_idx][b, :, draft_positions] = v_d[b]
+                for b in range(B):
+                    cp = cur_pos_list[b]
+                    draft_positions = self.w + torch.arange(cp, cp + Q_A, device=self.device)
+                    self.draft_cache.k[d_l_idx][b, :, draft_positions] = k_d[b]
+                    self.draft_cache.v[d_l_idx][b, :, draft_positions] = v_d[b]
 
         return logits, f_ctx
 
@@ -812,14 +817,58 @@ class StaticDraftEngine:
 
     def commit_accepted_tokens(
         self,
-        f_ctx_new: torch.Tensor,
-        cur_pos_prev_list: List[int],
-        k_list: List[int],
+        f_ctx_accepted: torch.Tensor,
+        pos_accepted: Union[torch.Tensor, List[int]],
+        scatter_pos: Optional[Union[torch.Tensor, List[int]]] = None,
     ):
-        """Backward-compatibility stub: WAL writes ahead inside forward_verify_step,
-        so hot-loop commit is a zero-op. Updates fallback positions if called externally.
+        """CPU-Only Lazy Draft KV Commit.
+        Projects and writes draft KV only for the accepted tokens into draft_cache.
+        On CUDA, this is a zero-op because WAL writes ahead during forward_verify_step.
         """
-        pass
+        if self.device.type == "cuda":
+            return
+
+        B = f_ctx_accepted.shape[0]
+        N = f_ctx_accepted.shape[1]
+
+        if isinstance(pos_accepted, list):
+            # Backward-compatibility signature: (f_ctx_new, cur_pos_prev_list, k_list)
+            cp = pos_accepted[0]
+            k_val = scatter_pos[0] if isinstance(scatter_pos, list) else N
+            pos_tensor = torch.arange(cp, cp + k_val, device=self.device).unsqueeze(0).expand(B, -1)
+            scatter_tensor = (self.w + pos_tensor)
+        else:
+            pos_tensor = pos_accepted if isinstance(pos_accepted, torch.Tensor) else torch.tensor(pos_accepted, device=self.device)
+            if pos_tensor.ndim == 1:
+                pos_tensor = pos_tensor.unsqueeze(0).expand(B, -1)
+
+            if scatter_pos is None:
+                scatter_tensor = self.w + pos_tensor
+            else:
+                scatter_tensor = scatter_pos if isinstance(scatter_pos, torch.Tensor) else torch.tensor(scatter_pos, device=self.device)
+                if scatter_tensor.ndim == 1:
+                    scatter_tensor = scatter_tensor.unsqueeze(0).expand(B, -1)
+
+        cos_d_k, sin_d_k = self.drafter.rotary_emb(f_ctx_accepted, pos_tensor)
+        for d_l_idx in range(self.k_layers):
+            if self.drafter.has_ghost_layers:
+                ghost_l = self.drafter.ghost_layers[d_l_idx]
+                k_d = ghost_l.self_attn.k_proj(f_ctx_accepted)
+                v_d = ghost_l.self_attn.v_proj(f_ctx_accepted)
+            else:
+                base_l = self.drafter.draft_layers[d_l_idx]
+                deltas = self.drafter.layer_deltas[d_l_idx]
+                k_d = apply_linear_with_delta(base_l.self_attn.k_proj, f_ctx_accepted, deltas.k_proj)
+                v_d = apply_linear_with_delta(base_l.self_attn.v_proj, f_ctx_accepted, deltas.v_proj)
+
+            k_d = k_d.view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v_d = v_d.view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            k_d = apply_rotary_pos_emb_k(k_d, cos_d_k, sin_d_k, unsqueeze_dim=1)
+
+            for b in range(B):
+                sp = scatter_tensor[b]
+                self.draft_cache.k[d_l_idx][b, :, sp] = k_d[b]
+                self.draft_cache.v[d_l_idx][b, :, sp] = v_d[b]
 
 
 def generate_speculative_v3(
@@ -828,26 +877,31 @@ def generate_speculative_v3(
     input_ids: torch.Tensor,
     mask_token_id: int = 151665,
     max_new_tokens: int = 64,
-    v_tokens: int = 7,  # Q_A = 8
+    v_tokens: Optional[int] = None,
     temperature: float = 0.0,
     eos_token_id: Optional[int] = None,
+    stop_token_ids: Optional[Union[int, Set[int], List[int]]] = None,
     use_cuda_graph: bool = True,
     engine: Optional[StaticDraftEngine] = None,
     hedge_margin: float = 1.0,
+    step_callback: Optional[Callable[[dict], None]] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """BFG-Diff v4 Speculative Decoding:
     - 100% Lossless mathematical parity to greedy base_model autoregressive decoding.
-    - Write-Ahead Log (WAL) draft_cache: zero eager commit_accepted_tokens().
+    - Write-Ahead Log (WAL) draft_cache on CUDA; CPU-only lazy draft KV commit.
     - [0:W] scratch tail: zero torch.cat() in draft step.
     - Power-of-2 Bucketed CUDA Graphs: 256, 512, 1024, 2048.
     - Fused Ghost Weights: 28 fewer kernel launches per draft step.
-    - 6+1 Leaf-Hedge Mask Morphing: rescues near-tie slot-0 misses with zero graph recompilation.
+    - (W-1)+1 Leaf-Hedge Mask Morphing: rescues near-tie slot-0 misses with zero graph recompilation.
     """
     B, P = input_ids.shape
     device = input_ids.device
     dtype = next(base_model.parameters()).dtype
 
-    if engine is None or getattr(engine, "max_len", 0) < (P + max_new_tokens + 32) or getattr(engine, "batch_size", 0) != B:
+    if v_tokens is None:
+        v_tokens = 7 if device.type == "cuda" else 3
+
+    if engine is None or getattr(engine, "max_len", 0) < (P + max_new_tokens + 32) or getattr(engine, "batch_size", 0) != B or getattr(engine, "v_tokens", None) != v_tokens:
         engine = StaticDraftEngine(
             base_model=base_model,
             drafter=drafter,
@@ -860,6 +914,17 @@ def generate_speculative_v3(
             hedge_margin=hedge_margin,
         )
 
+    v_tokens = engine.v_tokens
+
+    stop_set = set()
+    if eos_token_id is not None:
+        stop_set.add(eos_token_id)
+    if stop_token_ids is not None:
+        if isinstance(stop_token_ids, int):
+            stop_set.add(stop_token_ids)
+        else:
+            stop_set.update(stop_token_ids)
+
     # 1. Warm up & capture CUDA graphs BEFORE prefill if not yet captured
     if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
         engine.capture_cuda_graphs(mask_token_id)
@@ -869,12 +934,15 @@ def generate_speculative_v3(
     if temperature == 0.0:
         next_token = torch.argmax(logits_0[:, -1:], dim=-1)  # (B, 1) token at position P
     else:
-        probs = F.softmax(logits_0[:, -1:] / temperature, dim=-1)
+        probs = F.softmax(logits_0[:, -1:] / max(1e-4, temperature), dim=-1)
         next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
 
     generated_per_row = [[input_ids[b], next_token[b]] for b in range(B)]
     cur_pos_list = [P for _ in range(B)]
     done = [False] * B
+    for b in range(B):
+        if int(next_token[b, 0]) in stop_set:
+            done[b] = True
 
     # Acceptance tracking
     total_draft_tokens = 0
@@ -893,7 +961,7 @@ def generate_speculative_v3(
         y_star = next_token  # (B, 1) concrete bonus token at position t
         t = cur_pos_list[0]
 
-        # Stage 2: Draft W = 7 tokens
+        # Stage 2: Draft W tokens
         draft_ids, draft_logits = engine.forward_draft_step(
             y_star_ids=y_star,
             mask_token_id=mask_token_id,
@@ -902,7 +970,7 @@ def generate_speculative_v3(
             return_logits=True,
         )
 
-        # 6+1 Leaf-Hedge Margin Check at Slot 0
+        # Leaf-Hedge Margin Check at Slot 0
         is_hedge = False
         d0_1, d0_2 = None, None
         if B == 1 and hedge_margin > 0.0:
@@ -916,22 +984,23 @@ def generate_speculative_v3(
                 is_hedge = True
                 hedge_attempts += 1
 
-        # Stage 1: Verify batch Q_A = 8 at positions [t .. t+7]
+        # Stage 1: Verify batch Q_A at positions [t .. t + Q_A - 1]
         if is_hedge:
-            # Polymorphic 6+1 Micro-Tree Tile: [y*, d0_1, d1, d2, d3, d4, d5, d0_2]
+            # Polymorphic Micro-Tree Tile: [y*, d0_1, ..., d0_2]
             verify_input_buf[0, 0] = y_star[0, 0]
             verify_input_buf[0, 1] = d0_1
-            verify_input_buf[0, 2:7].copy_(draft_ids[0, 1:6])
-            verify_input_buf[0, 7] = d0_2
+            if engine.w > 2:
+                verify_input_buf[0, 2 : engine.w].copy_(draft_ids[0, 1 : engine.w - 1])
+            verify_input_buf[0, engine.q_a - 1] = d0_2
 
-            pos_override_buf[0, 0:7].copy_(torch.arange(t, t + 7, device=engine.device))
-            pos_override_buf[0, 7] = t + 1
+            pos_override_buf[0, 0 : engine.w].copy_(torch.arange(t, t + engine.w, device=engine.device))
+            pos_override_buf[0, engine.q_a - 1] = t + 1
             verify_logits, f_ctx_verify = engine.forward_verify_step(
                 verify_input_buf, cur_pos_list=cur_pos_list, is_hedge=True, pos_verify_override=pos_override_buf
             )
             verify_input = verify_input_buf
         else:
-            # Standard Linear Chain Tile: [y*, d0, d1, d2, d3, d4, d5, d6]
+            # Standard Linear Chain Tile: [y*, d0, d1, ...]
             verify_input_buf[:, 0:1].copy_(y_star)
             verify_input_buf[:, 1:].copy_(draft_ids)
             verify_logits, f_ctx_verify = engine.forward_verify_step(
@@ -943,18 +1012,18 @@ def generate_speculative_v3(
         if temperature == 0.0:
             target_tokens = torch.argmax(verify_logits, dim=-1)
         else:
-            probs = F.softmax(verify_logits / temperature, dim=-1)
+            probs = F.softmax(verify_logits / max(1e-4, temperature), dim=-1)
             target_tokens = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, engine.q_a)
 
         if is_hedge:
-            # 6+1 Leaf-Hedge Verification Branching
+            # Leaf-Hedge Verification Branching
             t0 = target_tokens[0, 0].item()
             total_draft_tokens += v_tokens
 
             if t0 == d0_1:
-                # Case A: Primary branch hits! Verify slots 1..5 sequentially
+                # Case A: Primary branch hits! Verify sequential draft slots
                 k = 1
-                for j in range(1, 6):
+                for j in range(1, engine.w - 1):
                     if draft_ids[0, j].item() == target_tokens[0, j].item():
                         k += 1
                     else:
@@ -968,40 +1037,62 @@ def generate_speculative_v3(
                 accepted_draft_tokens += k
 
                 committed_tokens = torch.cat([verify_input[0, 1 : k + 1], target_tokens[0, k : k + 1]], dim=0)
+
+                # CPU Lazy Draft KV Commit
+                if engine.device.type != "cuda":
+                    pos_acc = torch.arange(t, t + k + 1, device=engine.device)
+                    engine.commit_accepted_tokens(
+                        f_ctx_verify[0:1, 0 : k + 1],
+                        pos_acc,
+                        engine.w + pos_acc,
+                    )
+
                 generated_per_row[0].append(committed_tokens)
 
                 next_token = target_tokens[0, k : k + 1].unsqueeze(0)
                 f_ctx_last = f_ctx_verify[0:1, k : k + 1]
                 cur_pos_list[0] += num_committed
 
-                if eos_token_id is not None and (committed_tokens == eos_token_id).any():
+                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
                     done[0] = True
                 if (cur_pos_list[0] - P) >= max_new_tokens:
                     done[0] = True
 
             elif t0 == d0_2:
-                # Case B: Hedge branch hits! Accept d0_2 + verified bonus token from slot 7
+                # Case B: Hedge branch hits! Accept d0_2 + verified bonus token from hedge slot
                 hedge_hits += 1
-                t_bonus = target_tokens[0, 7:8]
+                t_bonus = target_tokens[0, (engine.q_a - 1) : engine.q_a]
                 committed_tokens = torch.cat([torch.tensor([d0_2], device=engine.device), t_bonus], dim=0)
-                generated_per_row[0].append(committed_tokens)
 
-                # Commit slot 7 KV to slot 1 (position t + 1) in both caches
+                # Commit hedge slot KV to slot 1 (position t + 1) in target_cache
                 for l_idx in range(engine.total_layers):
-                    engine.target_cache.k[l_idx][0, :, t + 1] = engine.target_cache.k[l_idx][0, :, t + 7]
-                    engine.target_cache.v[l_idx][0, :, t + 1] = engine.target_cache.v[l_idx][0, :, t + 7]
-                for dl_idx in range(engine.k_layers):
-                    engine.draft_cache.k[dl_idx][0, :, engine.w + t + 1] = engine.draft_cache.k[dl_idx][0, :, engine.w + t + 7]
-                    engine.draft_cache.v[dl_idx][0, :, engine.w + t + 1] = engine.draft_cache.v[dl_idx][0, :, engine.w + t + 7]
+                    engine.target_cache.k[l_idx][0, :, t + 1] = engine.target_cache.k[l_idx][0, :, t + (engine.q_a - 1)]
+                    engine.target_cache.v[l_idx][0, :, t + 1] = engine.target_cache.v[l_idx][0, :, t + (engine.q_a - 1)]
+
+                if engine.device.type == "cuda":
+                    for dl_idx in range(engine.k_layers):
+                        engine.draft_cache.k[dl_idx][0, :, engine.w + t + 1] = engine.draft_cache.k[dl_idx][0, :, engine.w + t + (engine.q_a - 1)]
+                        engine.draft_cache.v[dl_idx][0, :, engine.w + t + 1] = engine.draft_cache.v[dl_idx][0, :, engine.w + t + (engine.q_a - 1)]
+                else:
+                    # CPU Lazy Draft KV Commit for [slot 0, slot hedge] -> [t, t+1]
+                    f_ctx_hedge = torch.cat([f_ctx_verify[0:1, 0:1], f_ctx_verify[0:1, (engine.q_a - 1) : engine.q_a]], dim=1)
+                    pos_hedge = torch.tensor([t, t + 1], device=engine.device)
+                    engine.commit_accepted_tokens(
+                        f_ctx_hedge,
+                        pos_hedge,
+                        engine.w + pos_hedge,
+                    )
+
+                generated_per_row[0].append(committed_tokens)
 
                 cur_pos_list[0] += 2
                 next_token = t_bonus.unsqueeze(0)
-                f_ctx_last = f_ctx_verify[0:1, 7:8]
+                f_ctx_last = f_ctx_verify[0:1, (engine.q_a - 1) : engine.q_a]
                 accepted_draft_tokens += 1
                 a_plus[0] += 1
                 accept_counts[2] += 1
 
-                if eos_token_id is not None and (committed_tokens == eos_token_id).any():
+                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
                     done[0] = True
                 if (cur_pos_list[0] - P) >= max_new_tokens:
                     done[0] = True
@@ -1009,13 +1100,23 @@ def generate_speculative_v3(
             else:
                 # Case C: Neither candidate matches slot 0. Emit t0 as bonus token
                 committed_tokens = target_tokens[0, 0:1]
+
+                # CPU Lazy Draft KV Commit for slot 0 at t
+                if engine.device.type != "cuda":
+                    pos_acc = torch.tensor([t], device=engine.device)
+                    engine.commit_accepted_tokens(
+                        f_ctx_verify[0:1, 0:1],
+                        pos_acc,
+                        engine.w + pos_acc,
+                    )
+
                 generated_per_row[0].append(committed_tokens)
                 cur_pos_list[0] += 1
                 next_token = committed_tokens.unsqueeze(0)
                 f_ctx_last = f_ctx_verify[0:1, 0:1]
                 accept_counts[1] += 1
 
-                if eos_token_id is not None and (committed_tokens == eos_token_id).any():
+                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
                     done[0] = True
                 if (cur_pos_list[0] - P) >= max_new_tokens:
                     done[0] = True
@@ -1051,6 +1152,16 @@ def generate_speculative_v3(
                 else:
                     committed_tokens = target_tokens[b, 0:1]
 
+                cp = cur_pos_list[b]
+                # CPU Lazy Draft KV Commit for accepted tokens [cp .. cp + k]
+                if engine.device.type != "cuda":
+                    pos_acc = torch.arange(cp, cp + k + 1, device=engine.device)
+                    engine.commit_accepted_tokens(
+                        f_ctx_verify[b : b + 1, 0 : k + 1],
+                        pos_acc,
+                        engine.w + pos_acc,
+                    )
+
                 generated_per_row[b].append(committed_tokens)
 
                 b_token = target_tokens[b, k : k + 1].unsqueeze(0)
@@ -1058,7 +1169,7 @@ def generate_speculative_v3(
                 f_ctx_last_list.append(f_ctx_verify[b : b + 1, k : k + 1])
                 cur_pos_list[b] += num_committed
 
-                if eos_token_id is not None and (committed_tokens == eos_token_id).any():
+                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
                     done[b] = True
                 if (cur_pos_list[b] - P) >= max_new_tokens:
                     done[b] = True
@@ -1066,8 +1177,17 @@ def generate_speculative_v3(
             next_token = torch.cat(next_token_list, dim=0)
             f_ctx_last = torch.cat(f_ctx_last_list, dim=0)
 
-        # WAL already wrote draft KV ahead in forward_verify_step; zero commit call needed
         steps += 1
+        if step_callback is not None:
+            step_callback({
+                "step": steps,
+                "committed_tokens": [int(x) for x in committed_tokens],
+                "accepted": k if not (is_hedge and t0 == d0_2) else 1,
+                "is_hedge": is_hedge,
+                "hedge_hit": (is_hedge and t0 == d0_2),
+                "q_a": engine.q_a,
+                "total_generated": sum(len(c) for c in generated_per_row[0]) - P,
+            })
 
     final_outputs = []
     for b in range(B):
