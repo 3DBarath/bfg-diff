@@ -13,6 +13,9 @@ Features:
 import argparse
 import math
 import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import time
 from collections import Counter
 from pathlib import Path

@@ -807,6 +807,33 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Extracted `data/onpolicy_1.5b_5k_clean.pt` (7.8 MB, 3,984 sequences of length 256).
    - Extracted and verified `train_v3.py`.
 
+## 49. Production Integration of 15k Drafter Bundle & Dual-Model Web UI (2026-11-20)
+
+1. **Ingested 15k Drafter Bundle (`bfg_v3_1.5b_15k_bundle.zip`):**
+   - Extracted `runs/bfg_v3_1.5b_15k/last.pt` (46.3 MB, 3,000 steps, 11.58M parameters).
+   - Extracted `data/onpolicy_1.5b_15k_clean.pt` (28.2 MB, 13,772 onpolicy sequences of length 256).
+   - Extracted updated `generate_onpolicy.py` and `train_v3.py`.
+
+2. **Web UI & Production Server Enhancements (`chat.py`):**
+   - Built `V3ModelManager` supporting thread-safe instance caching for multiple model targets (`1.5b` pointing to 15k bundle and `0.5b` pointing to prototype checkpoint).
+   - Added interactive model selector dropdown (`#modelSelector`) in top navbar allowing users to switch models seamlessly.
+   - Added `/api/models` endpoint returning active configurations, parameter counts, and checkpoint metadata.
+   - Updated `/api/chat` and `/api/generate` to accept `model` parameter and stream speculative verification tokens with live $\alpha$ metrics.
+   - Added CLI model selection via `--model` argument and `/model 1.5b|0.5b` interactive command.
+   - Added `ThreadingHTTPServer.allow_reuse_address = True` and HuggingFace offline environment flags (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
+
+3. **Production Deployment:**
+   - Restarted `bfg-web.service` on port 8766 (PID 302617).
+   - Verified live service responding at `http://localhost:8766` and `http://bfg-dff.gces.net.in`.
+
+4. **Comprehensive Verification:**
+   - Ran `python test_v3_gates.py --model Qwen/Qwen2.5-0.5B` -> ALL 4 UNIT GATES PASS.
+   - Ran `python benchmark_v3.py --smoke_test --checkpoint runs/bfg_v3_1.5b_15k/last.pt --model Qwen/Qwen2.5-1.5B` -> 100.0% exact lossless consistency, $\alpha = 1.39$ tok/step, PASS.
+   - Ran `python train_v3.py --smoke_test --resume runs/bfg_v3_1.5b_15k/last.pt --model Qwen/Qwen2.5-1.5B` -> probe convergence $5.2522 \to 4.5858$, PASS.
+   - Ran `python train.py --smoke_test` -> probe convergence $4.8838 \to 4.7517$, PASS.
+   - Ran `python benchmark.py --smoke_test` -> generation & reconstruction tests PASS.
+
+
 
 
 

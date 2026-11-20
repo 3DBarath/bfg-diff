@@ -1521,6 +1521,58 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
   - Size: 7.8 MB.
   - 3,984 sequences of length 256 (`torch.Size([3984, 256])`), generated on-policy by Qwen2.5-1.5B across balanced UltraChat-200k, MetaMathQA, and FineWeb-Edu.
 
+## 49. Production Integration of 15k Drafter Bundle & Dual-Model Web Serving (2026-11-20)
+
+### Ingestion of 15k Step Bundle (`bfg_v3_1.5b_15k_bundle.zip`)
+- **Trained 1.5B Drafter Checkpoint (`runs/bfg_v3_1.5b_15k/last.pt`)**:
+  - Filesize: 46.3 MB (trainable-only parameters, 63 tensors).
+  - Trainable parameters: 11,582,464 (11.58M), exactly 0.750% PEFT on Qwen2.5-1.5B (1,543,714,816 total params).
+  - Training steps: 3,000 steps with CosineAnnealingLR (`lr=3e-4`), batch size 8.
+- **Large On-Policy Dataset (`data/onpolicy_1.5b_15k_clean.pt`)**:
+  - Filesize: 28.2 MB.
+  - 13,772 sequences of length 256 (`torch.Size([13772, 256])`), generated across balanced UltraChat, MetaMathQA, FineWeb-Edu, and Magicoder OSS-Instruct.
+
+### Multi-Model Web UI & Streaming Server (`chat.py`)
+- **Dual-Model Selection**:
+  - `1.5b`: `Qwen/Qwen2.5-1.5B` headline model with `runs/bfg_v3_1.5b_15k/last.pt`.
+  - `0.5b`: `Qwen/Qwen2.5-0.5B` prototype model with `runs/smoke_v3/last.pt`.
+  - Configured header dropdown in Web UI (`#modelSelector`) enabling interactive switching between models.
+  - Backend `V3ModelManager` provides thread-safe dynamic caching and speculative streaming via SSE.
+  - Endpoints `/api/models`, `/api/chat`, and `/api/generate` support dynamic model targeting.
+- **Offline Reliability**:
+  - Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` across entry points to eliminate network timeout stalls in offline environments.
+  - Configured `ThreadingHTTPServer.allow_reuse_address = True` to enable clean and instant port re-binding.
+
+### Verification Measurements
+1. **Unit Gates (`python test_v3_gates.py --model Qwen/Qwen2.5-0.5B`)**:
+   - `test_unit_gate_a` (Exact Lossless Parity): 10/10 prompts exact match with greedy base generation. Ragged B=4 exact token parity True for all 4 rows. PASS.
+   - `test_unit_gate_b` (Parameter Budget): Trainable params 7,080,448 (0.752% < 1.0%), static KV memory 40.0 MB (<5% of model weights 980 MB). PASS.
+   - `test_unit_gate_c` (Gradient Flow): Min abs grad 7.42e-07 > 1e-8, max grad norm 0.2831 < 100.0, 63/63 tensors receive non-zero finite gradients. PASS.
+   - `test_unit_gate_d` (Train-Infer Parity): Max abs diff 2.15e-05 < 1e-04, mean abs diff 3.16e-06. Argmax token parity True. PASS.
+   - Overall: ALL 4 UNIT GATES PASSED.
+2. **Benchmark Smoke Test (`python benchmark_v3.py --smoke_test --checkpoint runs/bfg_v3_1.5b_15k/last.pt --model Qwen/Qwen2.5-1.5B`)**:
+   - Consistency: 100.0% exact token match vs raw causal generation across all smoke test prompts.
+   - Acceptance: Mean acceptance length $\alpha = 1.39$ tok/step.
+   - Speed: Baseline causal TPS 14.1, Speculative TPS 12.0 (0.85x speedup on single-core CPU smoke test).
+   - Status: PASS.
+3. **Train v3 Resume Smoke Test (`python train_v3.py --smoke_test --resume runs/bfg_v3_1.5b_15k/last.pt --model Qwen/Qwen2.5-1.5B`)**:
+   - Loaded 63 tensors with `strict=False`.
+   - Convergence probe: Step 0 loss 5.2522 -> Step 4 loss 4.5858 (delta -0.6664).
+   - Status: PASS.
+4. **Legacy Train Smoke Test (`python train.py --smoke_test`)**:
+   - Convergence probe: Step 0 loss 4.8838 -> Step 4 loss 4.7517 (delta -0.1321).
+   - Output: `PASS`.
+5. **Legacy Benchmark Smoke Test (`python benchmark.py --smoke_test`)**:
+   - Reconstruction (2 prefixes, P=128, C=16): bfg-diff k=2 recovery 31.6%, TPS 12.1.
+   - Generation (2 prompts, C=16, top_k=50):
+     - Causal generate (unadapted): H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.844, Dist2 1.000, alpha 1.00, R_kv 0.00, speedup 1.00x, TPS 13.6.
+     - bfg-diff k=2 T=0 d=0 f=0 r=0: H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.875, Dist2 1.000, alpha 1.03, R_kv 4.25, speedup 0.53x, TPS 7.1.
+   - Status: PASS.
+6. **Live Service Status (`bfg-web.service`)**:
+   - Active and running (`PID 302617`) on port 8766.
+   - Live endpoints verified: `/api/models`, `/api/chat` (1.5B & 0.5B), `/api/generate` (1.5B & 0.5B SSE streaming).
+
+
 
 
 

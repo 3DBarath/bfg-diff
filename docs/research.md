@@ -424,6 +424,20 @@ Concrete Token y* + [MASK] x (W-1) -> Manifold Bridge -> 4 Tied Layers (L-4..L-1
 - Packed blocks: $N$ anchor blocks ($M = N \times W$ tokens) are packed into a single tensor $(B, M, D)$ with RoPE positions `pos_draft` $(B, M)$.
 - Block-diagonal attention mask: A $(1, 1, M, S + M)$ mask allows each block $m$ (anchor $t_m$) to attend exclusively to prefix keys $0 \dots t_m - 1$ and bidirectionally to its own $W$ block keys, executing all $N$ blocks in ONE single 4-layer forward pass.
 
+### 8. Production Multi-Model Dynamic Serving & Web UI Architecture (`chat.py`)
+- **`V3ModelManager` Thread-Safe Dynamic Caching**:
+  - Implements lazy loading and thread-safe instance caching for multiple model sizes (`1.5B` headline production and `0.5B` prototype).
+  - Pre-allocates dedicated `StaticDraftEngine` with static Stage-1 ($Q_A=8$) and Stage-2 ($W=7$) pointer-indexed KV caches.
+  - Automatic offline initialization: Sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to guarantee instant local weight loading without remote metadata timeouts.
+- **Speculative Streaming Protocol (`generate_v3_stream`)**:
+  - Emits real-time SSE event stream (`chat_step`, `bfg_step`) containing accepted draft token chips, per-step acceptance counts ($k/7$), cumulative response text, live TPS, and step latency.
+  - Tracks running speculative speedup and mean acceptance length $\alpha = (\sum k + \text{steps}) / \text{steps}$.
+- **Web UI Header Dropdown & Model Hot-Swapping**:
+  - Integrated `.preset-dropdown` selector in the top navigation bar enabling client-side switching between `1.5B` (15k bundle) and `0.5B` without reloading the page.
+  - Transparently dispatches `/api/chat` and `/api/generate` requests with the active `model` parameter.
+  - Added `/api/models` metadata endpoint returning active registry configs, parameter counts, and checkpoint paths.
+
+
 
 
 

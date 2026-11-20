@@ -116,6 +116,7 @@ def load_hf_prompts(num_prompts: int) -> List[str]:
         ("HuggingFaceH4/ultrachat_200k", "default", "train_sft", lambda x: x["messages"][0]["content"]),
         ("meta-math/MetaMathQA", None, "train", lambda x: x["query"]),
         ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", lambda x: x["text"][:300].rsplit(".", 1)[0] + "."),
+        ("ise-uiuc/Magicoder-OSS-Instruct-75K", None, "train", lambda x: x["problem"]),
     ]
 
     per_source = math.ceil(num_prompts / len(sources))
@@ -211,7 +212,7 @@ def generate_onpolicy_dataset(
         max_new_tokens = 32
 
     prompts = load_diverse_prompts(num_samples, prompt_source=prompt_source, smoke_test=smoke_test)
-    prompts = prompts[int(os.environ.get("SHARD_IDX", "0")) :: int(os.environ.get("NUM_SHARDS", "1"))]
+    prompts = prompts[int(os.environ.get("SHARD_IDX", "0"))::int(os.environ.get("NUM_SHARDS", "1"))]
     print(f"Loaded {len(prompts)} unique diverse prompts (source={prompt_source}). Generating responses at batch_size={batch_size}...")
 
     all_sequences = []

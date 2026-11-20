@@ -11,6 +11,9 @@ Memory-Safe fp16-Base / fp32-Adapter Training:
 import argparse
 import math
 import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import sys
 import time
 from pathlib import Path

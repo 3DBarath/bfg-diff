@@ -3,20 +3,307 @@
 Supports live unmasking step-by-step visualization, side-by-side comparison
 against base causal generation, completion and chat modes, and an optional Web UI.
 """
+import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import argparse
 import json
 import math
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 import torch
 from peft import set_peft_model_state_dict
 
 from model import LORA_TARGETS, apply_lora, prepare
+from model_v3 import prepare_v3
 from sampler import sample_canvas
+from sampler_v3 import StaticDraftEngine
+
+V3_CONFIGS = {
+    "1.5b": {
+        "model_name": "Qwen/Qwen2.5-1.5B",
+        "checkpoint": "runs/bfg_v3_1.5b_15k/last.pt" if Path("runs/bfg_v3_1.5b_15k/last.pt").exists() else "runs/bfg_v3_1.5b_6k/last.pt",
+        "label": "Qwen2.5-1.5B (v3 Drafter - 15k bundle)",
+        "badge": "v3 · 1.5B",
+        "params": "1.54B Base + 11.58M Drafter (0.75% PEFT)",
+    },
+    "0.5b": {
+        "model_name": "Qwen/Qwen2.5-0.5B",
+        "checkpoint": "runs/smoke_v3/last.pt",
+        "label": "Qwen2.5-0.5B (v3 Drafter)",
+        "badge": "v3 · 0.5B",
+        "params": "0.49B Base + 6.61M Drafter",
+    },
+}
+
+
+class V3ModelManager:
+    """Thread-safe manager for cached loading and serving of BFG-Diff v3 models."""
+
+    def __init__(self, device: Optional[str] = None):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self._models: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def get_model(self, key: str = "1.5b", checkpoint_override: Optional[str] = None) -> dict:
+        key = (key or "1.5b").lower().strip()
+        if key not in V3_CONFIGS:
+            key = "1.5b"
+        cache_key = f"{key}:{checkpoint_override}" if checkpoint_override else key
+
+        with self._lock:
+            if cache_key in self._models:
+                return self._models[cache_key]
+
+            cfg = V3_CONFIGS[key]
+            model_name = cfg["model_name"]
+            ckpt_path = checkpoint_override or cfg["checkpoint"]
+            print(f"[V3ModelManager] Loading {key.upper()} base ({model_name}) on {self.device}...")
+
+            base_model, drafter, tok, mask_id = prepare_v3(
+                model_name=model_name,
+                device=str(self.device),
+                dtype=self.dtype,
+            )
+
+            ck_file = Path(ckpt_path)
+            if ck_file.exists():
+                print(f"[V3ModelManager] Loading drafter weights from {ck_file}...")
+                ck = torch.load(ck_file, map_location=self.device)
+                sd = ck.get("drafter_state_dict", ck)
+                drafter.load_state_dict(sd, strict=False)
+                print(f"[V3ModelManager] Loaded {len(sd)} drafter tensors into {key.upper()}")
+            else:
+                print(f"[V3ModelManager] Notice: Checkpoint {ckpt_path} not found. Using initialized drafter.")
+
+            drafter.eval()
+            base_model.eval()
+
+            engine = StaticDraftEngine(
+                base_model=base_model,
+                drafter=drafter,
+                max_len=2048,
+                batch_size=1,
+                v_tokens=7,
+                device=self.device,
+                dtype=self.dtype,
+                use_cuda_graph=(self.device.type == "cuda"),
+            )
+
+            bundle = {
+                "key": key,
+                "base_model": base_model,
+                "drafter": drafter,
+                "tok": tok,
+                "mask_id": mask_id,
+                "engine": engine,
+                "config": cfg,
+            }
+            self._models[cache_key] = bundle
+            return bundle
+
+
+def generate_v3_stream(
+    bundle: dict,
+    prompt_text: str,
+    max_new_tokens: int = 64,
+    v_tokens: int = 7,  # Q_A = 8
+    temperature: float = 0.0,
+    stop_tokens: Optional[List[str]] = None,
+    step_callback: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """100% Lossless Speculative Streaming with BFG-Diff v3 Drafter.
+    Streams accepted tokens and verification metrics step-by-step.
+    """
+    torch.set_num_threads(10)
+    tok = bundle["tok"]
+    mask_id = bundle["mask_id"]
+    engine = bundle["engine"]
+    device = engine.device
+
+    with torch.no_grad():
+        input_ids = tok.encode(prompt_text, return_tensors="pt").to(device)
+
+    B, P = input_ids.shape
+    assert B == 1, "Streaming generation currently requires B=1"
+
+    start_time = time.perf_counter()
+
+    # Capture CUDA Graph if on CUDA and not yet captured
+    if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
+        if engine.cuda_graph_verify is None or engine.cuda_graph_draft is None:
+            engine.capture_cuda_graphs(mask_id)
+
+    # 1. Prefill
+    logits_0, f_ctx_last = engine.prefill(input_ids)
+    if temperature == 0.0:
+        next_token = torch.argmax(logits_0[:, -1:], dim=-1)
+    else:
+        probs = torch.softmax(logits_0[:, -1:] / max(1e-4, temperature), dim=-1)
+        next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
+
+    generated_tokens = [int(next_token[0, 0])]
+    cur_pos = P
+    accepted_draft_tokens = 0
+    steps = 0
+    total_draft_tokens = 0
+
+    stop_token_ids = set()
+    if tok.eos_token_id is not None:
+        stop_token_ids.add(tok.eos_token_id)
+    if stop_tokens:
+        for st in stop_tokens:
+            tid = tok.convert_tokens_to_ids(st)
+            if tid is not None and tid != tok.unk_token_id:
+                stop_token_ids.add(tid)
+
+    hit_stop = generated_tokens[-1] in stop_token_ids
+
+    # Step-by-step speculative verification loop
+    while not hit_stop and len(generated_tokens) < max_new_tokens:
+        y_star = next_token  # (1, 1) concrete bonus token at position cur_pos
+
+        # Stage 2: Draft W=7 tokens
+        draft_ids = engine.forward_draft_step(
+            y_star_ids=y_star,
+            mask_token_id=mask_id,
+            f_ctx_last=f_ctx_last,
+            cur_pos_list=[cur_pos],
+        )
+
+        # Stage 1: Verify Q_A=8 tokens: [y*, d_0..d_6] at positions [cur_pos .. cur_pos+7]
+        verify_input = torch.cat([y_star, draft_ids], dim=-1)
+        verify_logits, f_ctx_verify = engine.forward_verify_step(verify_input, cur_pos_list=[cur_pos])
+
+        target_tokens = torch.argmax(verify_logits, dim=-1)  # (1, 8)
+
+        # Match draft against target
+        k = 0
+        for j in range(v_tokens):
+            if draft_ids[0, j] == target_tokens[0, j]:
+                k += 1
+            else:
+                break
+
+        if k > 0:
+            step_committed_tensors = torch.cat([draft_ids[0, :k], target_tokens[0, k : k + 1]], dim=0)
+        else:
+            step_committed_tensors = target_tokens[0, 0:1]
+
+        step_committed = [int(t) for t in step_committed_tensors]
+
+        for idx_c, tid in enumerate(step_committed):
+            if tid in stop_token_ids:
+                step_committed = step_committed[: idx_c]
+                hit_stop = True
+                break
+
+        generated_tokens.extend(step_committed)
+        accepted_draft_tokens += k
+        total_draft_tokens += v_tokens
+        steps += 1
+
+        num_committed = k + 1
+        cur_pos_prev = cur_pos
+        cur_pos += num_committed
+
+        # Update bonus token and feature for next step
+        next_token = target_tokens[0:1, k : k + 1]
+        f_ctx_last = f_ctx_verify[0:1, k : k + 1]
+
+        # Commit accepted vectors into draft cache
+        engine.commit_accepted_tokens(
+            f_ctx_new=f_ctx_verify,
+            cur_pos_prev_list=[cur_pos_prev],
+            k_list=[num_committed],
+        )
+
+        elapsed = time.perf_counter() - start_time
+        current_text = tok.decode(generated_tokens, skip_special_tokens=False)
+        for st in (stop_tokens or []):
+            if st in current_text:
+                current_text = current_text.split(st)[0]
+        current_text = current_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+        tps = len(generated_tokens) / max(1e-5, elapsed)
+
+        if step_callback:
+            token_strs = [tok.decode([t]) for t in step_committed] if step_committed else ["░"]
+            step_callback({
+                "type": "bfg_step",
+                "block_idx": steps - 1,
+                "step": steps,
+                "tokens": token_strs,
+                "text": current_text,
+                "unmasked": len(step_committed),
+                "tps": tps,
+                "elapsed": elapsed,
+                "accepted": k,
+                "q_a": 8,
+            })
+
+    elapsed = time.perf_counter() - start_time
+    full_text = tok.decode(generated_tokens, skip_special_tokens=False)
+    for st in (stop_tokens or []):
+        if st in full_text:
+            full_text = full_text.split(st)[0]
+    full_text = full_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+    tps = len(generated_tokens) / max(1e-5, elapsed)
+    alpha = (accepted_draft_tokens + steps) / max(1, steps)
+
+    return {
+        "text": full_text,
+        "tokens": len(generated_tokens),
+        "elapsed": elapsed,
+        "tps": tps,
+        "alpha": alpha,
+        "steps": steps,
+        "badge": f"{tps:.1f} TPS | α={alpha:.2f} tok/step",
+    }
+
+
+def generate_v3_traced(
+    bundle: dict,
+    prompt_text: str,
+    max_new_tokens: int = 64,
+    v_tokens: int = 7,
+    temperature: float = 0.0,
+    stop_tokens: Optional[List[str]] = None,
+) -> dict:
+    """Generate tokens using BFG-Diff v3 speculative decoding with trace collection."""
+    trace_steps = []
+
+    def trace_cb(evt):
+        trace_steps.append({
+            "step": evt["step"],
+            "tokens": evt["tokens"],
+            "text": evt["text"],
+            "tps": evt["tps"],
+            "elapsed": evt["elapsed"],
+            "accepted": evt.get("accepted", 0),
+        })
+
+    res = generate_v3_stream(
+        bundle=bundle,
+        prompt_text=prompt_text,
+        max_new_tokens=max_new_tokens,
+        v_tokens=v_tokens,
+        temperature=temperature,
+        stop_tokens=stop_tokens,
+        step_callback=trace_cb,
+    )
+    res["trace"] = trace_steps
+    return res
+
 
 
 def load_bfg_model(checkpoint_path, model_name="Qwen/Qwen2.5-0.5B", device=None):
@@ -1099,7 +1386,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="header-left">
       <div class="header-brand" style="display:flex; align-items:center; gap:8px;">
         <span class="brand-title">BFG-Diff</span>
-        <span class="brand-tag">v2</span>
+        <span class="brand-tag" id="brandTag">v3 · 1.5B</span>
+      </div>
+      <div class="preset-select-wrapper" style="margin-left: 8px;">
+        <select id="modelSelector" class="preset-dropdown" onchange="onModelChange(this.value)" title="Choose Active Model">
+          <option value="1.5b" selected>Qwen2.5-1.5B (15k v3 Drafter)</option>
+          <option value="0.5b">Qwen2.5-0.5B (v3 Drafter)</option>
+        </select>
+        <span class="preset-caret">▼</span>
       </div>
     </div>
 
@@ -1453,8 +1747,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 let currentActiveTab = 'chat';
+let currentSelectedModel = '1.5b';
+
+function onModelChange(val) {
+  currentSelectedModel = val;
+  const brand = document.getElementById('brandTag');
+  if (brand) {
+    brand.innerText = (val === '1.5b') ? 'v3 · 1.5B' : 'v3 · 0.5B';
+  }
+}
+
 let sessionChatHistory = [
-  { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v2 discrete diffusion." }
+  { role: "system", content: "You are a concise, helpful assistant powered by BFG-Diff v3 speculative decoding." }
 ];
 
 function escapeHtml(str) {
@@ -1611,6 +1915,7 @@ async function transmitChatMessage() {
   const replyMeta = document.getElementById(replyMetaId);
 
   const payload = {
+    model: currentSelectedModel,
     messages: sessionChatHistory,
     canvas_len: parseInt(document.getElementById('cfgCanvas').value) || 32,
     sub_canvas_len: parseInt(document.getElementById('cfgSubCanvas').value) || 8,
@@ -1696,6 +2001,7 @@ async function runVisualizerComparison() {
   traceFeed.innerHTML = '';
 
   const payload = {
+    model: currentSelectedModel,
     prompt: document.getElementById('visPrompt').value,
     mode: document.getElementById('cfgMode').value,
     canvas_len: parseInt(document.getElementById('cfgCanvas').value),
@@ -1758,7 +2064,7 @@ async function runVisualizerComparison() {
             bDiv.className = 'trace-block';
             bDiv.innerHTML = `
               <div class="trace-block-header">
-                <span class="trace-block-tag">Sub-Block ${evt.block_idx + 1}</span>
+                <span class="trace-block-tag">Step ${evt.block_idx + 1} (${evt.accepted !== undefined ? evt.accepted + '/7 accepted' : 'Speculative Pass'})</span>
                 <span class="trace-block-stats" id="blockStats_${evt.block_idx}"></span>
               </div>
               <div class="trace-steps-container" id="stepsContainer_${evt.block_idx}"></div>
@@ -1789,7 +2095,8 @@ async function runVisualizerComparison() {
           stepsBox.appendChild(row);
         } else if (evt.type === 'bfg_done') {
           bfgOut.innerText = evt.bfg.text;
-          bfgMeta.innerText = evt.bfg.tps.toFixed(1) + " TPS (" + evt.bfg.elapsed.toFixed(2) + "s)";
+          const alphaStr = (evt.bfg.alpha !== undefined) ? ` | α=${evt.bfg.alpha.toFixed(2)}` : '';
+          bfgMeta.innerText = evt.bfg.tps.toFixed(1) + " TPS" + alphaStr + " (" + evt.bfg.elapsed.toFixed(2) + "s)";
         }
       }
     }
@@ -1812,9 +2119,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
 
 class VisualizerHandler(BaseHTTPRequestHandler):
-    model = None
-    tok = None
-    mask_id = None
+    model_mgr: V3ModelManager = None
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
@@ -1827,6 +2132,16 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
+        elif self.path == "/api/models":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data = {
+                "models": V3_CONFIGS,
+                "default": "1.5b",
+            }
+            self.wfile.write(json.dumps(data).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1837,17 +2152,17 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_len)
             req = json.loads(body.decode("utf-8"))
 
+            model_key = req.get("model", "1.5b")
+            bundle = self.model_mgr.get_model(model_key)
+            tok = bundle["tok"]
+
             messages = req.get("messages", [])
             canvas_len = req.get("canvas_len", 32)
-            sub_canvas_len = req.get("sub_canvas_len", 8)
-            sub_steps = req.get("sub_steps", 4)
-            temp = req.get("temp", 0.3)
-            branching = bool(req.get("branching", False))
-            tau = float(req.get("tau", 0.8))
+            temp = req.get("temp", 0.0)
 
             # Apply Jinja2/ChatML template if available, else format cleanly
             try:
-                formatted_prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                formatted_prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             except Exception:
                 formatted_prompt = ""
                 for m in messages:
@@ -1867,6 +2182,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             pad = ": " + (" " * 2048) + "\n\n"
+
             def send_chat_sse(evt_data):
                 msg = (f"data: {json.dumps(evt_data)}\n\n" + pad).encode("utf-8")
                 try:
@@ -1875,19 +2191,12 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            # Stream response using BFG discrete diffusion with stop tokens
-            bfg_res = generate_bfg_stream(
-                self.model,
-                self.tok,
-                self.mask_id,
-                formatted_prompt,
-                canvas_len=canvas_len,
-                sub_canvas_len=sub_canvas_len,
-                sub_steps=sub_steps,
+            bfg_res = generate_v3_stream(
+                bundle=bundle,
+                prompt_text=formatted_prompt,
+                max_new_tokens=canvas_len,
                 temperature=temp,
                 stop_tokens=stop_tokens,
-                enable_branching=branching,
-                tau=tau,
                 step_callback=lambda evt: send_chat_sse({
                     "type": "chat_step",
                     "text": evt.get("text", ""),
@@ -1908,19 +2217,20 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 "elapsed": bfg_res.get("elapsed", 0.0),
             })
             return
+
         if self.path == "/api/generate":
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
             req = json.loads(body.decode("utf-8"))
 
+            model_key = req.get("model", "1.5b")
+            bundle = self.model_mgr.get_model(model_key)
+            tok = bundle["tok"]
+
             prompt = req.get("prompt", "")
             mode = req.get("mode", "completion")
             canvas_len = req.get("canvas_len", 32)
-            sub_canvas_len = req.get("sub_canvas_len", 8)
-            sub_steps = req.get("sub_steps", 4)
             temp = req.get("temp", 0.0)
-            branching = bool(req.get("branching", False))
-            tau = float(req.get("tau", 0.8))
 
             if mode == "chat" and "<|im_start|>" not in prompt:
                 prompt = (
@@ -1939,7 +2249,6 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            # 2KB comment padding to force immediate flush through proxy buffers (e.g. Cloudflare)
             pad = ": " + (" " * 2048) + "\n\n"
 
             def send_sse(evt_data):
@@ -1950,27 +2259,21 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            # 1. Stream BFG Discrete Diffusion step-by-step FIRST for instant visual response
-            bfg_res = generate_bfg_stream(
-                self.model,
-                self.tok,
-                self.mask_id,
-                prompt,
-                canvas_len=canvas_len,
-                sub_canvas_len=sub_canvas_len,
-                sub_steps=sub_steps,
+            # 1. Stream BFG v3 speculative generation
+            bfg_res = generate_v3_stream(
+                bundle=bundle,
+                prompt_text=prompt,
+                max_new_tokens=canvas_len,
                 temperature=temp,
                 stop_tokens=stop_tokens,
-                enable_branching=branching,
-                tau=tau,
                 step_callback=lambda evt: send_sse(evt),
             )
             send_sse({"type": "bfg_done", "bfg": bfg_res})
 
             # 2. Stream Causal Baseline token by token in real-time
             causal_res = generate_causal_stream(
-                self.model,
-                self.tok,
+                bundle["base_model"],
+                tok,
                 prompt,
                 max_new_tokens=canvas_len,
                 callback=lambda tok_str, total, tps, elap: send_sse({
@@ -1987,37 +2290,42 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def start_server(model, tok, mask_id, port=8766):
-    VisualizerHandler.model = model
-    VisualizerHandler.tok = tok
-    VisualizerHandler.mask_id = mask_id
+def start_server(model_mgr: V3ModelManager, port: int = 8766):
+    VisualizerHandler.model_mgr = model_mgr
+    ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", port), VisualizerHandler)
+    server.daemon_threads = True
     print(f"\n[Visualizer Web UI] Live at http://localhost:{port} and http://bfg-dff.gces.net.in")
+    print(f"[Visualizer Web UI] Available models in dropdown: 1.5B (Production) and 0.5B (Prototype)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down visualizer server...")
 
 
-def run_cli_interactive(model, tok, mask_id, args):
-    """Interactive terminal chat / completion loop."""
-    mode = args.mode
-    canvas_len = args.canvas_len
-    sub_canvas_len = args.sub_canvas_len
-    sub_steps = args.sub_steps
-    temp = args.temp
-    visualize = args.visualize
-    compare = args.compare
+def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b", args=None):
+    """Interactive terminal chat / completion loop with dynamic model selection."""
+    current_key = default_model
+    bundle = model_mgr.get_model(
+        current_key,
+        checkpoint_override=args.checkpoint if getattr(args, "checkpoint_specified", False) else None,
+    )
+    mode = getattr(args, "mode", "completion")
+    canvas_len = getattr(args, "canvas_len", 32)
+    temp = getattr(args, "temp", 0.0)
+    visualize = getattr(args, "visualize", True)
+    compare = getattr(args, "compare", True)
 
     print("=" * 70)
-    print(" BFG-Diff Interactive Terminal Playground")
-    print(f" Checkpoint: {args.checkpoint} | Device: {model.device}")
-    print(" Commands: /mode chat|complete, /vis, /compare, /c <len>, /k <steps>, /temp <val>, /quit")
+    print(" BFG-Diff v3 Interactive Terminal Playground")
+    print(f" Active Model: {bundle['config']['label']}")
+    print(f" Device: {bundle['engine'].device} | Parameters: {bundle['config']['params']}")
+    print(" Commands: /model 1.5b|0.5b, /mode chat|complete, /vis, /compare, /c <len>, /temp <val>, /quit")
     print("=" * 70)
 
     while True:
         try:
-            prompt = input(f"\n[{mode.upper()}] >>> ").strip()
+            prompt = input(f"\n[{current_key.upper()} · {mode.upper()}] >>> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             break
@@ -2026,6 +2334,15 @@ def run_cli_interactive(model, tok, mask_id, args):
             continue
         if prompt in ["/quit", "/exit"]:
             break
+        if prompt.startswith("/model"):
+            parts = prompt.split()
+            if len(parts) > 1 and parts[1].lower() in V3_CONFIGS:
+                current_key = parts[1].lower()
+                bundle = model_mgr.get_model(current_key)
+                print(f"Switched active model to: {bundle['config']['label']}")
+            else:
+                print(f"Current active model: {current_key} ({bundle['config']['label']}). Available: 1.5b, 0.5b")
+            continue
         if prompt.startswith("/mode"):
             parts = prompt.split()
             if len(parts) > 1 and parts[1].lower() in ["chat", "completion", "complete"]:
@@ -2044,10 +2361,6 @@ def run_cli_interactive(model, tok, mask_id, args):
             canvas_len = int(prompt.split()[1])
             print(f"Canvas length: {canvas_len}")
             continue
-        if prompt.startswith("/k "):
-            sub_steps = int(prompt.split()[1])
-            print(f"Sub-steps: {sub_steps}")
-            continue
         if prompt.startswith("/temp "):
             temp = float(prompt.split()[1])
             print(f"Temperature: {temp}")
@@ -2061,33 +2374,25 @@ def run_cli_interactive(model, tok, mask_id, args):
             )
 
         print("-" * 70)
-        res = generate_bfg_traced(
-            model,
-            tok,
-            mask_id,
-            formatted_prompt,
-            canvas_len=canvas_len,
-            sub_canvas_len=sub_canvas_len,
-            sub_steps=sub_steps,
+        res = generate_v3_traced(
+            bundle=bundle,
+            prompt_text=formatted_prompt,
+            max_new_tokens=canvas_len,
             temperature=temp,
             stop_tokens=["<|im_end|>", "<|endoftext|>"] if mode == "chat" else None,
         )
 
         if visualize:
-            print("\n[Step-by-Step Parallel Unmasking Trace]")
-            for block in res["trace"]:
-                print(
-                    f"--- Sub-Block {block['block_idx']+1} (Final: {repr(block['final_text'])}) ---"
-                )
-                for st in block["steps"]:
-                    print(f"  Step {st['step']}: {' '.join(st['tokens'])}")
+            print("\n[Step-by-Step Speculative Verification Trace]")
+            for st in res["trace"]:
+                print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
             print()
 
-        print(f"BFG-Diff ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s):")
+        print(f"BFG-Diff v3 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])
 
         if compare:
-            c_res = generate_causal(model, tok, formatted_prompt, max_new_tokens=canvas_len)
+            c_res = generate_causal(bundle["base_model"], bundle["tok"], formatted_prompt, max_new_tokens=canvas_len)
             print(f"\nCausal Base ({c_res['tps']:.1f} TPS, {c_res['elapsed']:.2f}s):")
             print(c_res["text"])
         print("-" * 70)
@@ -2095,13 +2400,14 @@ def run_cli_interactive(model, tok, mask_id, args):
 
 def main():
     parser = argparse.ArgumentParser(description="BFG-Diff Interactive Chat & Visualizer")
-    parser.add_argument("--checkpoint", default="runs/bfg-polished/last.pt")
+    parser.add_argument("--model", default="1.5b", choices=["1.5b", "0.5b"], help="Model size: 1.5b (headline) or 0.5b")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path override")
     parser.add_argument("--mode", choices=["chat", "completion"], default="completion")
     parser.add_argument("--canvas_len", type=int, default=32)
     parser.add_argument("--sub_canvas_len", type=int, default=8)
     parser.add_argument("--sub_steps", type=int, default=4)
     parser.add_argument("--temp", type=float, default=0.0)
-    parser.add_argument("--visualize", action="store_true", help="Print step-by-step unmasking")
+    parser.add_argument("--visualize", action="store_true", help="Print step-by-step speculative trace")
     parser.add_argument("--compare", action="store_true", default=True)
     parser.add_argument("--no_compare", action="store_false", dest="compare")
     parser.add_argument("--server", action="store_true", help="Launch web visualizer server")
@@ -2113,43 +2419,48 @@ def main():
         "--device", default="auto", choices=["auto", "cuda", "cpu"], help="Compute device"
     )
     args = parser.parse_args()
+    args.checkpoint_specified = ("--checkpoint" in sys.argv)
+    ckpt_override = None
+    if args.checkpoint_specified and args.checkpoint:
+        if "v3" in args.checkpoint:
+            ckpt_override = args.checkpoint
+        else:
+            print(f"[Notice] Legacy checkpoint argument '{args.checkpoint}' ignored in v3; using production v3 checkpoint.")
 
-    # Load model
-    device = torch.device(
-        "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
-    )
-    model, tok, mask_id = load_bfg_model(args.checkpoint, device=device)
+    device = "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
+    model_mgr = V3ModelManager(device=device)
 
     if args.server:
-        start_server(model, tok, mask_id, port=args.port)
+        print(f"Pre-warming production default model ({args.model})...")
+        model_mgr.get_model(
+            args.model,
+            checkpoint_override=ckpt_override,
+        )
+        start_server(model_mgr, port=args.port)
     elif args.prompt:
-        res = generate_bfg_traced(
-            model,
-            tok,
-            mask_id,
-            args.prompt,
-            canvas_len=args.canvas_len,
-            sub_canvas_len=args.sub_canvas_len,
-            sub_steps=args.sub_steps,
+        bundle = model_mgr.get_model(
+            args.model,
+            checkpoint_override=ckpt_override,
+        )
+        res = generate_v3_traced(
+            bundle=bundle,
+            prompt_text=args.prompt,
+            max_new_tokens=args.canvas_len,
             temperature=args.temp,
         )
         if args.visualize:
-            print("\n[Step-by-Step Parallel Unmasking Trace]")
-            for block in res["trace"]:
-                print(
-                    f"--- Sub-Block {block['block_idx']+1} (Final: {repr(block['final_text'])}) ---"
-                )
-                for st in block["steps"]:
-                    print(f"  Step {st['step']}: {' '.join(st['tokens'])}")
+            print("\n[Step-by-Step Speculative Verification Trace]")
+            for st in res["trace"]:
+                print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
             print()
-        print(f"BFG-Diff ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s):")
+        print(f"BFG-Diff v3 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])
         if args.compare:
-            c_res = generate_causal(model, tok, args.prompt, max_new_tokens=args.canvas_len)
+            c_res = generate_causal(bundle["base_model"], bundle["tok"], args.prompt, max_new_tokens=args.canvas_len)
             print(f"\nCausal Base ({c_res['tps']:.1f} TPS, {c_res['elapsed']:.2f}s):")
             print(c_res["text"])
     else:
-        run_cli_interactive(model, tok, mask_id, args)
+        run_cli_interactive(model_mgr, default_model=args.model, args=args)
 
 
 if __name__ == "__main__":
