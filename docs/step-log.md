@@ -851,6 +851,18 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `python train.py --smoke_test` -> `smoke convergence: 4.8838 -> 4.7517 PASS`.
    - Ran `python benchmark.py --smoke_test` -> PASS (recovery 31.6%, TPS 11.6, alpha 1.03).
 
+## 51. Web Serving Memory Optimization: bfloat16 Weights & Single-Resident Model (2026-11-20)
+
+1. **Fixed Memory Bloat & Host Swap Thrashing (`chat.py`):**
+   - Switched `V3ModelManager.dtype` on CPU from `torch.float32` to `torch.bfloat16`.
+   - Evicted previously cached bundles in `V3ModelManager.get_model()` using `del self._models[old_key]` and `gc.collect()` before loading newly requested models.
+   - Capped `bfg-web.service` with `MemoryHigh=8G / MemoryMax=9G` in `/etc/systemd/system/bfg-web.service.d/memory.conf`.
+
+2. **Verification:**
+   - Verified active service footprint dropped from 7.1 GB to ~530 MB–800 MB RSS.
+   - Verified seamless hot-swapping between `1.5b-instruct`, `1.5b`, and `0.5b` with zero memory stacking.
+
+
 
 
 

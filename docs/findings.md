@@ -1609,6 +1609,36 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
      - `bfg-diff k=2 T=0 d=0 f=0 r=0`: H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.875, Dist2 1.000, alpha 1.03, R_kv 4.25, speedup 0.55x, TPS 7.1.
    - Result: `PASS`.
 
+## 51. Web Serving Memory Optimization: bfloat16 Weights & Single-Resident Model (2026-11-20)
+
+### Root Cause Analysis: Multi-Model OOM Killer Deactivation
+- Prior to commit `75870a4`, `chat.py` loaded models on CPU with `dtype=torch.float32`, consuming ~6.8 GB RSS for a single 1.5B instance.
+- Furthermore, `V3ModelManager._models` cached every loaded model indefinitely without eviction (`self._models[cache_key] = bundle`).
+- When users hot-swapped between models in the dropdown (e.g. from `1.5b-instruct` to `1.5b` base), a second 6.8 GB model was loaded on top, exceeding host RAM (>13.6 GB), driving the box into heavy swap, and triggering kernel OOM termination of `bfg-web.service` (peak: 6.7 GB–7.1 GB).
+
+### Architecture & Memory Mitigations
+1. **CPU Memory Halving with bfloat16 (`chat.py`)**:
+   - Switched `V3ModelManager.dtype` on CPU from `torch.float32` to `torch.bfloat16`.
+   - On the host's Xeon Gold 5215 (no AVX-512 BF16), PyTorch stores weights in 16-bit and upcasts compute to fp32 internally, halving weight footprint from 6.8 GB to ~3.1 GB without performance loss.
+2. **Strict Single-Model Residency**:
+   - In `V3ModelManager.get_model()`, before instantiating a newly selected model, all existing cached bundles are explicitly purged:
+     ```python
+     for old_key in list(self._models):
+         print(f"[V3ModelManager] Dropping cached model {old_key} to free memory")
+         del self._models[old_key]
+     gc.collect()
+     if self.device.type == "cuda":
+         torch.cuda.empty_cache()
+     ```
+   - Only exactly one model resides in host RAM at any given time.
+3. **Cgroup Memory Caps**:
+   - Configured systemd slice drop-in `/etc/systemd/system/bfg-web.service.d/memory.conf` with `MemoryHigh=8G` and `MemoryMax=9G` to protect system stability.
+
+### Measured Results
+- `bfg-web.service` active memory footprint: dropped from **7.1 GB** down to **~530 MB–800 MB RSS**.
+- Switching between `1.5b-instruct`, `1.5b`, and `0.5b` logs eviction and keeps RAM usage flat.
+
+
 
 
 
