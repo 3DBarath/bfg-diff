@@ -833,6 +833,25 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
    - Ran `python train.py --smoke_test` -> probe convergence $4.8838 \to 4.7517$, PASS.
    - Ran `python benchmark.py --smoke_test` -> generation & reconstruction tests PASS.
 
+## 50. Ingestion and Deployment of Qwen2.5-1.5B-Instruct for Web Serving (2026-11-20)
+
+1. **Downloaded Model Weights:**
+   - Pulled `Qwen/Qwen2.5-1.5B-Instruct` snapshot from Hugging Face Hub (3.10 GB, 10 files) into local cache directory `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct`.
+   - Verified offline loading via `AutoConfig` and `AutoTokenizer` with `local_files_only=True`.
+
+2. **Web UI & Server Updates (`chat.py`):**
+   - Configured `1.5b-instruct` in `V3_CONFIGS` as default production conversational model, paired with `runs/bfg_v3_1.5b_15k/last.pt`.
+   - Expanded top navbar dropdown to 3 options: `1.5b-instruct` (Default), `1.5b` (Base), and `0.5b` (Prototype).
+   - Updated JavaScript `onModelChange`, `/api/models`, and API defaults.
+   - Restarted `bfg-web.service` on port 8766 (PID 315790).
+
+3. **Verification:**
+   - Tested `/api/models` -> verified `1.5b-instruct`, `1.5b`, `0.5b` registered with default `1.5b-instruct`.
+   - Tested `/api/chat` streaming with `1.5b-instruct` -> verified prompt `"Hi! What is 2 + 2?"` replied `"2 + 2 equals 4."`.
+   - Ran `python train.py --smoke_test` -> `smoke convergence: 4.8838 -> 4.7517 PASS`.
+   - Ran `python benchmark.py --smoke_test` -> PASS (recovery 31.6%, TPS 11.6, alpha 1.03).
+
+
 
 
 

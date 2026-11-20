@@ -1568,9 +1568,47 @@ Measured per-pass execution latencies on `Qwen2.5-0.5B`:
      - Causal generate (unadapted): H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.844, Dist2 1.000, alpha 1.00, R_kv 0.00, speedup 1.00x, TPS 13.6.
      - bfg-diff k=2 T=0 d=0 f=0 r=0: H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.875, Dist2 1.000, alpha 1.03, R_kv 4.25, speedup 0.53x, TPS 7.1.
    - Status: PASS.
-6. **Live Service Status (`bfg-web.service`)**:
-   - Active and running (`PID 302617`) on port 8766.
-   - Live endpoints verified: `/api/models`, `/api/chat` (1.5B & 0.5B), `/api/generate` (1.5B & 0.5B SSE streaming).
+## 50. Ingestion and Deployment of Qwen2.5-1.5B-Instruct for Production Web Serving (2026-11-20)
+
+### Artifacts Downloaded
+- **Model Snapshot (`Qwen/Qwen2.5-1.5B-Instruct`)**:
+  - Downloaded via Hugging Face Hub snapshot API to local cache (`~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306`).
+  - Total size: 3.10 GB (10 files including `model.safetensors`, tokenizer configs, chat template).
+  - Model architecture: 28 layers, 1536 hidden dimension, 151936 vocab size.
+
+### Web UI and Production Server Updates (`chat.py`)
+- **Model Registry (`V3_CONFIGS`)**:
+  - Added `1.5b-instruct` as default conversational entry point:
+    - Base backbone: `Qwen/Qwen2.5-1.5B-Instruct` (1.54B parameters).
+    - Drafter checkpoint: `runs/bfg_v3_1.5b_15k/last.pt` (11.58M parameters, 0.750% PEFT).
+    - Label: `Qwen2.5-1.5B-Instruct (15k v3 Drafter)`.
+    - Badge: `v3 · 1.5B-Inst`.
+  - Configured navbar `<select id="modelSelector">` with options:
+    1. `1.5b-instruct`: Qwen2.5-1.5B-Instruct (15k Drafter) [Default]
+    2. `1.5b`: Qwen2.5-1.5B Base (15k Drafter)
+    3. `0.5b`: Qwen2.5-0.5B (v3 Drafter)
+- **Interactive Chat Execution**:
+  - Tested `/api/chat` with `1.5b-instruct` on user query *"Hi! What is 2 + 2?"*:
+    - Streamed tokens via SSE `chat_step` events in real-time.
+    - Final generated response: `"2 + 2 equals 4."` (8 tokens, 2.21 TPS on single CPU).
+- **Service Status**:
+  - Restarted `bfg-web.service` on the host (`Main PID: 315790`).
+  - Verified live at `http://localhost:8766` and `http://bfg-dff.gces.net.in`.
+  - Verified `/api/models` returning all three configurations with default `"1.5b-instruct"`.
+
+### Verification Suite
+1. **Legacy Training Smoke Test (`python train.py --smoke_test`)**:
+   - Starting probe loss: 4.8838.
+   - Ending probe loss: 4.7517 (delta: -0.1321).
+   - Validation at step 12: `val_loss 4.6362, acc_offset1 37.5%, acc_offset2 25.0%, acc_offset3 37.5%, acc_offset4 25.0%`.
+   - Result: `smoke convergence: 4.8838 -> 4.7517 PASS`.
+2. **Legacy Benchmark Smoke Test (`python benchmark.py --smoke_test`)**:
+   - Reconstruction (2 prefixes, P=128, C=16): `bfg-diff k=2 recovery 31.6%, TPS 11.6`.
+   - Generation (2 prompts, C=16, top_k=50):
+     - `causal generate (unadapted)`: H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.844, Dist2 1.000, alpha 1.00, R_kv 0.00, speedup 1.00x, TPS 12.9.
+     - `bfg-diff k=2 T=0 d=0 f=0 r=0`: H4 1.000, rep4 0.0%, rep2 0.0%, adj 0.0%, Dist1 0.875, Dist2 1.000, alpha 1.03, R_kv 4.25, speedup 0.55x, TPS 7.1.
+   - Result: `PASS`.
+
 
 
 

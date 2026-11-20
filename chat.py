@@ -27,11 +27,18 @@ from sampler import sample_canvas
 from sampler_v3 import StaticDraftEngine
 
 V3_CONFIGS = {
+    "1.5b-instruct": {
+        "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+        "checkpoint": "runs/bfg_v3_1.5b_15k/last.pt" if Path("runs/bfg_v3_1.5b_15k/last.pt").exists() else "runs/bfg_v3_1.5b_6k/last.pt",
+        "label": "Qwen2.5-1.5B-Instruct (15k v3 Drafter)",
+        "badge": "v3 · 1.5B-Inst",
+        "params": "1.54B Base + 11.58M Drafter (0.75% PEFT)",
+    },
     "1.5b": {
         "model_name": "Qwen/Qwen2.5-1.5B",
         "checkpoint": "runs/bfg_v3_1.5b_15k/last.pt" if Path("runs/bfg_v3_1.5b_15k/last.pt").exists() else "runs/bfg_v3_1.5b_6k/last.pt",
-        "label": "Qwen2.5-1.5B (v3 Drafter - 15k bundle)",
-        "badge": "v3 · 1.5B",
+        "label": "Qwen2.5-1.5B Base (15k v3 Drafter)",
+        "badge": "v3 · 1.5B Base",
         "params": "1.54B Base + 11.58M Drafter (0.75% PEFT)",
     },
     "0.5b": {
@@ -55,10 +62,10 @@ class V3ModelManager:
         self._models: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def get_model(self, key: str = "1.5b", checkpoint_override: Optional[str] = None) -> dict:
-        key = (key or "1.5b").lower().strip()
+    def get_model(self, key: str = "1.5b-instruct", checkpoint_override: Optional[str] = None) -> dict:
+        key = (key or "1.5b-instruct").lower().strip()
         if key not in V3_CONFIGS:
-            key = "1.5b"
+            key = "1.5b-instruct" if "1.5b-instruct" in V3_CONFIGS else "1.5b"
         cache_key = f"{key}:{checkpoint_override}" if checkpoint_override else key
 
         with self._lock:
@@ -1386,11 +1393,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="header-left">
       <div class="header-brand" style="display:flex; align-items:center; gap:8px;">
         <span class="brand-title">BFG-Diff</span>
-        <span class="brand-tag" id="brandTag">v3 · 1.5B</span>
+        <span class="brand-tag" id="brandTag">v3 · 1.5B-Inst</span>
       </div>
       <div class="preset-select-wrapper" style="margin-left: 8px;">
         <select id="modelSelector" class="preset-dropdown" onchange="onModelChange(this.value)" title="Choose Active Model">
-          <option value="1.5b" selected>Qwen2.5-1.5B (15k v3 Drafter)</option>
+          <option value="1.5b-instruct" selected>Qwen2.5-1.5B-Instruct (15k Drafter)</option>
+          <option value="1.5b">Qwen2.5-1.5B Base (15k Drafter)</option>
           <option value="0.5b">Qwen2.5-0.5B (v3 Drafter)</option>
         </select>
         <span class="preset-caret">▼</span>
@@ -1747,13 +1755,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 let currentActiveTab = 'chat';
-let currentSelectedModel = '1.5b';
+let currentSelectedModel = '1.5b-instruct';
 
 function onModelChange(val) {
   currentSelectedModel = val;
   const brand = document.getElementById('brandTag');
   if (brand) {
-    brand.innerText = (val === '1.5b') ? 'v3 · 1.5B' : 'v3 · 0.5B';
+    if (val === '1.5b-instruct') {
+      brand.innerText = 'v3 · 1.5B-Inst';
+    } else if (val === '1.5b') {
+      brand.innerText = 'v3 · 1.5B Base';
+    } else {
+      brand.innerText = 'v3 · 0.5B';
+    }
   }
 }
 
@@ -2139,7 +2153,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             data = {
                 "models": V3_CONFIGS,
-                "default": "1.5b",
+                "default": "1.5b-instruct",
             }
             self.wfile.write(json.dumps(data).encode("utf-8"))
         else:
@@ -2152,7 +2166,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_len)
             req = json.loads(body.decode("utf-8"))
 
-            model_key = req.get("model", "1.5b")
+            model_key = req.get("model", "1.5b-instruct")
             bundle = self.model_mgr.get_model(model_key)
             tok = bundle["tok"]
 
@@ -2223,7 +2237,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_len)
             req = json.loads(body.decode("utf-8"))
 
-            model_key = req.get("model", "1.5b")
+            model_key = req.get("model", "1.5b-instruct")
             bundle = self.model_mgr.get_model(model_key)
             tok = bundle["tok"]
 
@@ -2296,14 +2310,14 @@ def start_server(model_mgr: V3ModelManager, port: int = 8766):
     server = ThreadingHTTPServer(("0.0.0.0", port), VisualizerHandler)
     server.daemon_threads = True
     print(f"\n[Visualizer Web UI] Live at http://localhost:{port} and http://bfg-dff.gces.net.in")
-    print(f"[Visualizer Web UI] Available models in dropdown: 1.5B (Production) and 0.5B (Prototype)")
+    print(f"[Visualizer Web UI] Available models in dropdown: 1.5B-Instruct, 1.5B Base, and 0.5B")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down visualizer server...")
 
 
-def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b", args=None):
+def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-instruct", args=None):
     """Interactive terminal chat / completion loop with dynamic model selection."""
     current_key = default_model
     bundle = model_mgr.get_model(
@@ -2320,7 +2334,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b", 
     print(" BFG-Diff v3 Interactive Terminal Playground")
     print(f" Active Model: {bundle['config']['label']}")
     print(f" Device: {bundle['engine'].device} | Parameters: {bundle['config']['params']}")
-    print(" Commands: /model 1.5b|0.5b, /mode chat|complete, /vis, /compare, /c <len>, /temp <val>, /quit")
+    print(" Commands: /model 1.5b-instruct|1.5b|0.5b, /mode chat|complete, /vis, /compare, /c <len>, /temp <val>, /quit")
     print("=" * 70)
 
     while True:
@@ -2341,7 +2355,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b", 
                 bundle = model_mgr.get_model(current_key)
                 print(f"Switched active model to: {bundle['config']['label']}")
             else:
-                print(f"Current active model: {current_key} ({bundle['config']['label']}). Available: 1.5b, 0.5b")
+                print(f"Current active model: {current_key} ({bundle['config']['label']}). Available: 1.5b-instruct, 1.5b, 0.5b")
             continue
         if prompt.startswith("/mode"):
             parts = prompt.split()
@@ -2400,7 +2414,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b", 
 
 def main():
     parser = argparse.ArgumentParser(description="BFG-Diff Interactive Chat & Visualizer")
-    parser.add_argument("--model", default="1.5b", choices=["1.5b", "0.5b"], help="Model size: 1.5b (headline) or 0.5b")
+    parser.add_argument("--model", default="1.5b-instruct", choices=["1.5b-instruct", "1.5b", "0.5b"], help="Model size: 1.5b-instruct, 1.5b, or 0.5b")
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path override")
     parser.add_argument("--mode", choices=["chat", "completion"], default="completion")
     parser.add_argument("--canvas_len", type=int, default=32)
