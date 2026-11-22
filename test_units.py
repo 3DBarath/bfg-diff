@@ -336,7 +336,7 @@ def test_cpu_lazy_commit_v3_leaf_hedge():
 
 
 def test_quantized_int8_cpu_parity():
-    print("--- Test 5: INT8 Quantized CPU Execution & Parity ---")
+    print("--- Test 7: INT8 Quantized CPU Execution & Parity ---")
     base_model, drafter, tok, mask_id = prepare_v3("Qwen/Qwen2.5-0.5B", device="cpu", dtype=torch.float32)
     base_model, drafter = quantize_for_cpu(base_model, drafter, mode="int8")
 

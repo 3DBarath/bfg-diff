@@ -1007,3 +1007,10 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 - Updated all import references across codebase.
 - **Verification:** `python -m py_compile *.py` verified clean compilation across all Python files.
 
+## 55. Cleaned Broken Legacy Imports & Dead Functions in `chat.py` (2026-11-22)
+- Cleaned up top-level imports in `chat.py`: removed unused/broken `set_peft_model_state_dict`, `LORA_TARGETS`, `apply_lora`, `prepare`, and `sample_canvas`.
+- Removed dead legacy v1/v2 generation functions referencing removed symbols: `load_bfg_model`, `generate_bfg_stream`, and `generate_bfg_traced`.
+- Fixed test numbering header in `test_units.py` from `Test 5` to `Test 7: INT8 Quantized CPU Execution & Parity`.
+- **Verification:** `python -m py_compile chat.py test_units.py` verified compilation with zero errors.
+
+
