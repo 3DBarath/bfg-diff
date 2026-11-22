@@ -1,4 +1,4 @@
-"""BFG-Diff v3: Mandatory Phase 1 Verification Gates (test_v3_gates.py).
+"""BFG-Diff v3: Mandatory Phase 1 Verification Gates (test_gates.py).
 
 Verifies:
 - Unit Gate A: Lossless parity at T=0 vs raw model.generate() across 10 prompts (B=1 and B=4).
@@ -18,8 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
 
-from model_v3 import WeightTiedTopKDrafter, prepare_v3
-from sampler_v3 import generate_speculative_v3
+from model import WeightTiedTopKDrafter, prepare_v3
+from sampler import generate_speculative_v3
 
 TEST_PROMPTS_10 = [
     "Once upon a time, in a small coastal village, the fishermen noticed that",
@@ -265,7 +265,7 @@ def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
 
 def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> bool:
     """Unit Gate D: Exact Numerical Identity between Training & Inference at position t.
-    Enforces that train_v3's parallel block anchor forward and sampler_v3's forward_draft_step
+    Enforces that train.py's parallel block anchor forward and sampler.py's forward_draft_step
     produce identical logits (< 1e-4) from the same prefix and inputs.
     """
     print("\n" + "=" * 60)
@@ -315,7 +315,7 @@ def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
         train_logits = drafter.lm_head(drafter.norm(h))  # (1, W, vocab)
 
     # 2. Inference forward path using StaticDraftEngine at position t
-    from sampler_v3 import StaticDraftEngine
+    from sampler import StaticDraftEngine
     engine = StaticDraftEngine(
         base_model=base_model,
         drafter=drafter,
@@ -361,7 +361,7 @@ def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str 
     base_dtype = torch.float32 if device == "cpu" else torch.float16
     base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
 
-    from sampler_v3 import StaticDraftEngine
+    from sampler import StaticDraftEngine
     P = 128
     Q_A = 8
     W = 7

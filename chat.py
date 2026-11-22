@@ -23,9 +23,9 @@ import torch
 from peft import set_peft_model_state_dict
 
 from model import LORA_TARGETS, apply_lora, prepare
-from model_v3 import prepare_v3, quantize_for_cpu
+from model import prepare_v3, quantize_for_cpu
 from sampler import sample_canvas
-from sampler_v3 import StaticDraftEngine, generate_speculative_v3
+from sampler import StaticDraftEngine, generate_speculative_v3
 
 def setup_cpu_threads():
     """Auto-detect physical core count and pin PyTorch CPU execution once at startup."""

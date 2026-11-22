@@ -18,7 +18,7 @@ from typing import List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from benchmark_v3 import GEN_PROMPTS
+from benchmark import GEN_PROMPTS
 
 # Curated seed templates across 5 diverse domains with zero benchmark overlap
 PROMPT_DOMAINS = {
@@ -99,7 +99,7 @@ def build_prompts(num_prompts: int) -> List[str]:
 
 def load_hf_prompts(num_prompts: int) -> List[str]:
     """Load diverse unique prompts from HuggingFace datasets across code, math, chat, systems.
-    Filters out any prompt with substring overlap against benchmark_v3's GEN_PROMPTS.
+    Filters out any prompt with substring overlap against benchmark.py's GEN_PROMPTS.
     """
     from datasets import load_dataset
 

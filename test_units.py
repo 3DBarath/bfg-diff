@@ -4,12 +4,10 @@
 3. 6+1 Leaf-Hedge preserves exact lossless greedy parity across Case A, Case B, and Case C.
 """
 
-import sys
-sys.path.insert(0, '/home/gces/.bin/.s/.scripts/bfg-diff')
 import torch
 import torch.nn.functional as F
-from model_v3 import prepare_v3, apply_linear_with_delta, apply_rotary_pos_emb_k, quantize_for_cpu
-from sampler_v3 import StaticDraftEngine, generate_speculative_v3
+from model import prepare_v3, apply_linear_with_delta, apply_rotary_pos_emb_k, quantize_for_cpu
+from sampler import StaticDraftEngine, generate_speculative_v3
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 def test_ghost_weights_unit():
@@ -209,7 +207,7 @@ def test_synthetic_case_b_hedge_hit():
     assert t0 != d0_1, "Expected d0_1 to differ"
     assert t0 == d0_2, "Expected d0_2 to match t0 (Case B)"
 
-    # Execute Case B KV pointer copy as done in sampler_v3:
+    # Execute Case B KV pointer copy as done in sampler.py:
     # Slot 7 is at cur_pos + 7 in target_cache, copy to cur_pos + 1
     for l_idx in range(engine.total_layers):
         engine.target_cache.k[l_idx][0, :, cur_pos + 1] = engine.target_cache.k[l_idx][0, :, cur_pos + 7]

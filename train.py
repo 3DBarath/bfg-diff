@@ -1,4 +1,13 @@
-"""Train Qwen2.5 as a block-autoregressive discrete diffusion LM (BD3-LM style)."""
+"""BFG-Diff v3: Random-Anchor Self-Distillation Training (train.py).
+
+Memory-Safe fp16-Base / fp32-Adapter Training:
+- Frozen base model in torch.float16 (requires_grad=False).
+- Trainable WeightTiedTopKDrafter in torch.float32 (requires_grad=True).
+- Forward under torch.autocast("cuda", dtype=torch.float16) with GradScaler.
+- DFlash-Style Random-Anchor Parallel Block Distillation:
+  Top-64 KL self-distillation + Cross-Entropy with D-PACE front-loaded loss weighting.
+"""
+
 import argparse
 import math
 import os
@@ -7,528 +16,346 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import sys
 import time
-from itertools import cycle
 from pathlib import Path
+from typing import List, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 
-from dataset import GeneralTextDataset, synthetic_texts
-from model import LORA_TARGETS, LORA_TARGETS_MLP, apply_lora, canvas_forward, prepare
+from model import WeightTiedTopKDrafter, prepare_v3
+
+
+class OnPolicySequenceDataset(Dataset):
+    """Dataset of on-policy token sequences."""
+
+    def __init__(self, data_path_or_tensor, max_len: int = 256):
+        if isinstance(data_path_or_tensor, (str, Path)):
+            payload = torch.load(data_path_or_tensor, map_location="cpu")
+            self.seqs = payload["sequences"][:, :max_len]
+        else:
+            self.seqs = data_path_or_tensor[:, :max_len]
+
+    def __len__(self):
+        return len(self.seqs)
+
+    def __getitem__(self, idx):
+        return self.seqs[idx]
+
+
+def create_synthetic_data(num_samples: int = 64, seq_len: int = 128, vocab_size: int = 1000) -> torch.Tensor:
+    torch.manual_seed(42)
+    return torch.randint(100, vocab_size - 1, (num_samples, seq_len), dtype=torch.long)
+
+
+def compute_anchor_distill_loss(
+    base_model: nn.Module,
+    drafter: WeightTiedTopKDrafter,
+    batch_seqs: torch.Tensor,       # (B, S)
+    mask_token_id: int,
+    w: int = 7,
+    n_anchors: int = 16,
+    lambda_kl: float = 0.5,
+    d_pace_decay: float = 0.85,
+) -> Tuple[torch.Tensor, dict]:
+    """Parallelized DFlash-Style Random-Anchor Block Training (Fix 1 & Fix 2):
+    1. Base model no_grad forward pass: extracts Top-64 teacher logits and tapped hidden states.
+    2. Full prefix projection: drafter.project_prefix_kv(f_ctx, pos_all) called ONCE for full sequence (B, S, D).
+    3. Sample n_anchors clean anchor positions t_1 .. t_N (where y* = batch_seqs[:, t:t+1]).
+    4. Pack all n_anchors blocks (M = n_anchors * W tokens) into a single tensor (B, M, D) with pos_draft (B, M)
+       and a (1, 1, M, S + M) block-diagonal mask where block m (anchor t_m) attends to prefix keys 0 .. t_m - 1
+       and bidirectionally to its own W block keys only.
+    5. Run ONE 4-layer forward pass for all n_anchors blocks simultaneously.
+    6. Mathematical Train-Inference Invariant:
+       - y* has RoPE position t; draft tokens have RoPE positions [t, t+1, ..., t+W-1].
+       - f_last = f_ctx[:, t-1:t] (Stage-1 fused feature immediately preceding y*).
+       - Prefix KV seen by anchor t is strictly 0 .. t-1 (length t).
+       - Targets are batch_seqs[:, t+1 : t+1+W].
+       - Teacher Top-64 logits are top64[:, t : t+W].
+    """
+    B, S = batch_seqs.shape
+    device = batch_seqs.device
+
+    # 1. Base model teacher forward pass
+    with torch.no_grad():
+        out = base_model(batch_seqs, output_hidden_states=True)
+        teacher_logits = out.logits  # (B, S, vocab)
+        top64_vals, top64_idx = torch.topk(teacher_logits, k=64, dim=-1)  # (B, S, 64)
+        top64_probs = F.softmax(top64_vals.float(), dim=-1)
+
+    # Multi-layer target feature fusion (with grad enabled for fusion parameters)
+    f_ctx = drafter.fuse_stage1_features(out.hidden_states)  # (B, S, D)
+
+    # 2. Project full prefix KV ONCE for the entire sequence (B, S, D)
+    pos_all = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+    kp_all, vp_all = drafter.project_prefix_kv(f_ctx, pos_all)
+
+    # 3. Sample random clean anchors
+    # Each anchor t needs prefix of length >= 1 (so t >= 1, meaning token t-1 exists)
+    # and targets up to t + w (so t + w <= S - 1, meaning targets t+1..t+w exist in batch_seqs)
+    min_anchor = 1
+    max_anchor = max(2, S - w - 1)
+    if max_anchor <= min_anchor:
+        min_anchor = 1
+        max_anchor = 2
+
+    avail = max_anchor - min_anchor
+    actual_anchors_count = min(n_anchors, avail) if avail > 0 else 1
+    if avail > 0:
+        anchors = torch.randperm(avail, device=device)[:actual_anchors_count] + min_anchor
+        anchors = anchors.tolist()
+    else:
+        anchors = [min_anchor]
+
+    N = len(anchors)
+    M = N * w
+
+    # 4. Pack all N anchor blocks into single input tensor (B, M, D)
+    # For anchor t: y* = batch_seqs[:, t:t+1], f_last = f_ctx[:, t-1:t]
+    y_star_list = [batch_seqs[:, t : t + 1] for t in anchors]  # each (B, 1)
+    f_last_list = [f_ctx[:, t - 1 : t] for t in anchors]        # each (B, 1, D)
+
+    y_star_packed = torch.cat(y_star_list, dim=0)  # (B * N, 1)
+    f_last_packed = torch.cat(f_last_list, dim=0)  # (B * N, 1, D)
+
+    mask_tensor = torch.tensor([[mask_token_id]], dtype=torch.long, device=device)
+    mask_emb = drafter.embed_tokens(mask_tensor)   # (1, 1, D)
+    y_star_emb = drafter.embed_tokens(y_star_packed)  # (B * N, 1, D)
+
+    # Construct bridge output: (B * N, W, D)
+    h_packed = drafter.bridge(y_star_emb, mask_emb, f_last_packed, w=w)
+    # Reshape to (B, M, D) with M = N * W
+    h = h_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+
+    # RoPE positions for all packed tokens: (B, M)
+    pos_draft_list = [
+        torch.arange(t, t + w, device=device).unsqueeze(0).expand(B, w)
+        for t in anchors
+    ]
+    pos_draft = torch.cat(pos_draft_list, dim=1)  # (B, M)
+
+    # 5. Construct block-diagonal attention mask (1, 1, M, S + M)
+    attn_mask = torch.full((1, 1, M, S + M), -1e4, dtype=f_ctx.dtype, device=device)
+    for m, t in enumerate(anchors):
+        r_start = m * w
+        r_end = (m + 1) * w
+        if t > 0:
+            attn_mask[0, 0, r_start : r_end, :t] = 0.0
+        k_start = S + m * w
+        k_end = S + (m + 1) * w
+        attn_mask[0, 0, r_start : r_end, k_start : k_end] = 0.0
+
+    # 6. Execute 4 draft layers in ONE parallel forward pass
+    for layer_idx in range(drafter.k_layers):
+        h, _, _ = drafter.forward_draft_layer(
+            layer_idx=layer_idx,
+            hidden_states=h,
+            pos_draft=pos_draft,
+            k_prefix=kp_all[layer_idx],
+            v_prefix=vp_all[layer_idx],
+            attn_mask=attn_mask,
+        )
+
+    h_norm = drafter.norm(h)
+    student_logits = drafter.lm_head(h_norm)  # (B, M, vocab)
+    student_logits = student_logits.view(B, N, w, -1)  # (B, N, W, vocab)
+
+    # 7. Targets and teacher distributions for all anchors
+    targets = torch.stack([batch_seqs[:, t + 1 : t + 1 + w] for t in anchors], dim=1)  # (B, N, W)
+    t_top64_idx = torch.stack([top64_idx[:, t : t + w] for t in anchors], dim=1)        # (B, N, W, 64)
+    t_top64_probs = torch.stack([top64_probs[:, t : t + w] for t in anchors], dim=1)    # (B, N, W, 64)
+
+    # Gather student logits on teacher Top-64
+    s_gathered = torch.gather(student_logits.float(), dim=-1, index=t_top64_idx)  # (B, N, W, 64)
+    s_log_probs = F.log_softmax(s_gathered, dim=-1)
+
+    kl = F.kl_div(s_log_probs, t_top64_probs, reduction="none").sum(dim=-1)  # (B, N, W)
+    ce = F.cross_entropy(student_logits.reshape(-1, student_logits.shape[-1]), targets.reshape(-1), reduction="none").view(B, N, w)
+
+    # D-PACE position weighting
+    d_pace = torch.tensor([d_pace_decay ** j for j in range(w)], device=device, dtype=torch.float32)
+    d_pace = d_pace / d_pace.sum()
+
+    anchor_loss = lambda_kl * kl + (1.0 - lambda_kl) * ce  # (B, N, W)
+    loss = (anchor_loss * d_pace.view(1, 1, w)).sum(dim=-1).mean()
+
+    # Track offset accuracy
+    with torch.no_grad():
+        preds = torch.argmax(student_logits, dim=-1)  # (B, N, W)
+        correct = (preds == targets).float().mean(dim=(0, 1))  # (W,)
+        acc_per_offset = [correct[j].item() for j in range(w)]
+
+    stats = {
+        "loss": loss.item(),
+        "acc_offset1": acc_per_offset[0],
+        "acc_offset2": acc_per_offset[1] if w > 1 else 0.0,
+        "acc_offset3": acc_per_offset[2] if w > 2 else 0.0,
+        "acc_offset4": acc_per_offset[3] if w > 3 else 0.0,
+    }
+    return loss, stats
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
-    p.add_argument("--data", default=None, help="text dir/file, a HF dataset is not used here")
-    p.add_argument("--out", default="runs/bfg-diff")
-    p.add_argument("--prefix_len", type=int, default=384)
-    p.add_argument("--canvas_len", type=int, default=128)
+    p.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
+    p.add_argument("--data", default=None, help="path to onpolicy .pt dataset")
+    p.add_argument("--resume", default=None, help="checkpoint to warm-start drafter")
+    p.add_argument("--out", default="runs/bfg_v3")
+    p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--grad_accum", type=int, default=4)
-    p.add_argument("--steps", type=int, default=4000)
-    p.add_argument("--lr", type=float, default=None, help="default 5e-5 full FT, 5e-4 LoRA")
-    p.add_argument("--warmup", type=int, default=500)
-    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup", type=int, default=100)
+    p.add_argument("--w", type=int, default=7, help="draft block length W")
+    p.add_argument("--n_anchors", type=int, default=16, help="random anchors per sequence")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--smoke_test", action="store_true")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=500)
-    p.add_argument("--eval_every", type=int, default=100)
-    p.add_argument("--eval_batches", type=int, default=4)
-    p.add_argument("--limit", type=int, default=None, help="max source files")
-    p.add_argument("--max_tokens", type=int, default=None, help="cap on corpus tokens")
-    p.add_argument("--texts", type=int, default=32, help="synthetic texts when --data is unset")
-    p.add_argument("--device", default="auto")
-    p.add_argument("--dtype", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
-    p.add_argument("--threads", type=int, default=0, help="CPU threads (0 = all cores)")
-    p.add_argument("--cpu", action="store_true", help="CPU-friendly preset (P=128, C=32, 1k steps)")
-    p.add_argument("--lora", action="store_true", help="train LoRA adapters, freeze the base model")
-    p.add_argument("--lora_mlp", action="store_true",
-                   help="also adapt gate_proj/up_proj/down_proj (stage 3 ablation)")
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--resume", default=None, help="warm-start checkpoint (e.g. runs/bfg-shifted/last.pt)")
-    p.add_argument("--smoke_test", action="store_true", help="tiny synthetic run + convergence check")
-    if "--cpu" in sys.argv:  # preset only changes defaults; explicit flags still win
-        p.set_defaults(
-            device="cpu", dtype="fp32", prefix_len=128, canvas_len=32,
-            batch_size=2, grad_accum=8, steps=1000, save_every=200,
-            log_every=20, eval_every=200, warmup=20, lora=True,
-        )
     args = p.parse_args()
-    if args.lora_mlp:
-        args.lora = True
-    if args.lr is None:
-        args.lr = 2e-5 if args.smoke_test else (5e-4 if args.lora else 5e-5)
+
     if args.smoke_test:
         args.steps = 12
-        args.prefix_len, args.canvas_len = 128, 64
-        args.batch_size, args.grad_accum = 2, 1
-        args.warmup, args.log_every = 2, 1
-        args.save_every, args.eval_every = 6, 12
-        args.out = "runs/smoke"
+        args.batch_size = 2
+        args.n_anchors = 2
+        args.warmup = 2
+        args.log_every = 1
+        args.out = "runs/smoke_v3"
+        if args.lr == 3e-4:
+            args.lr = 2e-4
     return args
-
-
-def pick_device(name):
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
-
-
-def make_mask(target, mask_id):
-    """Staircase-Aligned Mask Curriculum:
-    - 50% Contiguous Lookahead Window Mask: target[:, :m] clean, target[:, m:] masked.
-    - 30% Simulated Draft Corruption + Suffix Mask: target[:, :m] clean, 1-2 corrupted drafts at m..m+2, and target[:, m+3:] masked.
-    - 20% Full or Random Scatter Mask.
-    Returns: noisy_target, mask, frontiers
-    """
-    B, C = target.shape
-    device = target.device
-    noisy = target.clone()
-    mask = torch.zeros_like(target, dtype=torch.bool)
-    frontiers = []
-
-    for i in range(B):
-        u = torch.rand(1).item()
-        if u < 0.50:
-            m = torch.randint(0, max(1, C - 1), (1,)).item()
-            mask[i, m:] = True
-            noisy[i, m:] = mask_id
-            frontiers.append(m)
-        elif u < 0.80:
-            m = torch.randint(0, max(1, C - 4), (1,)).item()
-            frontiers.append(m)
-            n_corr = min(2, C - m)
-            corr_indices = torch.randperm(min(3, C - m), device=device)[:n_corr] + m
-            rand_toks = torch.randint(100, 10000, (n_corr,), device=device)
-            noisy[i, corr_indices] = rand_toks
-            mask[i, corr_indices] = True
-            m_suffix = min(C, m + 3)
-            if m_suffix < C:
-                mask[i, m_suffix:] = True
-                noisy[i, m_suffix:] = mask_id
-        else:
-            if torch.rand(1).item() < 0.5:
-                mask[i, :] = True
-                noisy[i, :] = mask_id
-                frontiers.append(0)
-            else:
-                ratio = 0.20 + 0.75 * torch.rand(1).item()
-                n = max(1, int(ratio * C))
-                perm = torch.randperm(C, device=device)[:n]
-                mask[i, perm] = True
-                noisy[i, perm] = mask_id
-                frontiers.append(int(perm.min().item()))
-
-    return noisy, mask, frontiers
-
-
-def diffusion_loss(model, prefix, target, mask_id, lambda_kl=0.5, T_distill=1.0, force_sc=False):
-    B, C = target.shape
-    P = prefix.shape[1]
-    device = prefix.device
-    noisy, mask, frontiers = make_mask(target, mask_id)
-
-    # 1. Teacher Pass (Frozen Base Causal Model on clean sequence)
-    clean_seq = torch.cat([prefix, target], dim=1)
-    with torch.no_grad():
-        if hasattr(model, "disable_adapter"):
-            with model.disable_adapter():
-                t_out = model(input_ids=clean_seq, use_cache=False)
-        else:
-            t_out = model(input_ids=clean_seq, use_cache=False)
-        Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
-
-    # 2. Student Pass (Task 2.3: 25% Self-Conditioning SC unroll + 2-step latent unroll)
-    u_sc = torch.rand(1).item()
-    if force_sc or u_sc < 0.25:
-        # Pass 1: generate logits_1 and latents_1 under no_grad
-        with torch.no_grad():
-            logits_1, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask, frontiers=frontiers)
-            latents_1 = latents_1.detach()
-            prev_pred_ids = logits_1.argmax(dim=-1)
-            # Lookup predicted token embeddings from model's input embeddings
-            emb_fn = model.get_input_embeddings()
-            prev_pred_embeds = emb_fn(prev_pred_ids).detach()
-        student_logits = canvas_forward(
-            model,
-            prefix,
-            noisy,
-            prev_latents=latents_1,
-            prev_pred_embeds=prev_pred_embeds,
-            return_hidden=False,
-            mask=mask,
-            frontiers=frontiers,
-        )
-    elif u_sc < 0.50:
-        # Standard latent recycling unroll without self-conditioning
-        with torch.no_grad():
-            _, latents_1 = canvas_forward(model, prefix, noisy, return_hidden=True, mask=mask, frontiers=frontiers)
-            latents_1 = latents_1.detach()
-        student_logits = canvas_forward(
-            model, prefix, noisy, prev_latents=latents_1, return_hidden=False, mask=mask, frontiers=frontiers
-        )
-    else:
-        student_logits = canvas_forward(
-            model, prefix, noisy, prev_latents=None, return_hidden=False, mask=mask, frontiers=frontiers
-        )
-
-    Z_student = student_logits.float()
-
-    # 3. Top-64 Teacher Gather KL Divergence (Memory Invariant 4)
-    topk_T = Z_teacher.topk(64, dim=-1)
-    topk_vals_T = topk_T.values
-    topk_idx = topk_T.indices
-    topk_vals_S = Z_student.gather(dim=-1, index=topk_idx)
-
-    p_teacher = F.softmax(topk_vals_T / T_distill, dim=-1)
-    log_p_student = F.log_softmax(topk_vals_S / T_distill, dim=-1)
-    kl_per_token = F.kl_div(log_p_student, p_teacher, reduction="none").sum(dim=-1) * (T_distill ** 2)
-
-    # Cross-Entropy against true target
-    ce_per_token = F.cross_entropy(Z_student.reshape(-1, Z_student.shape[-1]), target.reshape(-1), reduction="none").reshape(B, C)
-
-    loss_per_token = lambda_kl * kl_per_token + (1.0 - lambda_kl) * ce_per_token
-
-    # Offset position weighting: +1-front-loaded loss weighting (the speculative gatekeeper)
-    # offset 0 -> 1.0, offset 1 -> 3.0, offset 2 -> 1.5, offset 3 -> 0.75, offset >= 4 -> 0.5 * exp(-0.15 * (j_rel - 4))
-    weights = torch.ones_like(loss_per_token)
-    for i, front in enumerate(frontiers):
-        if front < C:
-            j_rel = torch.arange(C - front, device=device).float()
-            ramp = torch.where(
-                j_rel == 0, torch.full_like(j_rel, 1.0),
-                torch.where(
-                    j_rel == 1, torch.full_like(j_rel, 3.0),
-                    torch.where(
-                        j_rel == 2, torch.full_like(j_rel, 1.5),
-                        torch.where(
-                            j_rel == 3, torch.full_like(j_rel, 0.75),
-                            0.5 * torch.exp(-0.15 * (j_rel - 4.0).clamp_min(0.0)),
-                        ),
-                    ),
-                ),
-            )
-            weights[i, front:] = ramp
-
-    return (loss_per_token[mask] * weights[mask]).sum() / weights[mask].sum().clamp_min(1.0)
-
-
-@torch.inference_mode()
-def evaluate(model, loader, mask_id, device, batches):
-    model.eval()
-    total_loss, n = 0.0, 0
-    correct_1, total_1 = 0, 0
-    correct_2, total_2 = 0, 0
-    correct_3, total_3 = 0, 0
-    correct_4, total_4 = 0, 0
-    correct_2_4, total_2_4 = 0, 0
-
-    for i, (prefix, target) in enumerate(loader):
-        if i >= batches:
-            break
-        prefix, target = prefix.to(device), target.to(device)
-        B, C = target.shape
-        P = prefix.shape[1]
-
-        clean_seq = torch.cat([prefix, target], dim=1)
-        if hasattr(model, "disable_adapter"):
-            with model.disable_adapter():
-                t_out = model(input_ids=clean_seq, use_cache=False)
-        else:
-            t_out = model(input_ids=clean_seq, use_cache=False)
-        Z_teacher = t_out.logits[:, P - 1 : P + C - 1, :].float()
-
-        mask = torch.zeros_like(target, dtype=torch.bool)
-        mask[:, :] = True
-        noisy = target.masked_fill(mask, mask_id)
-
-        Z_student = canvas_forward(model, prefix, noisy, mask=mask).float()
-
-        loss = F.cross_entropy(Z_student[mask], target[mask])
-        total_loss += loss.item()
-        n += 1
-
-        top1_T = Z_teacher.argmax(dim=-1)
-        top1_S = Z_student.argmax(dim=-1)
-
-        if C > 1:
-            correct_1 += (top1_S[:, 1] == top1_T[:, 1]).sum().item()
-            total_1 += B
-
-        if C > 2:
-            correct_2 += (top1_S[:, 2] == top1_T[:, 2]).sum().item()
-            total_2 += B
-
-        if C > 3:
-            correct_3 += (top1_S[:, 3] == top1_T[:, 3]).sum().item()
-            total_3 += B
-
-        if C > 4:
-            correct_4 += (top1_S[:, 4] == top1_T[:, 4]).sum().item()
-            total_4 += B
-
-        if C > 4:
-            correct_2_4 += (top1_S[:, 2:5] == top1_T[:, 2:5]).sum().item()
-            total_2_4 += (B * 3)
-
-    model.train()
-    acc_offset1 = correct_1 / max(1, total_1)
-    acc_offset2 = correct_2 / max(1, total_2)
-    acc_offset3 = correct_3 / max(1, total_3)
-    acc_offset4 = correct_4 / max(1, total_4)
-    acc_offset2_4 = correct_2_4 / max(1, total_2_4)
-    val_loss = total_loss / max(1, n)
-    return {
-        "val_loss": val_loss,
-        "acc_offset1": acc_offset1,
-        "acc_offset2": acc_offset2,
-        "acc_offset3": acc_offset3,
-        "acc_offset4": acc_offset4,
-        "acc_offset2_4": acc_offset2_4,
-    }
-
-
-def save_checkpoint(path, model, mask_id, args, step):
-    """LoRA runs save ~10 MB of adapters; full fine-tunes save the whole model."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ck = {"mask_id": mask_id, "model_name": args.model, "step": step, "args": vars(args)}
-    if getattr(model, "bfg_adapter", None) is not None:
-        ck["bfg_adapter"] = model.bfg_adapter.state_dict()
-    if args.lora:
-        from peft import get_peft_model_state_dict
-
-        ck["lora"] = get_peft_model_state_dict(model)
-        ck["lora_config"] = {
-            "r": args.lora_r,
-            "alpha": args.lora_alpha,
-            "dropout": args.lora_dropout,
-            "targets": list(LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS),
-        }
-        emb = model.get_input_embeddings().weight
-        if emb.requires_grad:
-            ck["mask_emb"] = emb[mask_id].detach().cpu().clone()
-    else:
-        ck["model"] = model.state_dict()
-    torch.save(ck, path)
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    n_threads = args.threads or (os.cpu_count() or 1)
-    torch.set_num_threads(n_threads)
-    try:
-        torch.set_num_interop_threads(2)
-    except RuntimeError:  # already set by an earlier import
-        pass
-    device = pick_device(args.device)
-    if args.dtype == "bf16":
-        selected_dtype = "bf16"
-    elif args.dtype == "fp16":
-        selected_dtype = "fp16"
-    elif args.dtype == "fp32":
-        selected_dtype = "fp32"
-    else:  # auto
-        if device.type == "cuda":
-            cap_major = torch.cuda.get_device_capability(device)[0]
-            selected_dtype = "bf16" if cap_major >= 8 else "fp16"
-        else:
-            selected_dtype = "fp32"
+    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
+    print(f"BFG-Diff v3 Training | Model: {args.model} | Device: {device} | Steps: {args.steps} | LR: {args.lr}")
 
-    use_fp16 = (selected_dtype == "fp16" and device.type == "cuda")
-    # fp16 mixed precision requires model master weights in fp32 to prevent GradScaler unscale errors
-    load_dtype = torch.bfloat16 if selected_dtype == "bf16" else torch.float32
-
-    model, tok, mask_id = prepare(args.model, device=device, dtype=load_dtype)
-    from model import setup_bfg_adapter
-    setup_bfg_adapter(model, lora_r=args.lora_r if args.lora else 16)
-    # Task 3: Wire Analytical SVD Init before loading checkpoint weights (scale=0.0 preserves Delta=0.0 parity)
-    model.bfg_adapter.init_svd_from_embeddings(model.get_input_embeddings().weight, scale=0.0)
-
-    if args.lora:
-        targets = LORA_TARGETS_MLP if args.lora_mlp else LORA_TARGETS
-        model = apply_lora(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets, mask_id=mask_id)
-        # PEFT get_peft_model sets requires_grad = False on non-LoRA modules; explicitly unfreeze BFGDiffAdapter
-        if getattr(model, "bfg_adapter", None) is not None:
-            for param in model.bfg_adapter.parameters():
-                param.requires_grad = True
-        if args.resume and Path(args.resume).exists():
-            print(f"resuming LoRA and mask weights from {args.resume}...")
-            from peft import set_peft_model_state_dict
-            ck = torch.load(args.resume, map_location="cpu")
-            if "lora" in ck:
-                set_peft_model_state_dict(model, ck["lora"])
-            if "mask_emb" in ck:
-                with torch.no_grad():
-                    model.get_input_embeddings().weight[mask_id] = ck["mask_emb"].to(device)
-            if "bfg_adapter" in ck and getattr(model, "bfg_adapter", None) is not None:
-                model.bfg_adapter.load_state_dict(ck["bfg_adapter"], strict=False)
-            print(f"resumed from {args.resume} (source step {ck.get('step', '?')})")
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(
-            f"LoRA r={args.lora_r} alpha={args.lora_alpha} targets={len(targets)}: "
-            f"{trainable:,} / {total:,} params trainable"
-        )
-    ds = (
-        GeneralTextDataset(
-            args.data, tok, args.prefix_len, args.canvas_len,
-            limit=args.limit, max_tokens=args.max_tokens,
-        )
-        if args.data
-        else GeneralTextDataset(
-            tokenizer=tok,
-            prefix_len=args.prefix_len,
-            canvas_len=args.canvas_len,
-            texts=synthetic_texts(args.texts, seed=args.seed),
-        )
-    )
-    assert len(ds) > 1, f"dataset too small: {len(ds)} chunks"
-    n_val = min(len(ds) // 20 + 1, 64, len(ds) - 1)
-    assert len(ds) - n_val >= args.batch_size, "too few chunks for one batch; add data or lower --batch_size"
-    val_ds, train_ds = Subset(ds, range(n_val)), Subset(ds, range(n_val, len(ds)))
-    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
-    print(
-        f"device={device} selected_dtype={selected_dtype} (model={load_dtype}) mask_id={mask_id} "
-        f"train={len(train_ds)} val={len(val_ds)} chunks"
+    # Prepare model + drafter
+    base_dtype = torch.float16 if device == "cuda" else torch.float32
+    base_model, drafter, tok, mask_id = prepare_v3(
+        args.model, device=device, dtype=base_dtype, max_w=args.w + 1
     )
 
-    adapter_params = list(model.bfg_adapter.parameters()) if getattr(model, "bfg_adapter", None) is not None else []
-    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_tokens" not in n]
-    all_trainable = list(dict.fromkeys(trainable_params + adapter_params))
-    opt = torch.optim.AdamW(
-        all_trainable,
-        lr=args.lr,
-        betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
-    )
-    # Track Adam moments for the single mask embedding row to avoid 136M buffer allocations
-    emb_weight = model.get_input_embeddings().weight
-    mask_m = torch.zeros(emb_weight.shape[1], device=device)
-    mask_v = torch.zeros(emb_weight.shape[1], device=device)
-    mask_t = 0
+    # Print parameter breakdown
+    bd = drafter.parameter_breakdown()
+    print("Parameter Breakdown:")
+    for k, v in bd.items():
+        print(f"  {k}: {v}")
 
-    def lr_lambda(update):
-        update += 1  # first update should not use lr=0
-        if update < args.warmup:
-            return update / max(1, args.warmup)
-        total_updates = max(1, math.ceil(args.steps / args.grad_accum))
-        progress = (update - args.warmup) / max(1, total_updates - args.warmup)
+    if args.resume and Path(args.resume).exists():
+        ck = torch.load(args.resume, map_location=device)
+        drafter.load_state_dict(ck["drafter_state_dict"], strict=False)
+        print(f"Warm-started drafter from {args.resume}")
+
+    # Optimizer on drafter params only
+    trainable_params = drafter.get_trainable_parameters()
+    opt = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+
+    # Cosine scheduler with warmup
+    def lr_lambda(step):
+        if step < args.warmup:
+            return float(step + 1) / max(1, args.warmup)
+        progress = float(step - args.warmup) / max(1, args.steps - args.warmup)
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    autocast_dtype = torch.float16 if use_fp16 else (torch.bfloat16 if selected_dtype == "bf16" else torch.float32)
-    autocast_enabled = (use_fp16 or (selected_dtype == "bf16" and device.type == "cuda"))
-    autocast = torch.autocast(
-        device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled
-    )
+    use_fp16 = (device == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-    model.train()
-    opt.zero_grad(set_to_none=True)
-    if args.smoke_test:  # fixed batch + fixed 50% mask: a stable convergence probe
-        probe_prefix, probe_target = next(iter(loader))
-        probe_prefix, probe_target = probe_prefix.to(device), probe_target.to(device)
-        probe_mask = torch.zeros_like(probe_target, dtype=torch.bool)
-        probe_mask[:, ::2] = True
+    # Dataset
+    if args.data and Path(args.data).exists():
+        dataset = OnPolicySequenceDataset(args.data)
+    else:
+        dataset = OnPolicySequenceDataset(create_synthetic_data(num_samples=128, seq_len=96))
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    loader_iter = iter(loader)
 
-        def probe_loss():
-            with torch.no_grad():
-                logits = canvas_forward(
-                    model, probe_prefix, probe_target.masked_fill(probe_mask, mask_id), mask=probe_mask
-                )
-                return F.cross_entropy(logits[probe_mask], probe_target[probe_mask]).item()
+    Path(args.out).mkdir(parents=True, exist_ok=True)
 
-        before = probe_loss()
-        print(f"smoke probe loss (before): {before:.4f}")
-    data_iter = cycle(loader)
-    running, start, last_log = 0.0, time.time(), time.time()
-    tokens = 0
-    logged = 0
+    # Probe loss for smoke test convergence check
+    probe_batch = next(loader_iter).to(device)
+    with torch.no_grad():
+        initial_loss, _ = compute_anchor_distill_loss(
+            base_model, drafter, probe_batch, mask_id, w=args.w, n_anchors=2
+        )
+    before_loss = initial_loss.item()
+    if args.smoke_test:
+        print(f"smoke probe loss (before): {before_loss:.4f}")
+
+    start_time = time.time()
+    drafter.train()
+
     for step in range(1, args.steps + 1):
-        prefix, target = next(data_iter)
-        prefix, target = prefix.to(device), target.to(device)
-        with autocast:
-            loss = diffusion_loss(model, prefix, target, mask_id) / args.grad_accum
+        try:
+            batch = next(loader_iter).to(device)
+        except StopIteration:
+            loader_iter = iter(loader)
+            batch = next(loader_iter).to(device)
+
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_fp16):
+            loss, stats = compute_anchor_distill_loss(
+                base_model, drafter, batch, mask_id, w=args.w, n_anchors=args.n_anchors
+            )
+
         if use_fp16:
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            scaler.step(opt)
+            scaler.update()
         else:
             loss.backward()
-        step_loss = loss.item() * args.grad_accum
-        running += step_loss
-        logged += 1
-        tokens += prefix.numel() + target.numel()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            opt.step()
 
-        if step % args.grad_accum == 0 or step == args.steps:
-            if use_fp16:
-                scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
-            if use_fp16:
-                scaler.step(opt)
-                scaler.update()
-            else:
-                opt.step()
-            sched.step()  # one schedule step per optimizer update
-            opt.zero_grad(set_to_none=True)
-
-            # Update the single [MASK] row with Adam moments
-            if emb_weight.requires_grad and emb_weight.grad is not None:
-                g = emb_weight.grad[mask_id]
-                if use_fp16:
-                    g = g / scaler.get_scale()
-                if torch.isfinite(g).all():
-                    mask_t += 1
-                    beta1, beta2, eps = 0.9, 0.95, 1e-8
-                    mask_m = beta1 * mask_m + (1.0 - beta1) * g
-                    mask_v = beta2 * mask_v + (1.0 - beta2) * (g ** 2)
-                    m_hat = mask_m / (1.0 - beta1 ** mask_t)
-                    v_hat = mask_v / (1.0 - beta2 ** mask_t)
-                    lr = sched.get_last_lr()[0]
-                    with torch.no_grad():
-                        emb_weight[mask_id] -= lr * m_hat / (torch.sqrt(v_hat) + eps)
-                emb_weight.grad.zero_()
+        sched.step()
 
         if step % args.log_every == 0 or step == 1:
-            now = time.time()
+            elapsed = time.time() - start_time
             print(
-                f"step {step:5d}/{args.steps} loss {running / max(1, logged):.4f} "
-                f"lr {sched.get_last_lr()[0]:.2e} tok/s {tokens / max(now - last_log, 1e-6):,.0f} "
-                f"elapsed {now - start:.0f}s"
-            )
-            running, tokens, logged, last_log = 0.0, 0, 0, now
-
-        if step % args.eval_every == 0 or step == args.steps:
-            val_res = evaluate(model, val_loader, mask_id, device, args.eval_batches)
-            val_loss = val_res["val_loss"]
-            acc1 = val_res["acc_offset1"]
-            acc2 = val_res["acc_offset2"]
-            acc3 = val_res["acc_offset3"]
-            acc4 = val_res["acc_offset4"]
-            acc2_4 = val_res["acc_offset2_4"]
-            print(
-                f"step {step:5d} val_loss {val_loss:.4f} "
-                f"acc_offset1 {acc1:.1%} acc_offset2 {acc2:.1%} "
-                f"acc_offset3 {acc3:.1%} acc_offset4 {acc4:.1%} "
-                f"(acc_offset2_4 {acc2_4:.1%})"
+                f"step {step:5d}/{args.steps} loss {stats['loss']:.4f} "
+                f"lr {sched.get_last_lr()[0]:.2e} "
+                f"A_+1: {stats['acc_offset1']:.1%} A_+2: {stats['acc_offset2']:.1%} A_+3: {stats['acc_offset3']:.1%} "
+                f"elapsed {elapsed:.0f}s"
             )
 
         if step % args.save_every == 0 or step == args.steps:
-            save_checkpoint(Path(args.out) / "last.pt", model, mask_id, args, step)
-            if step % args.save_every == 0 and step != args.steps:
-                save_checkpoint(Path(args.out) / f"ckpt-{step}.pt", model, mask_id, args, step)
+            save_path = Path(args.out) / f"ckpt-{step}.pt"
+            torch.save(
+                {
+                    "step": step,
+                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
+                    "args": vars(args),
+                    "bd": bd,
+                },
+                save_path,
+            )
+            # Link/copy last.pt
+            torch.save(
+                {
+                    "step": step,
+                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
+                    "args": vars(args),
+                    "bd": bd,
+                },
+                Path(args.out) / "last.pt",
+            )
 
     if args.smoke_test:
-        after = probe_loss()
-        ok = math.isfinite(after) and after < before
-        print(f"smoke convergence: {before:.4f} -> {after:.4f} {'PASS' if ok else 'FAIL'}")
+        with torch.no_grad():
+            after_loss_t, _ = compute_anchor_distill_loss(
+                base_model, drafter, probe_batch, mask_id, w=args.w, n_anchors=2
+            )
+        after_loss = after_loss_t.item()
+        ok = math.isfinite(after_loss) and after_loss < before_loss
+        print(f"smoke convergence: {before_loss:.4f} -> {after_loss:.4f} {'PASS' if ok else 'FAIL'}")
         if not ok:
-            raise SystemExit(1)
-    print(f"saved {Path(args.out) / 'last.pt'}")
+            sys.exit(1)
+
+    print(f"Finished training. Saved checkpoint to {Path(args.out) / 'last.pt'}")
 
 
 if __name__ == "__main__":
