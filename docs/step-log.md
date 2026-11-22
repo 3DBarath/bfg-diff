@@ -972,3 +972,25 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 
 
 
+
+## 53. Speculative Callback Contract, Stop-Token Truncation, CLI Window Defaults (2026-11-22)
+- **`sampler_v3.py`:**
+  - Emitted an initial `step: 0` callback event carrying the prefill token, so SSE streams
+    show token 0 at once. `on_step` maps `block_idx` through `max(0, step - 1)`.
+  - Replaced the unguarded `k` / `t0` reads in the callback with per-step
+    `step_committed`, `step_accepted`, and `hedge_hit`, initialised at the top of each
+    `while` iteration and assigned in Case A, Case B, Case C, and the linear branch. Fixes the
+    Case C `UnboundLocalError`.
+  - Truncated `step_committed` at the first token in `stop_set` before the callback, so stop
+    tokens never render as Visualizer pills. Output tensors are unchanged.
+- **`chat.py`:** `generate_v3_traced(v_tokens=None)` reuses the cached CPU `W = 3` engine;
+  `trace_cb` records `q_a`; both CLI trace prints use `{accepted}/{q_a - 1}`.
+- **`benchmark_v3.py`:** added `--v_tokens` (default `None`), threaded into both
+  `StaticDraftEngine` instances and `generate_speculative_v3`; the profiler allocates
+  `dummy_v` with `eng.q_a` columns and prints the real `Q_A` / `W`.
+- **`test_v4_units.py`:** added Test 6 `test_cpu_lazy_commit_v3_leaf_hedge` (CPU lazy commit,
+  `W = 3`, `hedge_margin = 2.0`, streamed-vs-generated-vs-`generate()` token parity) and
+  updated `test_hedge_case_c_callback` for the step-0 event.
+- **Verification:** `python -m py_compile sampler_v3.py chat.py benchmark_v3.py test_v4_units.py`
+  printed `COMPILE_OK`. `test_v4_units.py`, `test_v3_gates.py`, and `benchmark_v3.py` each stop
+  at `ModuleNotFoundError: No module named 'torch'` on this host, so no runtime result exists.

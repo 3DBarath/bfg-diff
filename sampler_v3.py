@@ -953,6 +953,17 @@ def generate_speculative_v3(
     hedge_attempts = 0
     hedge_hits = 0
 
+    if step_callback is not None and not done[0]:
+        step_callback({
+            "step": 0,
+            "committed_tokens": [int(next_token[0, 0])],
+            "accepted": 0,
+            "is_hedge": False,
+            "hedge_hit": False,
+            "q_a": engine.q_a,
+            "total_generated": 1,
+        })
+
     # Pre-allocated reusable buffers for hot loop (zero per-step heap allocations)
     verify_input_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
     pos_override_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
@@ -960,6 +971,9 @@ def generate_speculative_v3(
     while not all(done) and any((cur_pos_list[b] - P) < max_new_tokens for b in range(B)):
         y_star = next_token  # (B, 1) concrete bonus token at position t
         t = cur_pos_list[0]
+        step_committed = []
+        step_accepted = 0
+        hedge_hit = False
 
         # Stage 2: Draft W tokens
         draft_ids, draft_logits = engine.forward_draft_step(
@@ -1037,6 +1051,8 @@ def generate_speculative_v3(
                 accepted_draft_tokens += k
 
                 committed_tokens = torch.cat([verify_input[0, 1 : k + 1], target_tokens[0, k : k + 1]], dim=0)
+                step_accepted = k
+                step_committed = [int(x) for x in committed_tokens]
 
                 # CPU Lazy Draft KV Commit
                 if engine.device.type != "cuda":
@@ -1063,6 +1079,9 @@ def generate_speculative_v3(
                 hedge_hits += 1
                 t_bonus = target_tokens[0, (engine.q_a - 1) : engine.q_a]
                 committed_tokens = torch.cat([torch.tensor([d0_2], device=engine.device), t_bonus], dim=0)
+                step_accepted = 1
+                hedge_hit = True
+                step_committed = [int(x) for x in committed_tokens]
 
                 # Commit hedge slot KV to slot 1 (position t + 1) in target_cache
                 for l_idx in range(engine.total_layers):
@@ -1100,6 +1119,8 @@ def generate_speculative_v3(
             else:
                 # Case C: Neither candidate matches slot 0. Emit t0 as bonus token
                 committed_tokens = target_tokens[0, 0:1]
+                step_accepted = 0
+                step_committed = [int(x) for x in committed_tokens]
 
                 # CPU Lazy Draft KV Commit for slot 0 at t
                 if engine.device.type != "cuda":
@@ -1152,6 +1173,10 @@ def generate_speculative_v3(
                 else:
                     committed_tokens = target_tokens[b, 0:1]
 
+                if b == 0:
+                    step_accepted = k
+                    step_committed = [int(x) for x in committed_tokens]
+
                 cp = cur_pos_list[b]
                 # CPU Lazy Draft KV Commit for accepted tokens [cp .. cp + k]
                 if engine.device.type != "cuda":
@@ -1179,12 +1204,17 @@ def generate_speculative_v3(
 
         steps += 1
         if step_callback is not None:
+            cb_tokens = []
+            for tid in step_committed:
+                if tid in stop_set:
+                    break
+                cb_tokens.append(tid)
             step_callback({
                 "step": steps,
-                "committed_tokens": [int(x) for x in committed_tokens],
-                "accepted": k if not (is_hedge and t0 == d0_2) else 1,
+                "committed_tokens": cb_tokens,
+                "accepted": step_accepted,
                 "is_hedge": is_hedge,
-                "hedge_hit": (is_hedge and t0 == d0_2),
+                "hedge_hit": hedge_hit,
                 "q_a": engine.q_a,
                 "total_generated": sum(len(c) for c in generated_per_row[0]) - P,
             })

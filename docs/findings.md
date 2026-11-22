@@ -1825,3 +1825,59 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
 
 
 
+
+## 55. Leaf-Hedge Case C Crash, Prefill Streaming, Stop-Token Pills, CLI/CLI-Benchmark `v_tokens` (2026-11-22)
+
+### 1. Fault: `UnboundLocalError` on `k` in Leaf-Hedge Case C
+- **Cause:** `generate_speculative_v3` assigned `k` only in Case A (`k = 1`) and in the
+  linear branch (`k = 0` per row). Case B and Case C never assigned it, but the
+  `step_callback` payload read `k` for `"accepted"`.
+- **Effect:** a Case C step (target top-1 matches neither `d0_1` nor `d0_2`) raised
+  `UnboundLocalError: cannot access local variable 'k'` on step 1. On later steps the
+  payload carried the stale `k` of the previous step. `chat.py` passes a callback on every
+  `/api/chat` and `/api/generate` request, so live SSE streaming crashed.
+- **Fix:** the loop body now owns the per-step report. `step_committed = []`,
+  `step_accepted = 0`, `hedge_hit = False` are set at the top of every `while` iteration and
+  assigned explicitly in each branch: Case A `step_accepted = k`, Case B
+  `step_accepted = 1` with `hedge_hit = True`, Case C `step_accepted = 0`, and the linear
+  branch for `b == 0`. The callback no longer reads `k` or `t0`.
+
+### 2. Fault: Prefill Token Missing From Live Stream
+- **Cause:** the post-prefill token is appended to `generated_per_row` before the loop and was
+  never reported through `step_callback`. `generate_v3_stream` builds `accumulated_tokens`
+  from `evt["committed_tokens"]` only, so the first token of every streamed reply appeared
+  only in `chat_done` / `bfg_done`.
+- **Fix:** when `step_callback is not None and not done[0]`, an initial event is emitted after
+  prefill with `step: 0`, `committed_tokens: [token]`, `accepted: 0`, `is_hedge: False`,
+  `hedge_hit: False`, `q_a`, and `total_generated: 1`. `generate_v3_stream.on_step` maps
+  `block_idx` through `max(0, step - 1)` so the event never creates a `-1` block.
+
+### 3. Fault: Stop Tokens Rendered as Visualizer Pills
+- **Cause:** `committed_tokens` can contain `<|im_end|>` / `<|endoftext|>`; the callback
+  forwarded them verbatim.
+- **Fix:** the callback payload truncates at the first token in `stop_set`. The token tensor
+  appended to `generated_per_row` is unchanged, so output parity is unaffected.
+
+### 4. CLI and Benchmark Window Overrides
+- `generate_v3_traced(v_tokens=7)` overrode the engine auto-adaptation on the CLI path. The
+  default is now `None`, so the cached `W = 3` CPU engine is reused instead of reallocating a
+  `W = 7` engine per prompt.
+- The CLI trace print now shows `{accepted}/{q_a - 1}`; `trace_cb` records `q_a` per step.
+- `benchmark_v3.py` gained `--v_tokens` (default `None`), threaded into both
+  `StaticDraftEngine` instances and `generate_speculative_v3`. The latency profiler allocates
+  `dummy_v` with `eng.q_a` columns and prints the real `T_verify (Q_A=...)` / `T_draft (4L, W=...)`.
+
+### 5. Verification
+- **Command:** `python -m py_compile sampler_v3.py chat.py benchmark_v3.py test_v4_units.py`
+  -> `COMPILE_OK`.
+- **New checks:** `test_v4_units.py::test_hedge_case_c_callback` (stub engine, forced Case C,
+  asserts the step-0 prefill event and `accepted == 0`) and
+  `test_cpu_lazy_commit_v3_leaf_hedge` (Test 6: CPU `W = 3`, `hedge_margin = 2.0`, live
+  callback, asserts streamed tokens == generated tokens == `base_model.generate`).
+- **Limit:** this host has no `torch` install (`AD/.venv` from section 1 is gone). The commands
+  `python test_v4_units.py`, `python test_v3_gates.py --model Qwen/Qwen2.5-0.5B`, and
+  `python benchmark_v3.py --smoke_test --model Qwen/Qwen2.5-0.5B` all stop at
+  `ModuleNotFoundError: No module named 'torch'`, so no runtime result is recorded here.
+- **Known behavior:** the Visualizer groups the step-0 prefill event and the first speculative
+  pass into block 0 (`block_idx = max(0, step - 1)`), and the block header keeps the accepted
+  count of the event that created it.

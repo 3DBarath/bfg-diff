@@ -211,7 +211,7 @@ def generate_v3_stream(
         token_strs = [tok.decode([t]) for t in c_tokens] if c_tokens else ["░"]
         step_callback({
             "type": "bfg_step",
-            "block_idx": evt["step"] - 1,
+            "block_idx": max(0, evt["step"] - 1),
             "step": evt["step"],
             "tokens": token_strs,
             "text": current_text,
@@ -274,7 +274,7 @@ def generate_v3_traced(
     bundle: dict,
     prompt_text: str,
     max_new_tokens: int = 64,
-    v_tokens: int = 7,
+    v_tokens: Optional[int] = None,
     temperature: float = 0.0,
     stop_tokens: Optional[List[str]] = None,
 ) -> dict:
@@ -289,6 +289,7 @@ def generate_v3_traced(
             "tps": evt["tps"],
             "elapsed": evt["elapsed"],
             "accepted": evt.get("accepted", 0),
+            "q_a": evt.get("q_a", bundle["engine"].q_a),
         })
 
     res = generate_v3_stream(
@@ -2404,7 +2405,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-in
         if visualize:
             print("\n[Step-by-Step Speculative Verification Trace]")
             for st in res["trace"]:
-                print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
+                print(f"  Step {st['step']}: {st['accepted']}/{st.get('q_a', 8) - 1} drafts accepted -> {' '.join(st['tokens'])}")
             print()
 
         print(f"BFG-Diff v4 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
@@ -2473,7 +2474,7 @@ def main():
         if args.visualize:
             print("\n[Step-by-Step Speculative Verification Trace]")
             for st in res["trace"]:
-                print(f"  Step {st['step']}: {st['accepted']}/7 drafts accepted -> {' '.join(st['tokens'])}")
+                print(f"  Step {st['step']}: {st['accepted']}/{st.get('q_a', 8) - 1} drafts accepted -> {' '.join(st['tokens'])}")
             print()
         print(f"BFG-Diff v4 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])

@@ -163,6 +163,7 @@ def run_benchmark(
     cpu_quant: str = "int8",
     device: str = "auto",
     smoke_test: bool = False,
+    v_tokens: int = None,
 ):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -204,7 +205,7 @@ def run_benchmark(
         w_inputs = tok(warmup_prompts, return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
             base_model.generate(**w_inputs, max_new_tokens=16, do_sample=False)
-            generate_speculative_v3(base_model, drafter, w_inputs["input_ids"], mask_token_id=mask_id, max_new_tokens=16)
+            generate_speculative_v3(base_model, drafter, w_inputs["input_ids"], mask_token_id=mask_id, max_new_tokens=16, v_tokens=v_tokens)
         sync_device()
 
     # 1. Baseline 1: Standard HF model.generate()
@@ -289,7 +290,7 @@ def run_benchmark(
         drafter=drafter,
         max_len=engine_max_len,
         batch_size=batch_size,
-        v_tokens=7,
+        v_tokens=v_tokens,
         device=device,
         dtype=base_dtype,
         use_cuda_graph=(batch_size == 1),
@@ -315,6 +316,7 @@ def run_benchmark(
                 temperature=temperature,
                 engine=shared_engine,
                 hedge_margin=hedge_margin,
+                v_tokens=v_tokens,
             )
         sync_device()
         elapsed = time.perf_counter() - t0
@@ -367,11 +369,11 @@ def run_benchmark(
     hedge_hit_rate = (total_hedge_hits / max(1, total_hedge_attempts)) * 100.0
 
     # Profile isolated verify and draft step times on populated P=128 cache
-    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=7, device=device, dtype=base_dtype)
+    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=v_tokens, device=device, dtype=base_dtype)
     dummy_p = torch.randint(100, 1000, (1, 128), device=device)
     _, f_last = eng.prefill(dummy_p)
     dummy_y = dummy_p[:, -1:]
-    dummy_v = torch.randint(100, 1000, (1, 8), device=device)
+    dummy_v = torch.randint(100, 1000, (1, eng.q_a), device=device)
 
     sync_device()
     t0 = time.perf_counter()
@@ -405,8 +407,8 @@ def run_benchmark(
     print(f"{'A_+3 Acceptance Rate':<35}{'-':>15}{f'{a3:.1f}%':>15}")
     print(f"{'A_+4 Acceptance Rate':<35}{'-':>15}{f'{a4:.1f}%':>15}")
     print(f"{'Leaf-Hedge Hit Rate':<35}{'-':>15}{f'{hedge_hit_rate:.1f}% ({total_hedge_hits}/{total_hedge_attempts})':>15}")
-    print(f"{'T_verify (Q_A=8)':<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
-    print(f"{'T_draft (4L, W=7)':<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+    print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
+    print(f"{'T_draft (4L, W=%d)' % eng.w:<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%':>15}{f'{consistency_pct:.1f}%':>15}")
     print(f"{'4-gram Entropy (H4)':<35}{ngram_entropy(all_raw_seqs):>15.3f}{ngram_entropy(all_spec_seqs):>15.3f}")
     print(f"{'4-gram Repetition (rep4)':<35}{repeat_rate(all_raw_seqs):>14.1%}{repeat_rate(all_spec_seqs):>14.1%}")
@@ -429,6 +431,7 @@ def main():
     p.add_argument("--cpu_quant", default="int8", choices=["int8", "int4", "none"], help="CPU quantization mode (default: int8)")
     p.add_argument("--device", default="auto")
     p.add_argument("--smoke_test", action="store_true")
+    p.add_argument("--v_tokens", type=int, default=None, help="Draft window W (default: auto, 3 on CPU / 7 on CUDA)")
     args = p.parse_args()
 
     run_benchmark(
@@ -442,6 +445,7 @@ def main():
         cpu_quant=args.cpu_quant,
         device=args.device,
         smoke_test=args.smoke_test,
+        v_tokens=args.v_tokens,
     )
 
 

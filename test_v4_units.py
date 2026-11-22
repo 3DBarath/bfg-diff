@@ -227,6 +227,116 @@ def test_synthetic_case_b_hedge_hit():
     print("PASS: Synthetic Case B Hedge verification matches ground truth exactly\n")
 
 
+def test_hedge_case_c_callback():
+    print("--- Test 5: Leaf-Hedge Case C Reports Without UnboundLocalError ---")
+    # Stub engine: deterministic Case C (t0 matches neither d0_1 nor d0_2) on step 1.
+    vocab = 16
+
+    class _StubEngine:
+        def __init__(self):
+            self.device = torch.device("cpu")
+            self.v_tokens, self.w, self.q_a = 3, 3, 4
+            self.max_len, self.batch_size = 512, 1
+            self.total_layers, self.k_layers = 0, 0
+            self.target_cache = self.draft_cache = None
+
+        def prefill(self, input_ids):
+            logits = torch.full((1, 1, vocab), -100.0)
+            logits[0, 0, 2] = 100.0  # prefill token
+            return logits, torch.zeros(1, 1, 4)
+
+        def forward_draft_step(self, y_star_ids, mask_token_id, f_ctx_last, cur_pos_list, return_logits=False):
+            logits = torch.full((1, 3, vocab), -100.0)
+            logits[0, 0, 0], logits[0, 0, 1] = 9.0, 8.0  # d0_1=0, d0_2=1, margin 1.0
+            logits[0, 1, 3] = logits[0, 2, 4] = 9.0
+            return torch.zeros(1, 3, dtype=torch.long), logits
+
+        def forward_verify_step(self, verify_tokens, cur_pos_list, is_hedge=False, pos_verify_override=None):
+            logits = torch.full((1, 4, vocab), -100.0)
+            for i, tid in enumerate((5, 6, 7, 8)):
+                logits[0, i, tid] = 100.0
+            return logits, torch.zeros(1, 4, 4)
+
+        def commit_accepted_tokens(self, *args, **kwargs):
+            pass
+
+    events = []
+    generate_speculative_v3(
+        base_model=torch.nn.Linear(1, 1),
+        drafter=None,
+        input_ids=torch.tensor([[10, 11, 12, 13]]),
+        max_new_tokens=1,
+        engine=_StubEngine(),
+        hedge_margin=2.0,
+        step_callback=events.append,
+    )
+
+    assert len(events) == 2, f"Expected a prefill event plus 1 step event, got {len(events)}"
+    assert events[0]["step"] == 0 and events[0]["committed_tokens"] == [2], "Prefill token must stream as step 0"
+    evt = events[1]
+    assert evt["is_hedge"] and not evt["hedge_hit"], "Stub must take the Case C branch"
+    assert evt["accepted"] == 0, f"Case C accepts no draft tokens, got {evt['accepted']}"
+    assert evt["committed_tokens"] == [5], f"Case C must stream the bonus token, got {evt['committed_tokens']}"
+    print("PASS: Case C callback reports cleanly and includes the prefill token\n")
+
+
+def test_cpu_lazy_commit_v3_leaf_hedge():
+    print("--- Test 6: CPU Lazy Commit + 2+1 Leaf-Hedge Streaming Parity ---")
+    base_model, drafter, tok, mask_id = prepare_v3("Qwen/Qwen2.5-0.5B", device="cpu", dtype=torch.float32)
+    drafter.merge_ghost_weights(dtype=torch.float32)
+
+    engine = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=256,
+        batch_size=1,
+        v_tokens=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        use_cuda_graph=False,
+    )
+
+    prompt = "The primary advantage of speculative decoding is"
+    input_ids = tok(prompt, return_tensors="pt")["input_ids"]
+    P = input_ids.shape[1]
+    max_new = 32
+
+    with torch.no_grad():
+        ref_out = base_model.generate(input_ids=input_ids, max_new_tokens=max_new, do_sample=False)
+
+    streamed = []
+
+    def collect(evt):
+        streamed.extend(evt["committed_tokens"])
+
+    with torch.no_grad():
+        spec_out, stats = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine,
+            hedge_margin=2.0,
+            step_callback=collect,
+        )
+
+    ref_gen = ref_out[0, P:]
+    spec_gen = spec_out[0, P:]
+    stream_t = torch.tensor(streamed, dtype=torch.long)
+
+    print(f"Engine W={engine.w}, Q_A={engine.q_a} | hedge attempts={stats['hedge_attempts']}, hits={stats['hedge_hits']}")
+    print(f"Reference={len(ref_gen)} Speculative={len(spec_gen)} Streamed={len(stream_t)} tokens")
+
+    assert len(stream_t) >= len(spec_gen), f"Streamed {len(stream_t)} tokens, generated {len(spec_gen)}"
+    assert torch.equal(stream_t[: len(spec_gen)], spec_gen), "Streamed tokens differ from generated tokens (token 0 dropped?)"
+    assert int(stream_t[0]) == int(spec_gen[0]), "First streamed token is not the prefill token"
+    assert torch.equal(ref_gen, spec_gen), "CPU lazy-commit output differs from base model greedy"
+    assert stats["hedge_attempts"] > 0, "hedge_margin=2.0 produced no hedge attempts"
+    print("PASS: CPU lazy commit + 2+1 leaf-hedge streams every token in exact greedy parity\n")
+
+
 def test_quantized_int8_cpu_parity():
     print("--- Test 5: INT8 Quantized CPU Execution & Parity ---")
     base_model, drafter, tok, mask_id = prepare_v3("Qwen/Qwen2.5-0.5B", device="cpu", dtype=torch.float32)
@@ -298,9 +408,11 @@ def test_quantized_int8_cpu_parity():
 
 
 if __name__ == "__main__":
+    test_hedge_case_c_callback()
     test_ghost_weights_unit()
     test_wal_scratch_bucket_transitions()
     test_leaf_hedge_lossless_cases()
     test_synthetic_case_b_hedge_hit()
+    test_cpu_lazy_commit_v3_leaf_hedge()
     test_quantized_int8_cpu_parity()
     print("ALL V4 UNIT TESTS PASSED!")
