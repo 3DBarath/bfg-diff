@@ -101,13 +101,14 @@ class SoftRefinementBridge(nn.Module):
     Takes Pass-2 inputs:
     - tok_emb_2: (B, w, D) (slot 0 = y*_emb, slots 1..w-1 = shifted soft expected embeddings from Pass 1)
     - h1: (B, w, D) (Pass 1 top-layer output before drafter.norm)
-    - f_ctx_last: (B, 1, D) (prefix context anchor)
+    - f_ctx_last: Optional (B, 1, D) (prefix context anchor, kept for backward compatibility)
     """
 
-    def __init__(self, dim: int, max_w: int = 8, bottleneck: int = 512):
+    def __init__(self, dim: int, max_w: int = 8, bottleneck: int = 256):
         super().__init__()
         self.dim = dim
         self.max_w = max_w
+        self.bottleneck = bottleneck
         self.emb_norm = Qwen2RMSNorm(dim, eps=1e-6)
         self.h1_norm = Qwen2RMSNorm(dim, eps=1e-6)
         self.slot_emb = nn.Parameter(torch.zeros(max_w, dim, dtype=torch.float32))
@@ -121,7 +122,7 @@ class SoftRefinementBridge(nn.Module):
         self,
         tok_emb_2: torch.Tensor,  # (B, w, D)
         h1: torch.Tensor,         # (B, w, D)
-        f_ctx_last: torch.Tensor, # (B, 1, D)
+        f_ctx_last: Optional[torch.Tensor] = None, # (B, 1, D) kept for backward compatibility
     ) -> torch.Tensor:
         B, w, D = tok_emb_2.shape
         w_dtype = self.down.weight.dtype if isinstance(getattr(self.down, "weight", None), torch.Tensor) else tok_emb_2.dtype
@@ -129,7 +130,7 @@ class SoftRefinementBridge(nn.Module):
         norm_tok = self.emb_norm(tok_emb_2.to(w_dtype)) + self.slot_emb[:w].unsqueeze(0).to(w_dtype)
         norm_h1 = self.h1_norm(h1.to(w_dtype))
         delta = self.up(self.act(self.down(torch.cat([norm_tok, norm_h1], dim=-1))))
-        return (f_ctx_last.expand(B, w, self.dim).to(w_dtype) + delta).to(tok_emb_2.dtype)
+        return (h1.to(w_dtype) + delta).to(tok_emb_2.dtype)
 
 
 def compute_shifted_soft_embeds(
@@ -255,6 +256,8 @@ class WeightTiedTopKDrafter(nn.Module):
         max_w: int = 8,
         num_draft_steps: int = 1,
         soft_topk: int = 4,
+        pass2_layers: int = 1,
+        refine_bottleneck: int = 256,
     ):
         super().__init__()
         self.k_layers = k_layers
@@ -263,6 +266,7 @@ class WeightTiedTopKDrafter(nn.Module):
         self.alpha = alpha
         self.num_draft_steps = num_draft_steps
         self.soft_topk = soft_topk
+        self.refine_bottleneck = refine_bottleneck
 
         # Frozen backbone references, kept out of _modules so that .to(), .train()
         # and .state_dict() never touch the 1.5B base model.
@@ -288,11 +292,29 @@ class WeightTiedTopKDrafter(nn.Module):
         # Trainable drafter modules (instantiated in fp32)
         self.fusion = BottleneckFusion(self.dim, num_tapped=4, bottleneck=512)
         self.bridge = ManifoldAlignmentBridge(self.dim, max_w=max_w, bottleneck=512)
-        self.refine_bridge = (
-            SoftRefinementBridge(self.dim, max_w=max_w, bottleneck=512)
-            if self.num_draft_steps > 1
-            else None
-        )
+
+        if self.num_draft_steps > 1:
+            self.pass2_layers = max(1, min(pass2_layers, k_layers))
+            self.refine_bridge = SoftRefinementBridge(self.dim, max_w=max_w, bottleneck=refine_bottleneck)
+            self.pass2_deltas = nn.ModuleList(
+                [
+                    LayerDeltas(
+                        self.dim,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        self.intermediate_size,
+                        r=r,
+                        alpha=alpha,
+                    )
+                    for _ in range(self.pass2_layers)
+                ]
+            )
+        else:
+            self.pass2_layers = 0
+            self.refine_bridge = None
+            self.pass2_deltas = None
+
         self.layer_deltas = nn.ModuleList(
             [
                 LayerDeltas(
@@ -310,6 +332,7 @@ class WeightTiedTopKDrafter(nn.Module):
 
         # Ghost layers for zero-overhead inference
         self.ghost_layers = None
+        self.pass2_ghost_layers = None
         self.has_ghost_layers = False
 
     @property
@@ -344,17 +367,46 @@ class WeightTiedTopKDrafter(nn.Module):
                 proj.weight.requires_grad = False
         if dtype is not None:
             self.ghost_layers.to(dtype=dtype)
+
+        # Merge Pass 2 ghost layers if pass2_deltas is present
+        if getattr(self, "pass2_deltas", None) is not None:
+            p2_source_layers = self.draft_layers[self.k_layers - self.pass2_layers :]
+            self.pass2_ghost_layers = nn.ModuleList([copy.deepcopy(layer) for layer in p2_source_layers])
+            for p_idx, ghost_layer in enumerate(self.pass2_ghost_layers):
+                deltas = self.pass2_deltas[p_idx]
+                for name, proj in [
+                    ("q_proj", ghost_layer.self_attn.q_proj),
+                    ("k_proj", ghost_layer.self_attn.k_proj),
+                    ("v_proj", ghost_layer.self_attn.v_proj),
+                    ("o_proj", ghost_layer.self_attn.o_proj),
+                    ("gate_proj", ghost_layer.mlp.gate_proj),
+                    ("up_proj", ghost_layer.mlp.up_proj),
+                    ("down_proj", ghost_layer.mlp.down_proj),
+                ]:
+                    delta = getattr(deltas, name)
+                    delta_w = delta.scaling * torch.matmul(delta.lora_B.data.float(), delta.lora_A.data.float())
+                    w_merged = proj.weight.data.float() + delta_w
+                    target_dtype = dtype if dtype is not None else proj.weight.dtype
+                    proj.weight.data.copy_(w_merged.to(target_dtype))
+                    proj.weight.requires_grad = False
+            if dtype is not None:
+                self.pass2_ghost_layers.to(dtype=dtype)
+        else:
+            self.pass2_ghost_layers = None
+
         self.has_ghost_layers = True
         return self
 
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Return list of trainable parameters (fusion, bridge, refine_bridge, layer_deltas)."""
+        """Return list of trainable parameters (fusion, bridge, refine_bridge, layer_deltas, pass2_deltas)."""
         params = []
         params.extend(self.fusion.parameters())
         params.extend(self.bridge.parameters())
         if self.refine_bridge is not None:
             params.extend(self.refine_bridge.parameters())
         params.extend(self.layer_deltas.parameters())
+        if getattr(self, "pass2_deltas", None) is not None:
+            params.extend(self.pass2_deltas.parameters())
         return params
 
     def parameter_breakdown(self) -> dict:
@@ -363,7 +415,8 @@ class WeightTiedTopKDrafter(nn.Module):
         p_bridge = sum(p.numel() for p in self.bridge.parameters())
         p_refine = sum(p.numel() for p in self.refine_bridge.parameters()) if self.refine_bridge is not None else 0
         p_deltas = sum(p.numel() for p in self.layer_deltas.parameters())
-        p_trainable = p_fusion + p_bridge + p_refine + p_deltas
+        p_pass2_deltas = sum(p.numel() for p in self.pass2_deltas.parameters()) if getattr(self, "pass2_deltas", None) is not None else 0
+        p_trainable = p_fusion + p_bridge + p_refine + p_deltas + p_pass2_deltas
         p_base = sum(p.numel() for p in self.base_model.parameters())
         return {
             "dim": self.dim,
@@ -371,11 +424,13 @@ class WeightTiedTopKDrafter(nn.Module):
             "bridge": p_bridge,
             "refine_bridge": p_refine,
             "deltas": p_deltas,
+            "pass2_deltas": p_pass2_deltas,
             "total_drafter": p_trainable,
             "total_base": p_base,
             "trainable_ratio_pct": (p_trainable / max(1, p_base)) * 100.0,
             "tapped_layers": self.tapped_layer_indices,
             "k_layers": self.k_layers,
+            "pass2_layers": getattr(self, "pass2_layers", 0),
             "num_draft_steps": self.num_draft_steps,
         }
 
@@ -395,13 +450,58 @@ class WeightTiedTopKDrafter(nn.Module):
         k_prefix: Optional[torch.Tensor] = None,  # (B, num_kv_heads, S_p, head_dim)
         v_prefix: Optional[torch.Tensor] = None,  # (B, num_kv_heads, S_p, head_dim)
         attn_mask: Optional[torch.Tensor] = None,  # (B, 1, W, S_p + W) bool or float
+        use_pass2: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute one draft layer referencing base_model layer with DraftLoRADelta (or fused ghost weights).
+        When use_pass2=True, accesses pass2_ghost_layers / pass2_deltas using p_idx = layer_idx - (k_layers - pass2_layers).
         Returns: (hidden_states, k_draft_total, v_draft_total)
         """
         B, W, D = hidden_states.shape
 
-        if self.has_ghost_layers:
+        if use_pass2:
+            p_idx = layer_idx - (self.k_layers - self.pass2_layers)
+            if self.has_ghost_layers and self.pass2_ghost_layers is not None:
+                ghost_layer = self.pass2_ghost_layers[p_idx]
+                norm_h = ghost_layer.input_layernorm(hidden_states)
+                q = ghost_layer.self_attn.q_proj(norm_h).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                k_draft = ghost_layer.self_attn.k_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_draft = ghost_layer.self_attn.v_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+                cos_d, sin_d = self.rotary_emb(norm_h, pos_draft)
+                q, k_draft = apply_rotary_pos_emb(q, k_draft, cos_d, sin_d, unsqueeze_dim=1)
+
+                if k_prefix is not None and v_prefix is not None:
+                    k_total = torch.cat([k_prefix, k_draft], dim=2)
+                    v_total = torch.cat([v_prefix, v_draft], dim=2)
+                else:
+                    k_total = k_draft
+                    v_total = v_draft
+
+                if self.num_heads != self.num_kv_heads:
+                    n_rep = self.num_heads // self.num_kv_heads
+                    k_attn = repeat_kv(k_total, n_rep)
+                    v_attn = repeat_kv(v_total, n_rep)
+                else:
+                    k_attn = k_total
+                    v_attn = v_total
+
+                attn_out = F.scaled_dot_product_attention(
+                    q, k_attn, v_attn, attn_mask=attn_mask, dropout_p=0.0
+                )
+                attn_out = attn_out.transpose(1, 2).reshape(B, W, D)
+                hidden_states = hidden_states + ghost_layer.self_attn.o_proj(attn_out)
+
+                norm_post = ghost_layer.post_attention_layernorm(hidden_states)
+                gate = ghost_layer.mlp.gate_proj(norm_post)
+                up = ghost_layer.mlp.up_proj(norm_post)
+                mlp_act = ghost_layer.mlp.act_fn(gate) * up
+                down = ghost_layer.mlp.down_proj(mlp_act)
+                hidden_states = hidden_states + down
+                return hidden_states, k_draft, v_draft
+            else:
+                base_layer = self.draft_layers[layer_idx]
+                deltas = self.pass2_deltas[p_idx]
+        elif self.has_ghost_layers:
             ghost_layer = self.ghost_layers[layer_idx]
             norm_h = ghost_layer.input_layernorm(hidden_states)
             q = ghost_layer.self_attn.q_proj(norm_h).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
@@ -439,10 +539,10 @@ class WeightTiedTopKDrafter(nn.Module):
             down = ghost_layer.mlp.down_proj(mlp_act)
             hidden_states = hidden_states + down
             return hidden_states, k_draft, v_draft
-
-        # Standard training / unfused forward path
-        base_layer = self.draft_layers[layer_idx]
-        deltas = self.layer_deltas[layer_idx]
+        else:
+            # Standard training / unfused forward path (Pass 1)
+            base_layer = self.draft_layers[layer_idx]
+            deltas = self.layer_deltas[layer_idx]
 
         # 1. Input RMSNorm
         norm_h = base_layer.input_layernorm(hidden_states)
@@ -559,8 +659,9 @@ class WeightTiedTopKDrafter(nn.Module):
             )
             h = self.refine_bridge(tok_emb_2, h, f_ctx_last)
 
-            # Re-run same draft layers with same prefix KV and mask
-            for layer_idx in range(self.k_layers):
+            # Re-run top pass2_layers with dedicated Pass 2 deltas / ghost weights
+            p2_start = self.k_layers - self.pass2_layers
+            for layer_idx in range(p2_start, self.k_layers):
                 kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
                 vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
                 h, _, _ = self.forward_draft_layer(
@@ -570,6 +671,7 @@ class WeightTiedTopKDrafter(nn.Module):
                     k_prefix=kp,
                     v_prefix=vp,
                     attn_mask=attn_mask,
+                    use_pass2=True,
                 )
 
         # Output head: frozen norm + frozen lm_head
@@ -642,6 +744,8 @@ def prepare_v3(
     max_w: int = 8,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> Tuple[AutoModelForCausalLM, WeightTiedTopKDrafter, AutoTokenizer, int]:
     """Prepare frozen base model + standalone WeightTiedTopKDrafter."""
     if device is None:
@@ -664,6 +768,8 @@ def prepare_v3(
         max_w=max_w,
         num_draft_steps=num_draft_steps,
         soft_topk=soft_topk,
+        pass2_layers=pass2_layers,
+        refine_bottleneck=refine_bottleneck,
     ).to(device)
 
     # Drafter trainable parameters in fp32 for stable training
@@ -713,6 +819,13 @@ def quantize_for_cpu(
                     drafter.ghost_layers[i], {nn.Linear}, dtype=torch.qint8
                 )
                 gc.collect()
+
+        if hasattr(drafter, "pass2_ghost_layers") and drafter.pass2_ghost_layers is not None:
+            for i in range(len(drafter.pass2_ghost_layers)):
+                drafter.pass2_ghost_layers[i] = torch.ao.quantization.quantize_dynamic(
+                    drafter.pass2_ghost_layers[i], {nn.Linear}, dtype=torch.qint8
+                )
+                gc.collect()
         gc.collect()
         print(f"[quantize_for_cpu] Applied in-place dynamic INT8 quantization to base model decoder layers and ghost layers (lm_head kept in fp32).")
 
@@ -723,6 +836,8 @@ def quantize_for_cpu(
             quantize_(base_model, int4_weight_only())
             if hasattr(drafter, "ghost_layers") and drafter.ghost_layers is not None:
                 quantize_(drafter.ghost_layers, int4_weight_only())
+            if hasattr(drafter, "pass2_ghost_layers") and drafter.pass2_ghost_layers is not None:
+                quantize_(drafter.pass2_ghost_layers, int4_weight_only())
             print(f"[quantize_for_cpu] Applied torchao INT4 weight-only quantization.")
         except Exception as e:
             print(f"[quantize_for_cpu] torchao INT4 unavailable ({e}); falling back to in-place dynamic INT8.")
@@ -736,6 +851,12 @@ def quantize_for_cpu(
                 for i in range(len(drafter.ghost_layers)):
                     drafter.ghost_layers[i] = torch.ao.quantization.quantize_dynamic(
                         drafter.ghost_layers[i], {nn.Linear}, dtype=torch.qint8
+                    )
+                    gc.collect()
+            if hasattr(drafter, "pass2_ghost_layers") and drafter.pass2_ghost_layers is not None:
+                for i in range(len(drafter.pass2_ghost_layers)):
+                    drafter.pass2_ghost_layers[i] = torch.ao.quantization.quantize_dynamic(
+                        drafter.pass2_ghost_layers[i], {nn.Linear}, dtype=torch.qint8
                     )
                     gc.collect()
             gc.collect()

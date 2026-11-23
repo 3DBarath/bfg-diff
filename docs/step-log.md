@@ -1080,6 +1080,23 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - `python3 -m py_compile *.py tools/*.py` verified zero syntax errors.
   - `git diff --check` confirmed clean whitespace and formatting.
 
+## 61. Kaggle v5.0 Hardware Evaluation & Path B v5.1 Design (2026-11-23)
+- **Unpacked Kaggle Bundle**: Extracted `runs/bfg_v5_pathb_1.5b/last.pt`, `runs/bfg_v4_clean_1.5b/last.pt`, `data/draft_vocab_32k_v5.pt`, and execution logs from `bfg_v5_bundle.zip`.
+- **Benchmark Evaluation Results**:
+  - Evaluated on 50 prompts, $C=128$, $B=1$, greedy decoding on NVIDIA T4.
+  - v4 Clean Control ($Q_A=16$, 4L 1-step, 32k vocab): **65.3 TPS**, $\alpha = 1.92$, $A_{+1} = 60.7\%$, $A_{+2} = 26.9\%$, $A_{+3} = 6.7\%$, $T_\text{draft} = 3.50\text{ ms}$, consistency $78.0\%$.
+  - v5.0 Path B ($Q_A=16$, 2L 2-step, 32k vocab): **60.9 TPS**, $\alpha = 1.82$, $A_{+1} = 54.4\%$, $A_{+2} = 24.0\%$, $A_{+3} = 5.7\%$, $T_\text{draft} = 4.30\text{ ms}$, consistency $84.0\%$.
+  - v5.0 Path B ($Q_A=8$ Auto): **60.3 TPS**, $\alpha = 1.59$, $A_{+1} = 45.5\%$, $A_{+2} = 12.7\%$, $T_\text{draft} = 4.16\text{ ms}$.
+- **Root Cause Analysis**:
+  1. $4\text{L} \to 2\text{L}$ truncation dropped $A_{+1}$ by $-6.3\text{ pp}$.
+  2. `SoftRefinementBridge` residual anchored to `f_ctx_last` instead of `h1`, losing Pass 1 contextual state, while Pass 2 shared Pass 1 LoRA deltas.
+  3. Short dataset sequence collapse (`min_len = 11`) and aggressive D-PACE discounting (`d_pace_decay = 0.70`).
+- **Path B v5.1 Architecture Implementation Plan**:
+  - Asymmetric $4\text{L} + 1\text{L}$ drafter: 4 Pass-1 layers for maximum $A_{+1}$ accuracy, followed by 1 dedicated Pass-2 refinement layer with dedicated `pass2_deltas` LoRA weights.
+  - `SoftRefinementBridge` bottleneck reduced from 512 to 256; residual connection changed to `h1 + delta`.
+  - Reused Pass-1 prefix KV cache in `[W : W + S]` with zero extra WAL operations and zero additional KV cache memory.
+  - Dataset filtering updated to enforce `min_seq_len = 128` (with smoke test fallback), `d_pace_decay` restored to $0.85$, and PyTorch GradScaler / scheduler step order corrected.
+
 - **Tooling & Benchmark Parity Cleanups**:
   - `tools/build_draft_vocab.py`: Added `--vocab_size` alias, bounded control token IDs by vocab size, and implemented clean dataset fallback to deterministic lowest BPE backfill.
   - `benchmark.py`: Wired `eos_token_id=tok.eos_token_id` into `generate_speculative_v3`, added EOS break and dynamic token counting to `GraphedCausalRunner`, and added `[Divergence Margins Summary]` logging min/max margins across diverging prompts.

@@ -264,7 +264,8 @@ def compute_anchor_distill_loss(
         h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
 
         # Re-run draft layers with refined h2
-        for layer_idx in range(drafter.k_layers):
+        p2_start = drafter.k_layers - drafter.pass2_layers
+        for layer_idx in range(p2_start, drafter.k_layers):
             h2, _, _ = drafter.forward_draft_layer(
                 layer_idx=layer_idx,
                 hidden_states=h2,
@@ -272,6 +273,7 @@ def compute_anchor_distill_loss(
                 k_prefix=kp_all[layer_idx],
                 v_prefix=vp_all[layer_idx],
                 attn_mask=attn_mask,
+                use_pass2=True,
             )
 
         h_norm2 = drafter.norm(h2)
@@ -325,8 +327,11 @@ def parse_args():
     p.add_argument("--drafter_alpha", type=float, default=64.0, help="drafter LoRA alpha (default 64.0)")
     p.add_argument("--num_draft_steps", type=int, default=1, help="draft refinement steps (1 or 2, default 1)")
     p.add_argument("--soft_topk", type=int, default=4, help="top-k tokens for soft expected embedding (default 4)")
+    p.add_argument("--pass2_layers", type=int, default=1, help="number of draft layers to execute in Pass 2 (default 1)")
+    p.add_argument("--refine_bottleneck", type=int, default=256, help="refinement bridge bottleneck dimension (default 256)")
+    p.add_argument("--min_seq_len", type=int, default=128, help="minimum sequence length filter (default 128)")
     p.add_argument("--lambda_pass1", type=float, default=0.3, help="weight for pass 1 loss in 2-step training (default 0.3)")
-    p.add_argument("--d_pace_decay", type=float, default=0.70, help="D-PACE position discount decay (default 0.70)")
+    p.add_argument("--d_pace_decay", type=float, default=0.85, help="D-PACE position discount decay (default 0.85)")
     p.add_argument("--loss_chunk_anchors", type=int, default=4, help="anchor chunk size for fp32 loss computation (default 4)")
     args = p.parse_args()
 
@@ -337,6 +342,7 @@ def parse_args():
         args.warmup = 2
         args.log_every = 1
         args.out = "runs/smoke_v3"
+        args.min_seq_len = args.w + 2
         if args.lr == 3e-4:
             args.lr = 2e-4
     return args
@@ -359,6 +365,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     # Print parameter breakdown
@@ -392,10 +400,13 @@ def main():
         dataset = OnPolicySequenceDataset(args.data)
     else:
         dataset = OnPolicySequenceDataset(create_synthetic_data(num_samples=128, seq_len=96))
-    dataset = dataset.filter_min_len(args.w + 2)
+    min_len_req = max(args.w + 2, args.min_seq_len)
+    raw_n = len(dataset)
+    dataset = dataset.filter_min_len(min_len_req)
+    print(f"Filtered dataset: kept {len(dataset)}/{raw_n} sequences with len >= {min_len_req}")
     if len(dataset) < args.batch_size:
         raise ValueError(
-            f"dataset has {len(dataset)} sequences of at least {args.w + 2} valid tokens, "
+            f"dataset has {len(dataset)} sequences of at least {min_len_req} valid tokens, "
             f"need at least batch_size={args.batch_size}. Regenerate the dataset with "
             "generate_onpolicy.py or lower --batch_size."
         )
@@ -465,12 +476,14 @@ def main():
 
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         if use_fp16:
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
+            if scaler.get_scale() >= scale_before:
+                sched.step()
         else:
             opt.step()
-
-        sched.step()
+            sched.step()
 
         if step % args.log_every == 0 or step == 1:
             elapsed = time.time() - start_time
@@ -489,7 +502,7 @@ def main():
                 "step": step,
                 "drafter_state_dict": {
                     k: v for k, v in drafter.state_dict().items()
-                    if k.startswith(("fusion.", "bridge.", "refine_bridge.", "layer_deltas."))
+                    if k.startswith(("fusion.", "bridge.", "refine_bridge.", "layer_deltas.", "pass2_deltas."))
                 },
                 "args": vars(args),
                 "bd": bd,
@@ -499,6 +512,8 @@ def main():
                     "alpha": args.drafter_alpha,
                     "num_draft_steps": args.num_draft_steps,
                     "soft_topk": args.soft_topk,
+                    "pass2_layers": args.pass2_layers,
+                    "refine_bottleneck": args.refine_bottleneck,
                 },
             }
             save_path = Path(args.out) / f"ckpt-{step}.pt"

@@ -1978,6 +1978,47 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
   - Architecture-aware checkpointing with `"arch"` metadata in `train.py`, `benchmark.py`, and `chat.py`.
   - Test suite expansion: Unit Gate C gradient verification for `refine_bridge`, Unit Gate D train-infer parity for 2-step drafters in `test_gates.py`, and Test 8 in `test_units.py` for exact greedy parity with full and pruned vocab.
 
+### 10.13 Kaggle Hardware Benchmark Findings: v5.0 Path B vs. v4 Clean Control (2026-11-23)
+
+Hardware: Dual NVIDIA T4 GPUs (`cuda:0`, `cuda:1`, Turing sm_75), PyTorch, CUDA.
+Model: `Qwen/Qwen2.5-1.5B`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
+Checkpoints Unpacked from `bfg_v5_bundle.zip`:
+- Control: `runs/bfg_v4_clean_1.5b/last.pt` (4L, 1-step, $Q_A=16$ Tree, 32k Vocab)
+- Candidate: `runs/bfg_v5_pathb_1.5b/last.pt` (2L, 2-step Soft-Emb, $Q_A=16$ Tree, 32k Vocab)
+
+#### Controlled Benchmark Results Summary Table:
+
+| Metric | v4 Clean Control ($Q_A=16$) | v5.0 Path B ($Q_A=16$) | v5.0 Path B ($Q_A=8$ Auto) |
+| :--- | :---: | :---: | :---: |
+| **Throughput (TPS)** | **65.3** | **60.9** | **60.3** |
+| Raw Baseline TPS (HF) | 24.3 | 24.9 | 24.4 |
+| Graphed $Q=1$ Baseline | 49.3 | 49.3 | 49.3 |
+| Speculative Speedup (vs $Q=1$) | **1.32x** | **1.23x** | **1.22x** |
+| Wall-clock Speedup (vs HF) | **2.69x** | **2.44x** | **2.48x** |
+| **Mean Acceptance $\alpha$** | **1.92** | **1.82** | **1.59** |
+| $\Gamma$ Total Acceptance % | 13.2% | 11.7% | 8.5% |
+| **$A_{+1}$ Acceptance Rate** | **60.7%** | **54.4%** | **45.5%** |
+| **$A_{+2}$ Acceptance Rate** | **26.9%** | **24.0%** | **12.7%** |
+| **$A_{+3}$ Acceptance Rate** | **6.7%** | **5.7%** | **2.5%** |
+| **$A_{+4}$ Acceptance Rate** | **0.5%** | **0.8%** | **0.6%** |
+| Leaf-Hedge Hit Rate | 31.0% (968/3118) | 28.6% (943/3297) | 12.7% (273/2148) |
+| $T_\text{verify}$ | 24.58 ms | 24.16 ms | 21.49 ms |
+| $T_\text{draft}$ | 3.50 ms (4L, W=7) | 4.30 ms (2L, Steps=2, W=7) | 4.16 ms (2L, Steps=2, W=7) |
+| Lossless Consistency % | 78.0% (11 mismatches) | 84.0% (8 mismatches) | 80.0% (10 mismatches) |
+| Divergence Margin Bounds | Min: 0.0000, Max: 0.0312 | Min: 0.0000, Max: 0.0312 | Min: 0.0000, Max: 0.0312 |
+| 4-gram Entropy ($H_4$) | 0.950 | 0.949 | 0.949 |
+| 4-gram Repetition ($rep_4$) | 26.0% | 26.9% | 26.8% |
+
+#### Root Cause Diagnosis for v5.0 Trailing v4:
+1. **Pass 1 Backbone Depth Truncation ($4\text{L} \to 2\text{L}$)**:
+   Cutting the drafter stack from 4 layers to 2 layers directly caused a **$-6.3\text{ percentage point}$ penalty on $A_{+1}$** ($60.7\% \to 54.4\%$). In speculative drafting, slot 1 generates the base root candidate; if Pass 1 misses $A_{+1}$, Pass 2 refinement cannot salvage the block.
+2. **Improper Refinement Bridge Anchor Residual & Shared LoRA Weights**:
+   `SoftRefinementBridge` in v5.0 added its residual to `f_ctx_last` instead of the top-layer Pass-1 representation `h1`. This discarded rich token-to-token contextual representations constructed by Pass 1, effectively forcing Pass 2 to start over from the prefix context anchor. Furthermore, Pass 2 shared the identical LoRA deltas as Pass 1 despite operating on soft continuous expected embeddings rather than discrete tokens.
+3. **Training Distribution Deficiencies (Short-Batch Collapse & Fast Discount Decay)**:
+   The dataset filtering used `min_len = 11` (`args.w + 2`), allowing short sequences to collapse the available anchor pool. Concurrently, aggressive D-PACE discounting (`d_pace_decay = 0.70`) severely starved gradients on deeper slots ($A_{+3}$ and $A_{+4}$), preventing Pass 2 from capturing multi-token speculative momentum.
+
+These findings directly motivate the **Path B v5.1** architecture: an asymmetric $4\text{L} + 1\text{L}$ design with dedicated Pass-2 LoRA deltas, `h1 + delta` residual bridge, $256$-dim bottleneck, `min_seq_len = 128`, and `d_pace_decay = 0.85`.
+
 Hardware: NVIDIA T4 GPU (sm_75, Turing), PyTorch 2.14+, CUDA.
 Model: `Qwen/Qwen2.5-1.5B`, Checkpoint: `runs/bfg_v3_1.5b_15k/last.pt`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
 

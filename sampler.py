@@ -165,6 +165,7 @@ class StaticDraftEngine:
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
         self.dim = config.hidden_size
+        self.pass2_layers = getattr(drafter, "pass2_layers", 0)
 
         # Probe hardware/PyTorch support for enable_gqa=True with 4D float additive mask
         self.supports_enable_gqa = False
@@ -483,17 +484,19 @@ class StaticDraftEngine:
             )
             h = self.drafter.refine_bridge(tok_emb_2, h, self.static_f_ctx_last)
 
-            # Re-run k_layers with new h
-            for layer_idx in range(self.k_layers):
-                if self.drafter.has_ghost_layers:
-                    ghost_l = self.drafter.ghost_layers[layer_idx]
+            # Re-run pass2_layers with new h
+            p_start = self.k_layers - self.pass2_layers
+            for p_idx in range(self.pass2_layers):
+                layer_idx = p_start + p_idx
+                if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                    ghost_l = self.drafter.pass2_ghost_layers[p_idx]
                     norm_h = ghost_l.input_layernorm(h)
                     q = ghost_l.self_attn.q_proj(norm_h).view(1, self.w, self.num_heads, self.head_dim).transpose(1, 2)
                     k_d = ghost_l.self_attn.k_proj(norm_h).view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
                     v_d = ghost_l.self_attn.v_proj(norm_h).view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
                 else:
                     base_l = self.drafter.draft_layers[layer_idx]
-                    deltas = self.drafter.layer_deltas[layer_idx]
+                    deltas = self.drafter.pass2_deltas[p_idx]
                     norm_h = base_l.input_layernorm(h)
                     q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h, deltas.q_proj)
                     q = q.view(1, self.w, self.num_heads, self.head_dim).transpose(1, 2)
@@ -522,7 +525,7 @@ class StaticDraftEngine:
                     attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view)
                 attn_out = attn_out.transpose(1, 2).reshape(1, self.w, self.dim)
 
-                if self.drafter.has_ghost_layers:
+                if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                     h = h + ghost_l.self_attn.o_proj(attn_out)
                     norm_post = ghost_l.post_attention_layernorm(h)
                     gate = ghost_l.mlp.gate_proj(norm_post)
@@ -984,17 +987,19 @@ class StaticDraftEngine:
             )
             h = self.drafter.refine_bridge(tok_emb_2, h, f_ctx_last)
 
-            # Re-run k_layers with new h writing to [0:W] scratch tail
-            for layer_idx in range(self.k_layers):
-                if self.drafter.has_ghost_layers:
-                    ghost_l = self.drafter.ghost_layers[layer_idx]
+            # Re-run pass2_layers with new h writing to [0:W] scratch tail
+            p_start = self.k_layers - self.pass2_layers
+            for p_idx in range(self.pass2_layers):
+                layer_idx = p_start + p_idx
+                if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                    ghost_l = self.drafter.pass2_ghost_layers[p_idx]
                     norm_h = ghost_l.input_layernorm(h)
                     q = ghost_l.self_attn.q_proj(norm_h).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
                     k_d = ghost_l.self_attn.k_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
                     v_d = ghost_l.self_attn.v_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
                 else:
                     base_l = self.drafter.draft_layers[layer_idx]
-                    deltas = self.drafter.layer_deltas[layer_idx]
+                    deltas = self.drafter.pass2_deltas[p_idx]
                     norm_h = base_l.input_layernorm(h)
                     q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h, deltas.q_proj)
                     q = q.view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
@@ -1024,7 +1029,7 @@ class StaticDraftEngine:
                     attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask)
                 attn_out = attn_out.transpose(1, 2).reshape(B, W, self.dim)
 
-                if self.drafter.has_ghost_layers:
+                if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                     h = h + ghost_l.self_attn.o_proj(attn_out)
                     norm_post = ghost_l.post_attention_layernorm(h)
                     gate = ghost_l.mlp.gate_proj(norm_post)

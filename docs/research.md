@@ -531,25 +531,28 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
   - Nested micro-batch accumulation decouples gradient step increments from optimizer updates, ensuring the cosine learning rate schedule completes.
   - Shared full-vocab `logsumexp` unifies top-64 Kullback-Leibler divergence with Cross-Entropy loss under exact mathematical normalization.
 
-### 8. BFG-Diff v5 Path B: Weight-Tied 2-Layer, 2-Step Differentiable Soft-Embedding Block Diffusion
+### 8. BFG-Diff v5 Path B: Weight-Tied Asymmetric 4L + 1L Differentiable Soft-Embedding Diffusion
 
-#### A. Architectural Motivation & Budget
-- **Layer & Parameter Reduction**: Shrinks the drafter stack from $K=4$ layers ($r=32$) to $K=2$ layers ($r=32$), reducing parameter footprint from ~6.6M to ~3.9M parameters while cutting single-pass draft forward compute in half.
-- **Two-Step Differentiable Diffusion Cycle**:
-  1. **Pass 1**: The bridge synthesizes initial draft representations $h_1 \in \mathbb{R}^{B \times W \times D}$ from $y^*$ and mask embeddings, which pass through the $K=2$ draft layers attending to prefix KV and their own $W$ block tokens.
-  2. **Soft Refinement Bridge**: Soft predicted token distributions from Pass 1 (slots $0 \dots W-2$) are shifted by one position ($+1$) to align with candidate slots $1 \dots W-1$. Differentiable soft expected embeddings are computed via top-$k$ normalized softmax over the tied embedding matrix:
-     $$\tilde{e}_j = \sum_{m=1}^k \text{Softmax}\left(\frac{z_{j-1}^{(m)}}{\tau}\right) W_\text{emb}[c_m]$$
-     where slot 0 receives $y^*$ embedding.
-  3. `SoftRefinementBridge` combines normalized shifted embeddings with slot embeddings and top-layer Pass 1 representations via an SiLU-activated bottleneck MLP ($\Delta h = W_\text{up} \cdot \text{SiLU}(W_\text{down} [ \text{norm}(e_2), \text{norm}(h_1) ])$ initialized near zero) added to $f_\text{ctx}^\text{last}$.
-  4. **Pass 2**: Draft representations $h_2$ re-enter the identical $K=2$ draft layers, overwriting the `[0:W]` scratch tail in `draft_cache`.
-- **Zero Additional CUDA Graph Overhead**: Pass 2 operates inside the exact same captured bucketed CUDA Graph on the identical `[0:W]` scratch memory, keeping host-side launch overhead at 0.
+#### A. Architectural Motivation & Evolution (v5.0 to v5.1)
+- **v5.0 Bottleneck Analysis**: Initial v5.0 trials evaluated a symmetric 2-layer, 2-step drafter ($K=2$, $r=32$). Controlled benchmark on dual T4 GPUs revealed that halving Pass-1 depth ($4\text{L} \to 2\text{L}$) cost $-6.3\text{ pp}$ on $A_{+1}$ ($60.7\% \to 54.4\%$), capping overall throughput at $60.9\text{ TPS}$ compared to v4's $65.3\text{ TPS}$. Furthermore, anchoring the refinement bridge to `f_ctx_last` wiped out Pass-1 contextual representations, and sharing Pass-1 LoRA weights across both passes conflated discrete and soft-embedding regimes.
+- **Asymmetric $4\text{L} + 1\text{L}$ Drafter (v5.1)**:
+  - **Pass 1 ($K=4$)**: Retains full 4-layer depth with Pass-1 LoRA deltas (`layer_deltas`) to safeguard high $A_{+1}$ acceptance ($>60\%$).
+  - **Differentiable Soft-Refinement Bridge**: Top-layer Pass-1 representations $h_1$ and shifted soft expected embeddings $\tilde{e}_j$ pass through a normalized SiLU bottleneck ($256$ dimensions). Crucially, the residual connection operates directly on $h_1$:
+    $$h_2 = h_1 + \Delta h$$
+    where $\Delta h = W_\text{up} \cdot \text{SiLU}(W_\text{down}[\text{norm}(\tilde{e}_2) + \text{slot\_emb}, \text{norm}(h_1)])$, with $W_\text{up}$ initialized near-zero ($10^{-3}$) for clean identity initialization.
+  - **Dedicated Pass 2 ($1\text{L}$)**: Executes exclusively over the top layer(s) ($p_2 = 1$, i.e. layer index $K-1$) utilizing dedicated Pass-2 LoRA deltas (`pass2_deltas` / `pass2_ghost_layers`).
+  - **Parameter Footprint**: With bottleneck reduced to 256 and 1 dedicated Pass-2 delta layer, total PEFT parameters on Qwen2.5-1.5B remain at $14.10\text{M}$ ($0.913\% < 1.0\%$) and on 3B at $18.32\text{M}$ ($0.593\% < 0.85\%$).
+- **Zero Additional CUDA Graph or Cache Overhead**: Pass 2 operates inside the exact same captured bucketed CUDA Graph on the identical `[0:W]` scratch memory, reusing Pass-1 prefix KV cache in `[W : W + S]` with zero extra WAL operations and zero additional memory allocation.
 
 #### B. Distillation Training & Checkpoint Compatibility
 - **Two-Pass Joint Loss Objective**:
   $$\mathcal{L}_\text{joint} = \lambda_\text{pass1} \mathcal{L}_\text{pass1} + \mathcal{L}_\text{pass2}$$
   with default $\lambda_\text{pass1} = 0.3$.
-- **Chunked FP32 Anchor Distillation**: Anchor Top-64 KL and Cross-Entropy loss is computed over chunks of $N$ anchors (`_chunked_distill_loss`) in FP32, preventing memory spikes during batched 2-pass training.
-- **Backward Compatibility**: Checkpoints save architecture metadata under `"arch"` (`k_layers`, `r`, `alpha`, `num_draft_steps`, `soft_topk`). Checkpoints without `"arch"` default cleanly to v4 configuration ($K=4, r=32, \text{steps}=1$).
+- **Training Stabilization**:
+  - `min_seq_len = 128` prevents short-batch anchor collapse.
+  - `d_pace_decay = 0.85` prevents deep-slot gradient starvation on $A_{+3}/A_{+4}$.
+  - PyTorch GradScaler step order decouples scheduler progression from unscaled skipped steps.
+- **Backward Compatibility**: Checkpoints save architecture metadata under `"arch"` (`k_layers`, `r`, `alpha`, `num_draft_steps`, `soft_topk`, `pass2_layers`, `refine_bottleneck`). Checkpoints without these keys default cleanly to v4 configuration ($K=4, r=32, \text{steps}=1$).
 
 
 #### A. Scaled Autocast Gradients

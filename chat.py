@@ -127,6 +127,8 @@ class V3ModelManager:
                 drafter_alpha=arch_kwargs.get("alpha", 64.0),
                 num_draft_steps=arch_kwargs.get("num_draft_steps", 1),
                 soft_topk=arch_kwargs.get("soft_topk", 4),
+                pass2_layers=arch_kwargs.get("pass2_layers", 1),
+                refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
             )
 
             if ck_payload is not None:

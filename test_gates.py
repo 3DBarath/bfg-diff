@@ -42,6 +42,8 @@ def test_unit_gate_b(
     drafter_alpha: float = 64.0,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> bool:
     """Unit Gate B: Assert trainable_params / total_params < 0.01 on both 1.5B and 3B."""
     print("\n" + "=" * 60)
@@ -72,7 +74,8 @@ def test_unit_gate_b(
         p_bridge = (2 * D * 512) + (512 * D) + D + (8 * D)
 
         # Refine bridge if num_draft_steps > 1
-        p_refine = (2 * D * 512) + (512 * D) + (2 * D) + (8 * D) if num_draft_steps > 1 else 0
+        # Down: 2*D -> refine_bottleneck, Up: refine_bottleneck -> D, Norms: 2*D, Slot: 8*D
+        p_refine = (3 * D * refine_bottleneck + 10 * D) if num_draft_steps > 1 else 0
 
         # 3. k_layers of LoRA deltas: q, k, v, o, gate, up, down
         p_delta_per_layer = (
@@ -85,7 +88,8 @@ def test_unit_gate_b(
             r * mlp_dim + D * r
         )
         p_deltas = k_layers * p_delta_per_layer
-        p_trainable = p_fusion + p_bridge + p_refine + p_deltas
+        p_pass2_deltas = pass2_layers * p_delta_per_layer if num_draft_steps > 1 else 0
+        p_trainable = p_fusion + p_bridge + p_refine + p_deltas + p_pass2_deltas
 
         # Total base parameters estimate
         if "1.5B" in m_name:
@@ -103,7 +107,12 @@ def test_unit_gate_b(
         print(f"\nModel: {m_name} (Layers={L}, Hidden={D}, KV_Heads={num_kv}, MLP={mlp_dim})")
         print(f"  Fusion:        {p_fusion:>10,d} ({p_fusion / 1e6:5.2f}M)")
         print(f"  Bridge:        {p_bridge:>10,d} ({p_bridge / 1e6:5.2f}M)")
-        print(f"  Deltas (4L):   {p_deltas:>10,d} ({p_deltas / 1e6:5.2f}M)")
+        if num_draft_steps > 1:
+            print(f"  Refine Bridge: {p_refine:>10,d} ({p_refine / 1e6:5.2f}M)")
+            print(f"  Deltas (Pass1 {k_layers}L): {p_deltas:>10,d} ({p_deltas / 1e6:5.2f}M)")
+            print(f"  Deltas (Pass2 {pass2_layers}L): {p_pass2_deltas:>10,d} ({p_pass2_deltas / 1e6:5.2f}M)")
+        else:
+            print(f"  Deltas ({k_layers}L):   {p_deltas:>10,d} ({p_deltas / 1e6:5.2f}M)")
         print(f"  Total Drafter: {p_trainable:>10,d} ({p_trainable / 1e6:5.2f}M)")
         print(f"  Trainable Ratio: {ratio_pct:.3f}% (target: <1.000%, 3B target <0.850%)")
 
@@ -125,6 +134,8 @@ def test_unit_gate_a(
     drafter_alpha: float = 64.0,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> bool:
     """Unit Gate A: 100% token-identical output to raw model.generate() across 10 prompts (B=1 and B=4)."""
     print("\n" + "=" * 60)
@@ -140,6 +151,8 @@ def test_unit_gate_a(
         drafter_alpha=drafter_alpha,
         num_draft_steps=num_draft_steps,
         soft_topk=soft_topk,
+        pass2_layers=pass2_layers,
+        refine_bottleneck=refine_bottleneck,
     )
 
     # 1. Test B=1 across 10 prompts
@@ -194,8 +207,10 @@ def test_unit_gate_c(
     drafter_alpha: float = 64.0,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> bool:
-    """Unit Gate C: Verify grad flow across fusion, bridge, slot_emb, and all DraftLoRADelta weights."""
+    """Unit Gate C: Verify grad flow across fusion, bridge, slot_emb, pass2_deltas, and all DraftLoRADelta weights."""
     print("\n" + "=" * 60)
     print(f"UNIT GATE C: Gradient Flow Check on {model_name} (device={device}, k_layers={k_layers}, steps={num_draft_steps})")
     print("=" * 60)
@@ -211,6 +226,8 @@ def test_unit_gate_c(
         drafter_alpha=drafter_alpha,
         num_draft_steps=num_draft_steps,
         soft_topk=soft_topk,
+        pass2_layers=pass2_layers,
+        refine_bottleneck=refine_bottleneck,
     )
 
     # Dummy input sequence
@@ -276,9 +293,32 @@ def test_unit_gate_c(
     # Refine bridge gradients if num_draft_steps > 1
     if drafter.num_draft_steps > 1 and drafter.refine_bridge is not None:
         rb_grads = [p.grad for p in drafter.refine_bridge.parameters() if p.grad is not None]
-        rb_ok = len(rb_grads) > 0 and all(torch.isfinite(g).all() for g in rb_grads)
-        print(f"  Refine Bridge ({len(rb_grads)} tensors): all finite and non-empty: {rb_ok}")
+        rb_ok = len(rb_grads) > 0 and all(torch.isfinite(g).all() for g in rb_grads) and all((g.abs().sum() > 0) for g in rb_grads)
+        print(f"  Refine Bridge ({len(rb_grads)} tensors): all finite, non-zero and non-empty: {rb_ok}")
         if not rb_ok:
+            all_ok = False
+
+    # Pass 2 deltas gradients if present
+    if drafter.num_draft_steps > 1 and getattr(drafter, "pass2_deltas", None) is not None:
+        p2_ok = True
+        for p_idx in range(drafter.pass2_layers):
+            ld = drafter.pass2_deltas[p_idx]
+            for name, delta in [
+                ("q", ld.q_proj),
+                ("k", ld.k_proj),
+                ("v", ld.v_proj),
+                ("o", ld.o_proj),
+                ("gate", ld.gate_proj),
+                ("up", ld.up_proj),
+                ("down", ld.down_proj),
+            ]:
+                ga = delta.lora_A.grad
+                gb = delta.lora_B.grad
+                if ga is None or gb is None or not (torch.isfinite(ga).all() and torch.isfinite(gb).all()) or (ga.abs().sum() == 0) or (gb.abs().sum() == 0):
+                    p2_ok = False
+                    print(f"    Pass2 Layer {p_idx} {name}_proj grad issue (missing, non-finite, or zero)!")
+        print(f"  Pass 2 LoRA Deltas (7 projections x {drafter.pass2_layers} layers): all finite and non-zero: {p2_ok}")
+        if not p2_ok:
             all_ok = False
 
     # LoRA deltas gradients
@@ -322,6 +362,8 @@ def test_unit_gate_d(
     drafter_alpha: float = 64.0,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> bool:
     """Unit Gate D: Exact Numerical Identity between Training & Inference at position t.
     Enforces that train.py's parallel block anchor forward and sampler.py's forward_draft_step
@@ -341,6 +383,8 @@ def test_unit_gate_d(
         drafter_alpha=drafter_alpha,
         num_draft_steps=num_draft_steps,
         soft_topk=soft_topk,
+        pass2_layers=pass2_layers,
+        refine_bottleneck=refine_bottleneck,
     )
 
     torch.manual_seed(42)
@@ -392,7 +436,8 @@ def test_unit_gate_d(
                 top_k=getattr(drafter, "soft_topk", 4),
             )
             h2 = drafter.refine_bridge(tok_emb_2, h, f_last)
-            for layer_idx in range(drafter.k_layers):
+            p2_start = drafter.k_layers - drafter.pass2_layers
+            for layer_idx in range(p2_start, drafter.k_layers):
                 h2, _, _ = drafter.forward_draft_layer(
                     layer_idx=layer_idx,
                     hidden_states=h2,
@@ -400,6 +445,7 @@ def test_unit_gate_d(
                     k_prefix=kp_all[layer_idx],
                     v_prefix=vp_all[layer_idx],
                     attn_mask=attn_mask,
+                    use_pass2=True,
                 )
             train_logits = drafter.lm_head(drafter.norm(h2))
         else:
@@ -466,6 +512,8 @@ def test_gate0_gate1_profile(
     drafter_alpha: float = 64.0,
     num_draft_steps: int = 1,
     soft_topk: int = 4,
+    pass2_layers: int = 1,
+    refine_bottleneck: int = 256,
 ) -> dict:
     """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling with populated P=128 KV cache."""
     print("\n" + "=" * 60)
@@ -482,6 +530,8 @@ def test_gate0_gate1_profile(
         drafter_alpha=drafter_alpha,
         num_draft_steps=num_draft_steps,
         soft_topk=soft_topk,
+        pass2_layers=pass2_layers,
+        refine_bottleneck=refine_bottleneck,
     )
 
     from sampler import StaticDraftEngine
@@ -569,6 +619,8 @@ def main():
     p.add_argument("--drafter_alpha", type=float, default=64.0)
     p.add_argument("--num_draft_steps", type=int, default=1)
     p.add_argument("--soft_topk", type=int, default=4)
+    p.add_argument("--pass2_layers", type=int, default=1)
+    p.add_argument("--refine_bottleneck", type=int, default=256)
     args = p.parse_args()
 
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
@@ -580,6 +632,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     # 2. Unit Gate A (Lossless Parity)
@@ -591,6 +645,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     # 3. Unit Gate C (Gradient Flow)
@@ -602,6 +658,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     # 4. Unit Gate D (Train-Inference Parity)
@@ -613,6 +671,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     # 5. Gate 0 & 1 Roofline Profiling
@@ -624,6 +684,8 @@ def main():
         drafter_alpha=args.drafter_alpha,
         num_draft_steps=args.num_draft_steps,
         soft_topk=args.soft_topk,
+        pass2_layers=args.pass2_layers,
+        refine_bottleneck=args.refine_bottleneck,
     )
 
     print("\n" + "=" * 60)
