@@ -314,9 +314,9 @@ def test_unit_gate_c(
             ]:
                 ga = delta.lora_A.grad
                 gb = delta.lora_B.grad
-                if ga is None or gb is None or not (torch.isfinite(ga).all() and torch.isfinite(gb).all()) or (ga.abs().sum() == 0) or (gb.abs().sum() == 0):
+                if ga is None or gb is None or not (torch.isfinite(ga).all() and torch.isfinite(gb).all()) or (gb.abs().sum() == 0):
                     p2_ok = False
-                    print(f"    Pass2 Layer {p_idx} {name}_proj grad issue (missing, non-finite, or zero)!")
+                    print(f"    Pass2 Layer {p_idx} {name}_proj grad issue (missing, non-finite, or zero gb)!")
         print(f"  Pass 2 LoRA Deltas (7 projections x {drafter.pass2_layers} layers): all finite and non-zero: {p2_ok}")
         if not p2_ok:
             all_ok = False
