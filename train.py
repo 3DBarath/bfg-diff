@@ -52,7 +52,8 @@ class OnPolicySequenceDataset(Dataset):
             if slice_mode == "tail":
                 # Tail-slice up to max_len tokens using per-row valid length
                 N_seq = len(raw_seqs)
-                sliced_seqs = torch.zeros((N_seq, max_len), dtype=raw_seqs.dtype)
+                pad_id = payload.get("pad_token_id", 0)
+                sliced_seqs = torch.full((N_seq, max_len), pad_id, dtype=raw_seqs.dtype)
                 sliced_lens = torch.zeros(N_seq, dtype=torch.long)
                 for i in range(N_seq):
                     L = int(raw_lens[i].item())
@@ -287,8 +288,8 @@ def compute_anchor_distill_loss(
 
         if pass2_mode == "bfork":
             # B-Fork Pass 2: Teacher-forced ground-truth target token at slot 1
-            # targets[:, :, 0] is ground truth for slot 1 (t+1)
-            d0_targets = targets[:, :, 0].reshape(B * N, 1)
+            # targets[:, :, 0] is ground truth for slot 1 (t+1), permuted to match (N, B) packing order
+            d0_targets = targets[:, :, 0].permute(1, 0).reshape(B * N, 1)
             d0_emb = drafter.embed_tokens(d0_targets)
             tok_emb_2 = build_bfork_token_embeds(
                 y_star_emb=y_star_emb,

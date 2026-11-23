@@ -32,7 +32,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import MASK_TOKEN_ID, WeightTiedTopKDrafter, apply_linear_with_delta, apply_rotary_pos_emb_k, compute_shifted_soft_embeds
+from model import (
+    MASK_TOKEN_ID,
+    WeightTiedTopKDrafter,
+    apply_linear_with_delta,
+    apply_rotary_pos_emb_k,
+    build_bfork_token_embeds,
+    compute_shifted_soft_embeds,
+)
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 
@@ -1123,7 +1130,7 @@ class StaticDraftEngine:
                     if self.draft_lm_head_w is not None:
                         z1_s0 = F.linear(h1_s0, self.draft_lm_head_w, self.draft_lm_head_b)
                         topk_root = torch.topk(z1_s0[0, 0], k=self.fork_k)
-                        self.static_fork_root_logits.copy_(z1_s0[0, 0])
+                        self.static_fork_root_logits.copy_(z1_s0[0])
                         self.static_fork_root_local_ids.copy_(topk_root.indices)
                         if self.draft_vocab_ids is not None:
                             self.static_fork_root_global_ids.copy_(self.draft_vocab_ids[topk_root.indices])
@@ -1133,7 +1140,7 @@ class StaticDraftEngine:
                     else:
                         z1_s0 = self.drafter.lm_head(h1_s0)
                         topk_root = torch.topk(z1_s0[0, 0], k=self.fork_k)
-                        self.static_fork_root_logits.copy_(z1_s0[0, 0])
+                        self.static_fork_root_logits.copy_(z1_s0[0])
                         self.static_fork_root_local_ids.copy_(topk_root.indices)
                         self.static_fork_root_global_ids.copy_(topk_root.indices)
                         d0_ids = self.static_fork_root_global_ids.view(self.fork_k, 1)
@@ -1151,15 +1158,22 @@ class StaticDraftEngine:
                     attn_mask_fork = attn_mask.expand(self.fork_k, -1, -1, -1)
                     for p_idx in range(self.pass2_layers):
                         layer_idx = p_start + p_idx
-                        base_l = self.drafter.draft_layers[layer_idx]
-                        deltas = self.drafter.pass2_deltas[p_idx]
-                        norm_h2 = base_l.input_layernorm(h2)
-                        q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
-                        q = q.view(self.fork_k, W, self.num_heads, self.head_dim).transpose(1, 2)
-                        k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
-                        k_d = k_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                        v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
-                        v_d = v_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                            ghost_l = self.drafter.pass2_ghost_layers[p_idx]
+                            norm_h2 = ghost_l.input_layernorm(h2)
+                            q = ghost_l.self_attn.q_proj(norm_h2).view(self.fork_k, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        else:
+                            base_l = self.drafter.draft_layers[layer_idx]
+                            deltas = self.drafter.pass2_deltas[p_idx]
+                            norm_h2 = base_l.input_layernorm(h2)
+                            q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
+                            q = q.view(self.fork_k, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
+                            k_d = k_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
+                            v_d = v_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
                         cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_fork)
                         q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
@@ -1181,12 +1195,20 @@ class StaticDraftEngine:
                             attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask_fork)
                         attn_out = attn_out.transpose(1, 2).reshape(self.fork_k, W, self.dim)
 
-                        h2 = h2 + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
-                        norm_post = base_l.post_attention_layernorm(h2)
-                        gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
-                        up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
-                        mlp_act = base_l.mlp.act_fn(gate) * up
-                        h2 = h2 + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
+                        if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                            h2 = h2 + ghost_l.self_attn.o_proj(attn_out)
+                            norm_post = ghost_l.post_attention_layernorm(h2)
+                            gate = ghost_l.mlp.gate_proj(norm_post)
+                            up = ghost_l.mlp.up_proj(norm_post)
+                            mlp_act = ghost_l.mlp.act_fn(gate) * up
+                            h2 = h2 + ghost_l.mlp.down_proj(mlp_act)
+                        else:
+                            h2 = h2 + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
+                            norm_post = base_l.post_attention_layernorm(h2)
+                            gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
+                            up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
+                            mlp_act = base_l.mlp.act_fn(gate) * up
+                            h2 = h2 + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
                     h2_norm = self.drafter.norm(h2[:, 1:])
                     if self.draft_lm_head_w is not None:
@@ -1224,15 +1246,22 @@ class StaticDraftEngine:
 
                     for p_idx in range(self.pass2_layers):
                         layer_idx = p_start + p_idx
-                        base_l = self.drafter.draft_layers[layer_idx]
-                        deltas = self.drafter.pass2_deltas[p_idx]
-                        norm_h2 = base_l.input_layernorm(h2)
-                        q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
-                        q = q.view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
-                        k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
-                        k_d = k_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                        v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
-                        v_d = v_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                            ghost_l = self.drafter.pass2_ghost_layers[p_idx]
+                            norm_h2 = ghost_l.input_layernorm(h2)
+                            q = ghost_l.self_attn.q_proj(norm_h2).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        else:
+                            base_l = self.drafter.draft_layers[layer_idx]
+                            deltas = self.drafter.pass2_deltas[p_idx]
+                            norm_h2 = base_l.input_layernorm(h2)
+                            q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
+                            q = q.view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
+                            k_d = k_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
+                            v_d = v_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
                         cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_draft)
                         q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
@@ -1254,12 +1283,20 @@ class StaticDraftEngine:
                             attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask)
                         attn_out = attn_out.transpose(1, 2).reshape(B, W, self.dim)
 
-                        h2 = h2 + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
-                        norm_post = base_l.post_attention_layernorm(h2)
-                        gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
-                        up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
-                        mlp_act = base_l.mlp.act_fn(gate) * up
-                        h2 = h2 + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
+                        if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
+                            h2 = h2 + ghost_l.self_attn.o_proj(attn_out)
+                            norm_post = ghost_l.post_attention_layernorm(h2)
+                            gate = ghost_l.mlp.gate_proj(norm_post)
+                            up = ghost_l.mlp.up_proj(norm_post)
+                            mlp_act = ghost_l.mlp.act_fn(gate) * up
+                            h2 = h2 + ghost_l.mlp.down_proj(mlp_act)
+                        else:
+                            h2 = h2 + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
+                            norm_post = base_l.post_attention_layernorm(h2)
+                            gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
+                            up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
+                            mlp_act = base_l.mlp.act_fn(gate) * up
+                            h2 = h2 + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
                     h2_norm = self.drafter.norm(h2[:, 1:])
                     if self.draft_lm_head_w is not None:
@@ -1452,25 +1489,29 @@ def build_forked_tree(
     tree_parents = [-1]    # slot 0 has no parent
     tree_depths = [0]      # slot 0 is at depth 0 (pos t)
 
-    # Seed heap with top-K root candidates at depth 1
+    # Seed heap with top-K root candidates at depth 1 via single GPU-to-CPU transfers
+    root_vals_list = root_log_probs[root_local_ids].tolist()
+    root_globals_list = root_global_ids.tolist()
     for k in range(K):
-        loc_id = int(root_local_ids[k].item())
-        glob_id = int(root_global_ids[k].item())
-        val = float(root_log_probs[loc_id].item())
+        val = float(root_vals_list[k])
+        glob_id = int(root_globals_list[k])
         # Seed item: cum_lp = val, depth = 1, parent_slot = 0, tok = glob_id, branch_idx = k, suffix_step = -1
         heapq.heappush(heap, (-val, 1, 0, glob_id, k, -1))
 
-    # Pre-extract top candidates for each branch's suffix steps
-    # branch_topk[k][s] = list of (val, global_id)
+    # Pre-extract top candidates for each branch's suffix steps using ONE batched top-k
+    # branch_log_probs: (K, W - 1, V_d)
+    k_suffix = min(k_per_step, branch_log_probs.shape[-1])
+    topk_vals, topk_inds = torch.topk(branch_log_probs, k=k_suffix, dim=-1)
+    vals_all = topk_vals.tolist()  # (K, W - 1, k_suffix)
+    inds_all = topk_inds.tolist()  # (K, W - 1, k_suffix)
+
+    # Remap local vocab indices to global token IDs on CPU
     branch_topk = []
     for k in range(K):
         b_steps = []
         for s in range(W_minus_1):
-            s_top = torch.topk(branch_log_probs[k, s], k=min(k_per_step, branch_log_probs.shape[-1]), dim=-1)
-            vals = s_top.values.tolist()
-            inds = s_top.indices.tolist()
             step_cand = []
-            for v, idx in zip(vals, inds):
+            for v, idx in zip(vals_all[k][s], inds_all[k][s]):
                 if draft_vocab_list is not None:
                     gid = draft_vocab_list[idx]
                 elif draft_vocab_ids is not None:
