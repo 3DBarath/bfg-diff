@@ -350,6 +350,21 @@ def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
     print(f"  Mean |logits_train - logits_infer|: {mean_diff:.2e}")
     print(f"  Argmax Token Parity: {token_parity}")
 
+    if not token_parity and base_dtype in (torch.float16, torch.bfloat16):
+        train_argmax = train_logits.argmax(-1)[0]
+        infer_argmax = infer_logits.argmax(-1)[0]
+        all_flips_within_noise = True
+        for j in range(w):
+            if train_argmax[j] != infer_argmax[j]:
+                top2_train = torch.topk(train_logits[0, j].float(), 2).values
+                margin_j = (top2_train[0] - top2_train[1]).item()
+                print(f"    Slot {j} argmax flip (train={train_argmax[j].item()}, infer={infer_argmax[j].item()}): top-2 margin = {margin_j:.6f}")
+                if margin_j >= (2.0 * thresh):
+                    all_flips_within_noise = False
+        if all_flips_within_noise:
+            print("  [Note] Argmax mismatch allowed for fp16/bf16: all flipped slots are within numerical rounding margin (< 2*thresh).")
+            token_parity = True
+
     passed = (max_diff < thresh) and token_parity
     print(f"Unit Gate D Status: {'PASS' if passed else 'FAIL'}")
     return passed

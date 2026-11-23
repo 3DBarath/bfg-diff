@@ -533,6 +533,7 @@ def run_benchmark(
                         probs = F.softmax(logits / max(1e-4, temperature), dim=-1)
                         cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
 
+                    gen_tokens_count = 0
                     for step_idx in range(1, max_new_tokens):
                         cur_pos = P_len + step_idx - 1
                         logits_step = graphed_runner.step(cur_tok, cur_pos)
@@ -541,10 +542,13 @@ def run_benchmark(
                         else:
                             probs = F.softmax(logits_step / max(1e-4, temperature), dim=-1)
                             cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
+                        gen_tokens_count += 1
+                        if tok.eos_token_id is not None and int(cur_tok.item()) == tok.eos_token_id:
+                            break
                 sync_device()
                 elapsed = time.perf_counter() - t0
                 graphed_times.append(elapsed)
-                graphed_tokens.append(max_new_tokens)
+                graphed_tokens.append(max(1, gen_tokens_count))
             graphed_q1_tps = sum(graphed_tokens) / max(1e-4, sum(graphed_times))
             print(f"  Graphed Q=1 Baseline TPS: {graphed_q1_tps:.1f}")
         except Exception as e:
@@ -581,6 +585,8 @@ def run_benchmark(
     if shared_engine.device.type == "cuda" and batch_size == 1:
         shared_engine.capture_cuda_graphs(mask_id)
 
+    divergence_margins = []
+
     for i in range(0, len(prompts), batch_size):
         b_prompts = prompts[i : i + batch_size]
         inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
@@ -601,6 +607,7 @@ def run_benchmark(
                 v_tokens=v_tokens,
                 q_a=q_a,
                 tree_mode=tree_mode,
+                eos_token_id=tok.eos_token_id,
             )
         sync_device()
         elapsed = time.perf_counter() - t0
@@ -646,6 +653,7 @@ def run_benchmark(
                             div_logits = base_out.logits[0, -1].float()
                             top2_vals = torch.topk(div_logits, 2).values
                             margin = (top2_vals[0] - top2_vals[1]).item()
+                        divergence_margins.append(margin)
                         print(f"  [Divergence Diagnostic] Prompt {i}: first mismatch at step {div_idx} | raw={int(r_toks[div_idx])} vs spec={int(s_toks[div_idx])} | base logit margin={margin:.4f}")
                 except Exception as ex:
                     print(f"  [Divergence Diagnostic] Warning: {ex}")
@@ -734,6 +742,10 @@ def run_benchmark(
     print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
     print(f"{'T_draft (4L, W=%d)' % eng.w:<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%' if consistency_str != 'N/A' else 'N/A':>15}{consistency_str:>15}")
+    if divergence_margins:
+        min_m = min(divergence_margins)
+        max_m = max(divergence_margins)
+        print(f"  [Divergence Margins Summary] Mismatches: {len(divergence_margins)}/{len(prompts)} | Min Margin: {min_m:.4f} | Max Margin: {max_m:.4f}")
     print(f"{'4-gram Entropy (H4)':<35}{ngram_entropy(all_raw_seqs):>15.3f}{ngram_entropy(all_spec_seqs):>15.3f}")
     print(f"{'4-gram Repetition (rep4)':<35}{repeat_rate(all_raw_seqs):>14.1%}{repeat_rate(all_spec_seqs):>14.1%}")
     print(f"{'Adjacent Duplication (adj_dup)':<35}{adj_dup(all_raw_seqs):>14.1%}{adj_dup(all_spec_seqs):>14.1%}")
