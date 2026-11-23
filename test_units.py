@@ -509,6 +509,111 @@ def test_v5_path_b_two_step_parity():
     print("PASS: BFG-Diff v5 Path B 2-layer, 2-step maintains exact lossless greedy parity\n")
 
 
+def test_v52_bfork_tree_parity():
+    """Test 9: Verify BFG-Diff v5.2 B-Fork (Pass 2 branching + tree verifier) maintains exact lossless greedy parity."""
+    print("--- Running Test 9: B-Fork Pass 2 Multi-Branch Parity Verification ---")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    base_model, drafter, tok, mask_id = prepare_v3(
+        "Qwen/Qwen2.5-0.5B",
+        device=device,
+        dtype=dtype,
+        k_layers=4,
+        drafter_r=32,
+        drafter_alpha=64.0,
+        num_draft_steps=2,
+        soft_topk=4,
+        pass2_layers=1,
+        refine_bottleneck=256,
+        pass2_mode="bfork",
+        fork_k=3,
+    )
+    drafter.merge_ghost_weights(dtype=dtype)
+
+    prompt = "Artificial intelligence and machine learning models are transforming modern"
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+    max_new = 30
+
+    with torch.no_grad():
+        ref_out = base_model.generate(input_ids=input_ids, max_new_tokens=max_new, do_sample=False)
+
+    # 1. B-Fork speculative decoding with full vocab (tree_mode="tree", q_a=16)
+    engine_full = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=512,
+        batch_size=1,
+        v_tokens=7,
+        q_a=16,
+        device=device,
+        dtype=dtype,
+        use_cuda_graph=(device == "cuda"),
+    )
+    with torch.no_grad():
+        spec_out, stats = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine_full,
+            tree_mode="tree",
+            eos_token_id=tok.eos_token_id,
+        )
+
+    match_full = torch.equal(ref_out[:, :spec_out.shape[1]], spec_out)
+    print(f"B-Fork Full Vocab Match: {match_full} (steps={stats['steps']}, alpha={stats['alpha']:.2f})")
+    assert match_full, "B-Fork 2-step drafter output differed from base_model.generate() (full vocab)"
+
+    # 2. B-Fork speculative decoding with pruned vocab (32k)
+    vocab_size = getattr(base_model.config, "vocab_size", 151936)
+    raw_special = [0, 1, 2, mask_id, tok.eos_token_id, getattr(tok, "pad_token_id", None)]
+    special_ids = {s for s in raw_special if s is not None}
+    prompt_ids = set(input_ids[0].tolist())
+    all_needed = special_ids | prompt_ids
+    target_vocab_size = min(32768, vocab_size)
+    i = 0
+    while len(all_needed) < target_vocab_size and i < vocab_size:
+        all_needed.add(i)
+        i += 1
+    cand_ids = sorted(list(all_needed))
+    draft_vocab_ids = torch.tensor(cand_ids, dtype=torch.long, device=device)
+
+    engine_pruned = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=512,
+        batch_size=1,
+        v_tokens=7,
+        q_a=16,
+        device=device,
+        dtype=dtype,
+        use_cuda_graph=(device == "cuda"),
+        draft_vocab_ids=draft_vocab_ids,
+    )
+
+    with torch.no_grad():
+        spec_out_pruned, stats_pruned = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine_pruned,
+            tree_mode="tree",
+            eos_token_id=tok.eos_token_id,
+        )
+
+    match_pruned = torch.equal(ref_out[:, :spec_out_pruned.shape[1]], spec_out_pruned)
+    print(f"B-Fork Pruned Vocab Match: {match_pruned} (steps={stats_pruned['steps']}, alpha={stats_pruned['alpha']:.2f})")
+    assert match_pruned, "B-Fork 2-step drafter output differed from base_model.generate() (pruned vocab)"
+    print("PASS: BFG-Diff v5.2 B-Fork multi-branch conditional pass 2 maintains exact lossless greedy parity\n")
+
+
 if __name__ == "__main__":
     test_hedge_case_c_callback()
     test_ghost_weights_unit()
@@ -518,4 +623,5 @@ if __name__ == "__main__":
     test_cpu_lazy_commit_v3_leaf_hedge()
     test_quantized_int8_cpu_parity()
     test_v5_path_b_two_step_parity()
+    test_v52_bfork_tree_parity()
     print("ALL UNIT TESTS PASSED!")

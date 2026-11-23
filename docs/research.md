@@ -554,6 +554,39 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
   - PyTorch GradScaler step order decouples scheduler progression from unscaled skipped steps.
 - **Backward Compatibility**: Checkpoints save architecture metadata under `"arch"` (`k_layers`, `r`, `alpha`, `num_draft_steps`, `soft_topk`, `pass2_layers`, `refine_bottleneck`). Checkpoints without these keys default cleanly to v4 configuration ($K=4, r=32, \text{steps}=1$).
 
+### 9. BFG-Diff v5.2 "B-Fork": Batched Multi-Branch Conditional Pass 2 & Tree Topology
+
+#### A. Architectural Motivation & Manifold Alignment
+- **v5.1 Soft Expected Embedding Bottleneck**:
+  While v5.1 restored acceptance rates ($\alpha=1.96$), its Pass 2 relied on a continuous weighted sum of embeddings (`soft_topk=4`). In practice, soft embeddings blur sharp semantic distinctions and cannot supply divergent token branches to tree verification.
+- **Layer-26 Manifold Alignment ($h_\text{tap}$)**:
+  In v5.1, the refinement bridge accepted post-Layer-27 representations $h_1$ and then re-passed them into Layer 27 with Pass-2 deltas, effectively applying Layer 27's transformer stack twice sequentially.
+  In v5.2, Pass 1 captures $h_\text{tap} = h$ immediately before Layer 27 ($p_2$ start). $h_\text{tap}$ is the true native input manifold for Layer 27, eliminating manifold distortion and stabilizing refinement.
+- **B-Fork Concrete Token Conditioning**:
+  - Pass 1 generates root slot 0 ($A_{+1}$).
+  - Drafter extracts the top-$K$ discrete candidate tokens for slot 0: $d_0^{(1)}, \dots, d_0^{(K)}$.
+  - Suffix slots $1 \dots W-1$ condition on concrete discrete embeddings:
+    $$\text{tok\_emb}_2^{(k)} = [e(y^*), e(d_0^{(k)}), e(\text{[MASK]}), \dots]$$
+    passing through `refine_bridge(tok_emb_2, h_tap, f_ctx_last)` and dedicated Pass-2 layers.
+
+#### B. Single Static CUDA Graph Batched Replay ($B=1 \to K$)
+- In speculative decoding at batch size 1, Pass 2 evaluates all $K$ branches simultaneously by executing at effective batch size $K$ inside the **exact same captured static CUDA graph**.
+- Reuses prefix KV cache by reading zero-copy from `draft_cache.k[layer_idx][:, :, W : W + S, :]` and concatenating draft KV `[k_d, k_pref]` along the sequence dimension, avoiding any mutations or reallocation to the static KV cache.
+- Emits root logits for slot 0 and a tensor of suffix branch logits: `branch_logits` of shape $(K, W-1, V_d)$.
+
+#### C. Topological Candidate Tree Synthesis (`build_forked_tree`)
+- `build_forked_tree` combines root candidates and conditioned suffix logits into a single tree candidate tile of size $Q_A$ ($Q_A=16$).
+- Priority queue search seeds branches $1 \dots K$ from the top-$K$ root candidate probabilities, then greedily expands children from `branch_logits[k, s]`.
+- Enforces strict topological ordering (`parent[i] < i`) and depth indices, executing seamlessly on the existing static tree verifier with zero verifier overhead.
+
+#### D. Training Stabilization & Warm-Start Cloning
+- **Tail-Sliced Dataset (`slice_mode="tail"`)**:
+  On-policy sequences are sliced to the last `max_len` tokens using their true valid lengths (`seq_lens`), eliminating degenerate prefix padding patterns while ensuring anchors draw from high-density reasoning trajectories.
+- **Teacher-Forced Ground Truth**:
+  During training, slot 1 in Pass 2 is conditioned on the teacher-forced ground-truth target token $x_{t+1}$, providing clean supervision for suffix slots $1 \dots W-1$ with suffix D-PACE discount weighting.
+- **Warm-Start Cloning**:
+  Resuming from any v3/v4 checkpoint automatically clones top Pass-1 `layer_deltas` into `pass2_deltas` on initialization, enabling fast convergence.
+
 
 #### A. Scaled Autocast Gradients
 - `train.py` scales micro-batch gradients via `scaler.scale(loss / args.grad_accum).backward()` when `use_fp16=True` (CUDA), guaranteeing safe FP16 dynamic loss scaling across inner accumulation steps.

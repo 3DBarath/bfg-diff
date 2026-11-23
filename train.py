@@ -24,27 +24,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from model import WeightTiedTopKDrafter, compute_shifted_soft_embeds, prepare_v3
+from model import (
+    WeightTiedTopKDrafter,
+    build_bfork_token_embeds,
+    compute_shifted_soft_embeds,
+    prepare_v3,
+)
 
 
 class OnPolicySequenceDataset(Dataset):
     """Dataset of on-policy token sequences with their valid (non-padded) lengths."""
 
-    def __init__(self, data_path_or_tensor, max_len: int = 256):
+    def __init__(self, data_path_or_tensor, max_len: int = 256, slice_mode: str = "tail"):
         if isinstance(data_path_or_tensor, (str, Path)):
             payload = torch.load(data_path_or_tensor, map_location="cpu")
-            self.seqs = payload["sequences"][:, :max_len]
-            lens = payload.get("seq_lens")
-            if lens is None:
-                self.seq_lens = torch.full((len(self.seqs),), self.seqs.shape[1], dtype=torch.long)
+            raw_seqs = payload["sequences"]
+            raw_lens = payload.get("seq_lens")
+            if raw_lens is None:
+                raw_lens = torch.full((len(raw_seqs),), raw_seqs.shape[1], dtype=torch.long)
             else:
-                self.seq_lens = lens.long().clamp(max=self.seqs.shape[1])
-                if len(self.seq_lens) != len(self.seqs):
+                raw_lens = raw_lens.long().clamp(max=raw_seqs.shape[1])
+                if len(raw_lens) != len(raw_seqs):
                     raise ValueError(
-                        f"seq_lens has {len(self.seq_lens)} rows, sequences has {len(self.seqs)}"
+                        f"seq_lens has {len(raw_lens)} rows, sequences has {len(raw_seqs)}"
                     )
+
+            if slice_mode == "tail":
+                # Tail-slice up to max_len tokens using per-row valid length
+                N_seq = len(raw_seqs)
+                sliced_seqs = torch.zeros((N_seq, max_len), dtype=raw_seqs.dtype)
+                sliced_lens = torch.zeros(N_seq, dtype=torch.long)
+                for i in range(N_seq):
+                    L = int(raw_lens[i].item())
+                    actual = min(L, max_len)
+                    start = L - actual
+                    sliced_seqs[i, :actual] = raw_seqs[i, start:L]
+                    sliced_lens[i] = actual
+                self.seqs = sliced_seqs
+                self.seq_lens = sliced_lens
+            else:
+                self.seqs = raw_seqs[:, :max_len]
+                self.seq_lens = raw_lens.clamp(max=self.seqs.shape[1])
         else:
-            self.seqs = data_path_or_tensor[:, :max_len]
+            if slice_mode == "tail" and data_path_or_tensor.shape[1] > max_len:
+                self.seqs = data_path_or_tensor[:, -max_len:]
+            else:
+                self.seqs = data_path_or_tensor[:, :max_len]
             self.seq_lens = torch.full((len(self.seqs),), self.seqs.shape[1], dtype=torch.long)
 
     def __len__(self):
@@ -162,7 +187,7 @@ def compute_anchor_distill_loss(
     # 3. Sample random clean anchors
     # Each anchor t needs prefix of length >= 1 (so t >= 1, meaning token t-1 exists)
     # and targets up to t + w (so t + w <= min_len - 1, i.e. inside every valid row)
-    min_anchor = 1
+    min_anchor = min(16, max(1, min_len - w - 1)) if min_len > 32 else 1
     max_anchor = max(2, min_len - w)
     if max_anchor <= min_anchor:
         min_anchor = 1
@@ -215,7 +240,11 @@ def compute_anchor_distill_loss(
         attn_mask[0, 0, r_start : r_end, k_start : k_end] = 0.0
 
     # 6. Execute draft layers in parallel forward pass (Pass 1)
+    h_tap = None
+    p2_start = drafter.k_layers - drafter.pass2_layers
     for layer_idx in range(drafter.k_layers):
+        if getattr(drafter, "num_draft_steps", 1) > 1 and layer_idx == p2_start:
+            h_tap = h
         h, _, _ = drafter.forward_draft_layer(
             layer_idx=layer_idx,
             hidden_states=h,
@@ -241,48 +270,102 @@ def compute_anchor_distill_loss(
         student_logits1, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
     )
 
+    p1_acc1 = None
+    p1_top3_acc1 = None
     p1_acc2 = None
+    pass2_mode = getattr(drafter, "pass2_mode", "soft")
+
     if getattr(drafter, "num_draft_steps", 1) > 1 and getattr(drafter, "refine_bridge", None) is not None:
         with torch.no_grad():
             preds_p1 = torch.argmax(student_logits1, dim=-1)
+            p1_acc1 = (preds_p1[:, :, 0] == targets[:, :, 0]).float().mean().item()
+            # Top-3 accuracy on root slot 0
+            top3_p1_s0 = torch.topk(student_logits1[:, :, 0], k=min(3, student_logits1.shape[-1]), dim=-1).indices
+            tgt_s0 = targets[:, :, 0].unsqueeze(-1)
+            p1_top3_acc1 = (top3_p1_s0 == tgt_s0).any(dim=-1).float().mean().item()
             p1_acc2 = (preds_p1[:, :, 1] == targets[:, :, 1]).float().mean().item() if w > 1 else 0.0
 
-        # Pass 2: Differentiable soft embedding refinement
-        # Unpack h from (B, M, D) to (B * N, W, D) matching y_star_packed and f_last_packed
-        # h was constructed as: h_packed.view(N, B, w, D).permute(1, 0, 2, 3).reshape(B, M, D)
-        h1_unpacked = h.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
-        z1_shift_unpacked = student_logits1[:, :, :w - 1, :].permute(1, 0, 2, 3).reshape(B * N, w - 1, -1)
-
-        tok_emb_2 = compute_shifted_soft_embeds(
-            y_star_emb=y_star_emb,
-            z1=z1_shift_unpacked,
-            embed_weight=drafter.embed_tokens.weight,
-            top_k=getattr(drafter, "soft_topk", 4),
-            z1_is_shifted=True,
-        )
-        h2_packed = drafter.refine_bridge(tok_emb_2, h1_unpacked, f_last_packed)
-        h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
-
-        # Re-run draft layers with refined h2
-        p2_start = drafter.k_layers - drafter.pass2_layers
-        for layer_idx in range(p2_start, drafter.k_layers):
-            h2, _, _ = drafter.forward_draft_layer(
-                layer_idx=layer_idx,
-                hidden_states=h2,
-                pos_draft=pos_draft,
-                k_prefix=kp_all[layer_idx],
-                v_prefix=vp_all[layer_idx],
-                attn_mask=attn_mask,
-                use_pass2=True,
+        if pass2_mode == "bfork":
+            # B-Fork Pass 2: Teacher-forced ground-truth target token at slot 1
+            # targets[:, :, 0] is ground truth for slot 1 (t+1)
+            d0_targets = targets[:, :, 0].reshape(B * N, 1)
+            d0_emb = drafter.embed_tokens(d0_targets)
+            tok_emb_2 = build_bfork_token_embeds(
+                y_star_emb=y_star_emb,
+                d0_emb=d0_emb,
+                mask_emb=mask_emb,
+                w=w,
             )
+            h_tap_used = h_tap if h_tap is not None else h
+            h_tap_unpacked = h_tap_used.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
+            h2_packed = drafter.refine_bridge(tok_emb_2, h_tap_unpacked, f_last_packed)
+            h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
 
-        h_norm2 = drafter.norm(h2)
-        student_logits2 = drafter.lm_head(h_norm2).view(B, N, w, -1)
-        loss_p2 = _chunked_distill_loss(
-            student_logits2, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
-        )
-        loss = lambda_pass1 * loss_p1 + loss_p2
-        eval_logits = student_logits2
+            # Re-run draft layers with refined h2
+            for layer_idx in range(p2_start, drafter.k_layers):
+                h2, _, _ = drafter.forward_draft_layer(
+                    layer_idx=layer_idx,
+                    hidden_states=h2,
+                    pos_draft=pos_draft,
+                    k_prefix=kp_all[layer_idx],
+                    v_prefix=vp_all[layer_idx],
+                    attn_mask=attn_mask,
+                    use_pass2=True,
+                )
+
+            h_norm2 = drafter.norm(h2)
+            student_logits2 = drafter.lm_head(h_norm2).view(B, N, w, -1)
+
+            # Suffix loss over slots 1..w-1
+            w_suffix = max(1, w - 1)
+            d_pace_suffix = torch.tensor([d_pace_decay ** j for j in range(w_suffix)], device=device, dtype=torch.float32)
+            d_pace_suffix = d_pace_suffix / d_pace_suffix.sum()
+
+            loss_p2 = _chunked_distill_loss(
+                student_logits2[:, :, 1:],
+                t_top64_idx[:, :, 1:],
+                t_top64_probs[:, :, 1:],
+                targets[:, :, 1:],
+                d_pace_suffix,
+                lambda_kl,
+                chunk_size=loss_chunk_anchors,
+            )
+            loss = lambda_pass1 * loss_p1 + loss_p2
+            eval_logits = torch.cat([student_logits1[:, :, :1], student_logits2[:, :, 1:]], dim=2)
+        else:
+            # Soft refinement pass 2
+            h1_unpacked = h.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
+            z1_shift_unpacked = student_logits1[:, :, :w - 1, :].permute(1, 0, 2, 3).reshape(B * N, w - 1, -1)
+
+            tok_emb_2 = compute_shifted_soft_embeds(
+                y_star_emb=y_star_emb,
+                z1=z1_shift_unpacked,
+                embed_weight=drafter.embed_tokens.weight,
+                top_k=getattr(drafter, "soft_topk", 4),
+                z1_is_shifted=True,
+            )
+            h2_packed = drafter.refine_bridge(tok_emb_2, h1_unpacked, f_last_packed)
+            h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+
+            # Re-run draft layers with refined h2
+            for layer_idx in range(p2_start, drafter.k_layers):
+                h2, _, _ = drafter.forward_draft_layer(
+                    layer_idx=layer_idx,
+                    hidden_states=h2,
+                    pos_draft=pos_draft,
+                    k_prefix=kp_all[layer_idx],
+                    v_prefix=vp_all[layer_idx],
+                    attn_mask=attn_mask,
+                    use_pass2=True,
+                )
+
+            h_norm2 = drafter.norm(h2)
+            student_logits2 = drafter.lm_head(h_norm2).view(B, N, w, -1)
+            loss_p2 = _chunked_distill_loss(
+                student_logits2, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
+            )
+            loss = lambda_pass1 * loss_p1 + loss_p2
+            eval_logits = student_logits2
     else:
         loss = loss_p1
         eval_logits = student_logits1
@@ -300,6 +383,10 @@ def compute_anchor_distill_loss(
         "acc_offset3": acc_per_offset[2] if w > 2 else 0.0,
         "acc_offset4": acc_per_offset[3] if w > 3 else 0.0,
     }
+    if p1_acc1 is not None:
+        stats["p1_acc1"] = p1_acc1
+    if p1_top3_acc1 is not None:
+        stats["p1_top3_acc1"] = p1_top3_acc1
     if p1_acc2 is not None:
         stats["p1_acc2"] = p1_acc2
     return loss, stats
@@ -329,6 +416,9 @@ def parse_args():
     p.add_argument("--soft_topk", type=int, default=4, help="top-k tokens for soft expected embedding (default 4)")
     p.add_argument("--pass2_layers", type=int, default=1, help="number of draft layers to execute in Pass 2 (default 1)")
     p.add_argument("--refine_bottleneck", type=int, default=256, help="refinement bridge bottleneck dimension (default 256)")
+    p.add_argument("--pass2_mode", default="soft", choices=["soft", "bfork"], help="pass 2 refinement mode: soft or bfork (default soft)")
+    p.add_argument("--fork_k", type=int, default=3, help="number of root candidates to branch on in bfork mode (default 3)")
+    p.add_argument("--slice_mode", default="tail", choices=["head", "tail"], help="sequence slice mode: head or tail (default tail)")
     p.add_argument("--min_seq_len", type=int, default=128, help="minimum sequence length filter (default 128)")
     p.add_argument("--lambda_pass1", type=float, default=0.3, help="weight for pass 1 loss in 2-step training (default 0.3)")
     p.add_argument("--d_pace_decay", type=float, default=0.85, help="D-PACE position discount decay (default 0.85)")
@@ -367,6 +457,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     # Print parameter breakdown
@@ -377,7 +469,21 @@ def main():
 
     if args.resume and Path(args.resume).exists():
         ck = torch.load(args.resume, map_location=device)
-        drafter.load_state_dict(ck["drafter_state_dict"], strict=False)
+        sd = ck["drafter_state_dict"]
+        drafter.load_state_dict(sd, strict=False)
+
+        # Warm-start clone: if resuming from a checkpoint without pass2_deltas,
+        # clone the weights of the top pass2_layers from layer_deltas
+        has_p2_deltas = any(k.startswith("pass2_deltas.") for k in sd.keys())
+        if getattr(drafter, "num_draft_steps", 1) > 1 and not has_p2_deltas and getattr(drafter, "pass2_deltas", None) is not None:
+            with torch.no_grad():
+                p2_start = drafter.k_layers - drafter.pass2_layers
+                for p_idx in range(drafter.pass2_layers):
+                    src_layer = p2_start + p_idx
+                    src_delta = drafter.layer_deltas[src_layer]
+                    tgt_delta = drafter.pass2_deltas[p_idx]
+                    tgt_delta.load_state_dict(src_delta.state_dict())
+            print(f"Cloned layer_deltas[{p2_start}:{drafter.k_layers}] into pass2_deltas for warm-start")
         print(f"Warm-started drafter from {args.resume}")
 
     # Optimizer on drafter params only
@@ -397,9 +503,9 @@ def main():
 
     # Dataset
     if args.data and Path(args.data).exists():
-        dataset = OnPolicySequenceDataset(args.data)
+        dataset = OnPolicySequenceDataset(args.data, slice_mode=args.slice_mode)
     else:
-        dataset = OnPolicySequenceDataset(create_synthetic_data(num_samples=128, seq_len=96))
+        dataset = OnPolicySequenceDataset(create_synthetic_data(num_samples=128, seq_len=96), slice_mode=args.slice_mode)
     min_len_req = max(args.w + 2, args.min_seq_len)
     raw_n = len(dataset)
     dataset = dataset.filter_min_len(min_len_req)
@@ -490,10 +596,11 @@ def main():
             acc2_str = f"A_+2: {stats['acc_offset2']:.1%}"
             if "p1_acc2" in stats:
                 acc2_str = f"P1->P2 A_+2: {stats['p1_acc2']:.1%}->{stats['acc_offset2']:.1%}"
+            top3_str = f" (P1 top3: {stats['p1_top3_acc1']:.1%})" if "p1_top3_acc1" in stats else ""
             print(
                 f"step {step:5d}/{args.steps} loss {accum_loss / max(1, accum_count):.4f} "
                 f"lr {sched.get_last_lr()[0]:.2e} "
-                f"A_+1: {stats['acc_offset1']:.1%} {acc2_str} A_+3: {stats['acc_offset3']:.1%} "
+                f"A_+1: {stats['acc_offset1']:.1%}{top3_str} {acc2_str} A_+3: {stats['acc_offset3']:.1%} "
                 f"elapsed {elapsed:.0f}s"
             )
 
@@ -514,6 +621,8 @@ def main():
                     "soft_topk": args.soft_topk,
                     "pass2_layers": args.pass2_layers,
                     "refine_bottleneck": args.refine_bottleneck,
+                    "pass2_mode": args.pass2_mode,
+                    "fork_k": args.fork_k,
                 },
             }
             save_path = Path(args.out) / f"ckpt-{step}.pt"

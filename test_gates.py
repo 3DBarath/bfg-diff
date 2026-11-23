@@ -44,6 +44,8 @@ def test_unit_gate_b(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> bool:
     """Unit Gate B: Assert trainable_params / total_params < 0.01 on both 1.5B and 3B."""
     print("\n" + "=" * 60)
@@ -136,6 +138,8 @@ def test_unit_gate_a(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> bool:
     """Unit Gate A: 100% token-identical output to raw model.generate() across 10 prompts (B=1 and B=4)."""
     print("\n" + "=" * 60)
@@ -153,6 +157,8 @@ def test_unit_gate_a(
         soft_topk=soft_topk,
         pass2_layers=pass2_layers,
         refine_bottleneck=refine_bottleneck,
+        pass2_mode=pass2_mode,
+        fork_k=fork_k,
     )
 
     # 1. Test B=1 across 10 prompts
@@ -209,6 +215,8 @@ def test_unit_gate_c(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> bool:
     """Unit Gate C: Verify grad flow across fusion, bridge, slot_emb, pass2_deltas, and all DraftLoRADelta weights."""
     print("\n" + "=" * 60)
@@ -228,6 +236,8 @@ def test_unit_gate_c(
         soft_topk=soft_topk,
         pass2_layers=pass2_layers,
         refine_bottleneck=refine_bottleneck,
+        pass2_mode=pass2_mode,
+        fork_k=fork_k,
     )
 
     # Dummy input sequence
@@ -364,6 +374,8 @@ def test_unit_gate_d(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> bool:
     """Unit Gate D: Exact Numerical Identity between Training & Inference at position t.
     Enforces that train.py's parallel block anchor forward and sampler.py's forward_draft_step
@@ -385,6 +397,8 @@ def test_unit_gate_d(
         soft_topk=soft_topk,
         pass2_layers=pass2_layers,
         refine_bottleneck=refine_bottleneck,
+        pass2_mode=pass2_mode,
+        fork_k=fork_k,
     )
 
     torch.manual_seed(42)
@@ -415,7 +429,11 @@ def test_unit_gate_d(
         attn_mask[0, 0, :, :t] = 0.0
         attn_mask[0, 0, :, S : S + w] = 0.0
 
+        h_tap = None
+        p2_start = drafter.k_layers - drafter.pass2_layers
         for layer_idx in range(drafter.k_layers):
+            if drafter.num_draft_steps > 1 and layer_idx == p2_start:
+                h_tap = h
             h, _, _ = drafter.forward_draft_layer(
                 layer_idx=layer_idx,
                 hidden_states=h,
@@ -426,28 +444,49 @@ def test_unit_gate_d(
             )
 
         if drafter.num_draft_steps > 1 and drafter.refine_bridge is not None:
-            from model import compute_shifted_soft_embeds
-            h_norm1 = drafter.norm(h)
-            z1_1 = drafter.lm_head(h_norm1)
-            tok_emb_2 = compute_shifted_soft_embeds(
-                y_star_emb=y_star_emb,
-                z1=z1_1,
-                embed_weight=drafter.embed_tokens.weight,
-                top_k=getattr(drafter, "soft_topk", 4),
-            )
-            h2 = drafter.refine_bridge(tok_emb_2, h, f_last)
-            p2_start = drafter.k_layers - drafter.pass2_layers
-            for layer_idx in range(p2_start, drafter.k_layers):
-                h2, _, _ = drafter.forward_draft_layer(
-                    layer_idx=layer_idx,
-                    hidden_states=h2,
-                    pos_draft=pos_draft,
-                    k_prefix=kp_all[layer_idx],
-                    v_prefix=vp_all[layer_idx],
-                    attn_mask=attn_mask,
-                    use_pass2=True,
+            if getattr(drafter, "pass2_mode", "soft") == "bfork":
+                from model import build_bfork_token_embeds
+                h_norm1 = drafter.norm(h[:, 0:1])
+                z1_s0 = drafter.lm_head(h_norm1)
+                d0_ids = z1_s0.argmax(dim=-1)
+                d0_emb = drafter.embed_tokens(d0_ids)
+                tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, w)
+                h_tap_used = h_tap if h_tap is not None else h
+                h2 = drafter.refine_bridge(tok_emb_2, h_tap_used, f_last)
+                for layer_idx in range(p2_start, drafter.k_layers):
+                    h2, _, _ = drafter.forward_draft_layer(
+                        layer_idx=layer_idx,
+                        hidden_states=h2,
+                        pos_draft=pos_draft,
+                        k_prefix=kp_all[layer_idx],
+                        v_prefix=vp_all[layer_idx],
+                        attn_mask=attn_mask,
+                        use_pass2=True,
+                    )
+                z2_suffix = drafter.lm_head(drafter.norm(h2[:, 1:]))
+                train_logits = torch.cat([z1_s0, z2_suffix], dim=1)
+            else:
+                from model import compute_shifted_soft_embeds
+                h_norm1 = drafter.norm(h)
+                z1_1 = drafter.lm_head(h_norm1)
+                tok_emb_2 = compute_shifted_soft_embeds(
+                    y_star_emb=y_star_emb,
+                    z1=z1_1,
+                    embed_weight=drafter.embed_tokens.weight,
+                    top_k=getattr(drafter, "soft_topk", 4),
                 )
-            train_logits = drafter.lm_head(drafter.norm(h2))
+                h2 = drafter.refine_bridge(tok_emb_2, h, f_last)
+                for layer_idx in range(p2_start, drafter.k_layers):
+                    h2, _, _ = drafter.forward_draft_layer(
+                        layer_idx=layer_idx,
+                        hidden_states=h2,
+                        pos_draft=pos_draft,
+                        k_prefix=kp_all[layer_idx],
+                        v_prefix=vp_all[layer_idx],
+                        attn_mask=attn_mask,
+                        use_pass2=True,
+                    )
+                train_logits = drafter.lm_head(drafter.norm(h2))
         else:
             train_logits = drafter.lm_head(drafter.norm(h))  # (1, W, vocab)
 
@@ -514,6 +553,8 @@ def test_gate0_gate1_profile(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> dict:
     """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling with populated P=128 KV cache."""
     print("\n" + "=" * 60)
@@ -532,6 +573,8 @@ def test_gate0_gate1_profile(
         soft_topk=soft_topk,
         pass2_layers=pass2_layers,
         refine_bottleneck=refine_bottleneck,
+        pass2_mode=pass2_mode,
+        fork_k=fork_k,
     )
 
     from sampler import StaticDraftEngine
@@ -621,6 +664,8 @@ def main():
     p.add_argument("--soft_topk", type=int, default=4)
     p.add_argument("--pass2_layers", type=int, default=1)
     p.add_argument("--refine_bottleneck", type=int, default=256)
+    p.add_argument("--pass2_mode", default="soft", choices=["soft", "bfork"])
+    p.add_argument("--fork_k", type=int, default=3)
     args = p.parse_args()
 
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
@@ -634,6 +679,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     # 2. Unit Gate A (Lossless Parity)
@@ -647,6 +694,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     # 3. Unit Gate C (Gradient Flow)
@@ -660,6 +709,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     # 4. Unit Gate D (Train-Inference Parity)
@@ -673,6 +724,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     # 5. Gate 0 & 1 Roofline Profiling
@@ -686,6 +739,8 @@ def main():
         soft_topk=args.soft_topk,
         pass2_layers=args.pass2_layers,
         refine_bottleneck=args.refine_bottleneck,
+        pass2_mode=args.pass2_mode,
+        fork_k=args.fork_k,
     )
 
     print("\n" + "=" * 60)

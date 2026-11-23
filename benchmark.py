@@ -420,6 +420,8 @@ def run_benchmark(
         soft_topk=arch_kwargs.get("soft_topk", 4),
         pass2_layers=arch_kwargs.get("pass2_layers", 1),
         refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
+        pass2_mode=arch_kwargs.get("pass2_mode", "soft"),
+        fork_k=arch_kwargs.get("fork_k", 3),
     )
 
     draft_vocab_ids = None
@@ -762,7 +764,10 @@ def run_benchmark(
     print(f"{'Leaf-Hedge Hit Rate':<35}{'-':>15}{f'{hedge_hit_rate:.1f}% ({total_hedge_hits}/{total_hedge_attempts})':>15}")
     print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
     if getattr(drafter, 'num_draft_steps', 1) > 1:
-        print(f"{'T_draft (%dL+%dL, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+        if getattr(drafter, "pass2_mode", "soft") == "bfork":
+            print(f"{'T_draft (%dL+%dLx%d B-Fork, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), getattr(drafter, 'fork_k', 3), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+        else:
+            print(f"{'T_draft (%dL+%dL, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     else:
         print(f"{'T_draft (%dL, W=%d)' % (eng.k_layers, eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%' if consistency_str != 'N/A' else 'N/A':>15}{consistency_str:>15}")

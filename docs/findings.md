@@ -2019,6 +2019,46 @@ Checkpoints Unpacked from `bfg_v5_bundle.zip`:
 
 These findings directly motivate the **Path B v5.1** architecture: an asymmetric $4\text{L} + 1\text{L}$ design with dedicated Pass-2 LoRA deltas, `h1 + delta` residual bridge, $256$-dim bottleneck, `min_seq_len = 128`, and `d_pace_decay = 0.85`.
 
+### 10.14 Kaggle Hardware Benchmark Findings: v5.1 Path B vs. v4.1 Clean Control (2026-11-24)
+
+Hardware: Dual NVIDIA T4 GPUs (`cuda:0`, `cuda:1`, Turing sm_75), PyTorch 2.14+, CUDA.
+Model: `Qwen/Qwen2.5-1.5B`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
+Checkpoints Unpacked from `bfg_v51_bundle.zip`:
+- Control: `runs/bfg_v41_clean_1.5b/last.pt` (4L, 1-step, $Q_A=16$ Tree, 32k Vocab)
+- Candidate: `runs/bfg_v51_pathb_1.5b/last.pt` (4L+1L, 2-step Soft-Emb, $Q_A=16$ Tree, 32k Vocab, `refine_bottleneck=256`)
+
+#### Controlled Benchmark Results Summary Table:
+
+| Metric | v4.1 Clean Control ($Q_A=16$) | v5.1 Path B ($Q_A=16$) | Difference / Delta |
+| :--- | :---: | :---: | :---: |
+| **Throughput (TPS)** | **65.2** | **63.6** | -1.6 TPS (-2.4%) |
+| Raw Baseline TPS (HF) | 24.9 | 24.7 | - |
+| Graphed $Q=1$ Baseline | 49.3 | 49.3 | - |
+| Speculative Speedup (vs $Q=1$) | **1.32x** | **1.29x** | -0.03x |
+| Wall-clock Speedup (vs HF) | **2.62x** | **2.57x** | -0.05x |
+| **Mean Acceptance $\alpha$** | **1.92** | **1.96** | **+0.04 (+2.1%)** |
+| $\Gamma$ Total Acceptance % | 13.1% | 13.7% | +0.6% |
+| **$A_{+1}$ Acceptance Rate** | **59.9%** | **60.6%** | **+0.7%** |
+| **$A_{+2}$ Acceptance Rate** | **27.1%** | **28.4%** | **+1.3%** |
+| **$A_{+3}$ Acceptance Rate** | **6.7%** | **9.0%** | **+2.3%** |
+| **$A_{+4}$ Acceptance Rate** | **0.5%** | **1.5%** | **+1.0% (3.0x)** |
+| Leaf-Hedge Hit Rate | 32.4% (1013/3128) | 32.8% (1005/3060) | +0.4% |
+| $T_\text{verify} (Q_A=16)$ | 25.12 ms | 24.69 ms | -0.43 ms |
+| $T_\text{draft}$ | 3.70 ms (4L, W=7) | 4.86 ms (4L+1L, W=7) | +1.16 ms (+31.4%) |
+| Exact Lossless Consistency % | 76.0% (12 mismatches) | 72.0% (14 mismatches) | -4.0% |
+| Divergence Margin Bounds | Min: 0.0000, Max: 0.0312 | Min: 0.0000, Max: 0.0312 | - |
+| 4-gram Entropy ($H_4$) | 0.950 | 0.950 | 0.000 |
+| 4-gram Repetition ($rep_4$) | 26.3% | 25.6% | -0.7% (less repetitive) |
+| Adjacent Duplication | 6.2% | 6.2% | 0.0% |
+
+#### Key Insights & Motivation for v5.2 "B-Fork":
+1. **Quality Recovery Confirmed**:
+   v5.1's 4L+1L architecture completely reversed v5.0's regression: $\alpha$ increased from 1.92 to 1.96, $A_{+2}$ increased from 27.1% to 28.4%, $A_{+3}$ jumped from 6.7% to 9.0%, and $A_{+4}$ tripled from 0.5% to 1.5%.
+2. **Draft Overhead Bottleneck**:
+   $T_\text{draft}$ increased by 1.16 ms (3.70 ms $\to$ 4.86 ms). Because speculative verification operates on a single linear chain or top-k tree, soft expected continuous embeddings at Pass 2 do not provide multi-hypothesis branches to the tree verifier.
+3. **The B-Fork Opportunity (v5.2)**:
+   By conditioning Pass 2 on the discrete top-$K$ candidates ($K=3$) of root slot 0 using Layer-26 $h_\text{tap}$ and constructing a multi-branch tree tile, Pass 2 generates conditioned suffix candidates for all top branches within the exact same static CUDA graph call. This converts Pass 2 computation into multi-hypothesis tree branches that dramatically improve tree acceptance and wall-clock TPS.
+
 Hardware: NVIDIA T4 GPU (sm_75, Turing), PyTorch 2.14+, CUDA.
 Model: `Qwen/Qwen2.5-1.5B`, Checkpoint: `runs/bfg_v3_1.5b_15k/last.pt`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
 

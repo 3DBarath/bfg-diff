@@ -129,6 +129,8 @@ class V3ModelManager:
                 soft_topk=arch_kwargs.get("soft_topk", 4),
                 pass2_layers=arch_kwargs.get("pass2_layers", 1),
                 refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
+                pass2_mode=arch_kwargs.get("pass2_mode", "soft"),
+                fork_k=arch_kwargs.get("fork_k", 3),
             )
 
             if ck_payload is not None:

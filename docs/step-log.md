@@ -1109,8 +1109,29 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - Speculative Run B (QA=8, 32k vocab): 72.8 TPS (1.39x vs Q=1, 2.68x vs HF), alpha 1.77, T_draft 3.31 ms (-31.3% draft latency).
   - Speculative Run C (QA=16 static tree, 32k vocab): 75.4 TPS (1.44x vs Q=1, 2.77x vs HF), alpha 2.09 (+18.1% acceptance), branch rescue 35.1% (1078/3071).
   - Divergence margins across all mismatches confirmed to be $\le 0.0625$, confirming exact mathematical alignment within fp16 rounding precision.
+## 62. Kaggle v5.1 Hardware Results & BFG-Diff v5.2 "B-Fork" Implementation (2026-11-24)
+- **Unpacked Kaggle v5.1 Bundle**:
+  - Examined `runs/logs/bench_v51_qa16.log` and `runs/logs/bench_v41_qa16.log` from `bfg_v51_bundle.zip`.
+  - v5.1 Path B reversed v5.0 degradation: $\alpha$ increased from 1.92 to 1.96, $A_{+2}$ increased to 28.4% (vs 27.1%), $A_{+3}$ to 9.0% (vs 6.7%), and $A_{+4}$ to 1.5% (vs 0.5%).
+  - Bottleneck identified: $T_\text{draft}$ increased from 3.70 ms to 4.86 ms (+1.16 ms), yielding 63.6 TPS vs control 65.2 TPS. Soft continuous embeddings could not generate distinct candidate branches for tree verification.
+- **Implemented B-Fork v5.2**:
+  - `model.py`: Added `build_bfork_token_embeds()`, added `pass2_mode` (`"soft"` | `"bfork"`) and `fork_k` (default 3) to `WeightTiedTopKDrafter` and `prepare_v3`. In `forward_draft()`, captured Layer-26 native manifold representation `h_tap` before $p_2$ start, conditioned Pass 2 on top-$K$ discrete tokens ($d_0$) and `h_tap`, returning full logits `[z1_s0, z2_suffix]`.
+  - `sampler.py`:
+    - Updated `StaticDraftEngine` to pre-allocate static fork buffers (`static_fork_root_logits`, `static_fork_root_local_ids`, `static_fork_root_global_ids`, `static_fork_branch_logits`).
+    - Captured `h_tap` in both `_step_draft_kernel` and eager `forward_draft_step`.
+    - Executed Pass 2 at effective batch size $K$ within the exact same static CUDA graph without memory reallocation, reusing prefix KV zero-copy.
+    - Implemented `build_forked_tree()` synthesizing top-$K$ root branches and conditioned suffix logits into a topological tree tile of size $Q_A=16$.
+    - Wired `build_forked_tree` into `generate_speculative_v3` when `engine.is_bfork`.
+  - `train.py`:
+    - Added `--pass2_mode`, `--fork_k`, and `--slice_mode` (default `"tail"`) CLI options.
+    - Implemented tail-slicing in `OnPolicySequenceDataset` using valid lengths (`seq_lens`).
+    - Implemented warm-start cloning of top Pass-1 `layer_deltas` into `pass2_deltas` on `--resume`.
+    - Updated `compute_anchor_distill_loss`: `min_anchor = min(16, max(1, min_len - w - 1))` when `min_len > 32`, captured `h_tap` before `p2_start`, implemented teacher-forced ground-truth target conditioning for slot 1 under `bfork` mode with suffix D-PACE loss, tracked root top-3 accuracy (`p1_top3_acc1`), and saved `pass2_mode` / `fork_k` in checkpoint `"arch"`.
+  - `benchmark.py`, `chat.py`, `test_gates.py`, `test_units.py`:
+    - Propagated `pass2_mode` and `fork_k` from checkpoint arch into `prepare_v3`.
+    - Formatted summary table in `benchmark.py` with `T_draft (%dL+%dLx%d B-Fork, W=%d)`.
+    - Threaded CLI arguments and Gate D support for B-Fork in `test_gates.py`.
+    - Added Test 9 (`test_v52_bfork_tree_parity`) in `test_units.py` validating greedy parity for B-Fork with tree verifier across full and 32k pruned vocab.
 - **Verification**:
-  - `python3 -m py_compile *.py tools/*.py` verified syntax across modified files.
-  - `git diff --check` verified formatting.
-
-
+  - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
+  - `git diff --check` confirmed clean whitespace and formatting across all modified files.

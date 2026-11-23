@@ -164,6 +164,28 @@ def compute_shifted_soft_embeds(
     return torch.cat([y_star_emb, e_bar], dim=1)
 
 
+def build_bfork_token_embeds(
+    y_star_emb: torch.Tensor,       # (B, 1, D)
+    d0_emb: torch.Tensor,           # (B, 1, D)
+    mask_emb: torch.Tensor,         # (1, 1, D) or (B, 1, D)
+    w: int,
+) -> torch.Tensor:
+    """Build Pass-2 token embedding inputs conditioned on concrete slot-1 token d0 (B-Fork).
+
+    Slot 0: y* (concrete bonus token at position t).
+    Slot 1: d0 (concrete candidate token at position t+1, branch condition).
+    Slots 2..w-1: [MASK] embeddings.
+    Returns: (B, w, D)
+    """
+    if w == 1:
+        return y_star_emb
+    if w == 2:
+        return torch.cat([y_star_emb, d0_emb], dim=1)
+    B = y_star_emb.shape[0]
+    mask_slots = mask_emb.expand(B, w - 2, -1)
+    return torch.cat([y_star_emb, d0_emb, mask_slots], dim=1)
+
+
 class ManifoldAlignmentBridge(nn.Module):
     """Manifold Alignment Bridge (Fixing Layer-0 vs. Layer-(L-4) Mismatch):
     Slot 0 (concrete bonus token y*): input_bridge(cat([RMSNorm(Emb(y*)), F_ctx_last]))
@@ -258,6 +280,8 @@ class WeightTiedTopKDrafter(nn.Module):
         soft_topk: int = 4,
         pass2_layers: int = 1,
         refine_bottleneck: int = 256,
+        pass2_mode: str = "soft",
+        fork_k: int = 3,
     ):
         super().__init__()
         self.k_layers = k_layers
@@ -267,6 +291,8 @@ class WeightTiedTopKDrafter(nn.Module):
         self.num_draft_steps = num_draft_steps
         self.soft_topk = soft_topk
         self.refine_bottleneck = refine_bottleneck
+        self.pass2_mode = pass2_mode
+        self.fork_k = fork_k
 
         # Frozen backbone references, kept out of _modules so that .to(), .train()
         # and .state_dict() never touch the 1.5B base model.
@@ -432,6 +458,8 @@ class WeightTiedTopKDrafter(nn.Module):
             "k_layers": self.k_layers,
             "pass2_layers": getattr(self, "pass2_layers", 0),
             "num_draft_steps": self.num_draft_steps,
+            "pass2_mode": getattr(self, "pass2_mode", "soft"),
+            "fork_k": getattr(self, "fork_k", 3),
         }
 
     def fuse_stage1_features(self, all_hidden_states: Tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -610,6 +638,7 @@ class WeightTiedTopKDrafter(nn.Module):
         v_prefix_list: Optional[List[torch.Tensor]] = None,  # list of 4 tensors (B, n_kv, S_p, head_dim)
         attn_mask: Optional[torch.Tensor] = None,            # (B, 1, W, S_p + W)
         pos_draft: Optional[torch.Tensor] = None,            # (B, W)
+        d0_override: Optional[torch.Tensor] = None,          # (B, 1) optional concrete slot-1 condition for bfork
     ) -> torch.Tensor:
         """Run 4-layer bidirectional draft pass.
         When drafting from concrete bonus token y* at sequence position t (y* = x_t):
@@ -635,8 +664,13 @@ class WeightTiedTopKDrafter(nn.Module):
         if pos_draft is None:
             pos_draft = torch.arange(cur_pos, cur_pos + w, device=device).unsqueeze(0).expand(B, w)
 
+        h_tap = None
+        p2_start = self.k_layers - self.pass2_layers
+
         # Execute draft layers (Pass 1)
         for layer_idx in range(self.k_layers):
+            if self.num_draft_steps > 1 and layer_idx == p2_start:
+                h_tap = h
             kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
             vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
             h, _, _ = self.forward_draft_layer(
@@ -649,30 +683,54 @@ class WeightTiedTopKDrafter(nn.Module):
             )
 
         if self.num_draft_steps > 1 and self.refine_bridge is not None:
-            # Pass 2: Differentiable soft embedding refinement
-            z1 = self.lm_head(self.norm(h))  # (B, W, vocab_size)
-            tok_emb_2 = compute_shifted_soft_embeds(
-                y_star_emb=y_star_emb,
-                z1=z1,
-                embed_weight=self.embed_tokens.weight,
-                top_k=self.soft_topk,
-            )
-            h = self.refine_bridge(tok_emb_2, h, f_ctx_last)
+            if getattr(self, "pass2_mode", "soft") == "bfork":
+                # B-Fork Pass 2: Condition suffix on concrete Slot-1 prediction (or d0_override)
+                z1_slot0 = self.lm_head(self.norm(h[:, 0:1, :]))  # (B, 1, V)
+                d0_ids = d0_override if d0_override is not None else z1_slot0[:, 0, :].argmax(dim=-1, keepdim=True)
+                d0_emb = self.embed_tokens(d0_ids)  # (B, 1, D)
+                tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, w)  # (B, W, D)
+                # Feed h_tap (pre-Pass-2 manifold tap) instead of post-Pass-1 h
+                h2 = self.refine_bridge(tok_emb_2, h_tap if h_tap is not None else h, f_ctx_last)
 
-            # Re-run top pass2_layers with dedicated Pass 2 deltas / ghost weights
-            p2_start = self.k_layers - self.pass2_layers
-            for layer_idx in range(p2_start, self.k_layers):
-                kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
-                vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
-                h, _, _ = self.forward_draft_layer(
-                    layer_idx=layer_idx,
-                    hidden_states=h,
-                    pos_draft=pos_draft,
-                    k_prefix=kp,
-                    v_prefix=vp,
-                    attn_mask=attn_mask,
-                    use_pass2=True,
+                for layer_idx in range(p2_start, self.k_layers):
+                    kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
+                    vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
+                    h2, _, _ = self.forward_draft_layer(
+                        layer_idx=layer_idx,
+                        hidden_states=h2,
+                        pos_draft=pos_draft,
+                        k_prefix=kp,
+                        v_prefix=vp,
+                        attn_mask=attn_mask,
+                        use_pass2=True,
+                    )
+
+                z2_suffix = self.lm_head(self.norm(h2[:, 1:, :]))  # (B, W - 1, V)
+                return torch.cat([z1_slot0, z2_suffix], dim=1)  # (B, W, V)
+            else:
+                # Pass 2: Differentiable soft embedding refinement (v5.1 default)
+                z1 = self.lm_head(self.norm(h))  # (B, W, vocab_size)
+                tok_emb_2 = compute_shifted_soft_embeds(
+                    y_star_emb=y_star_emb,
+                    z1=z1,
+                    embed_weight=self.embed_tokens.weight,
+                    top_k=self.soft_topk,
                 )
+                h = self.refine_bridge(tok_emb_2, h, f_ctx_last)
+
+                # Re-run top pass2_layers with dedicated Pass 2 deltas / ghost weights
+                for layer_idx in range(p2_start, self.k_layers):
+                    kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
+                    vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
+                    h, _, _ = self.forward_draft_layer(
+                        layer_idx=layer_idx,
+                        hidden_states=h,
+                        pos_draft=pos_draft,
+                        k_prefix=kp,
+                        v_prefix=vp,
+                        attn_mask=attn_mask,
+                        use_pass2=True,
+                    )
 
         # Output head: frozen norm + frozen lm_head
         h_norm = self.norm(h)
@@ -746,6 +804,8 @@ def prepare_v3(
     soft_topk: int = 4,
     pass2_layers: int = 1,
     refine_bottleneck: int = 256,
+    pass2_mode: str = "soft",
+    fork_k: int = 3,
 ) -> Tuple[AutoModelForCausalLM, WeightTiedTopKDrafter, AutoTokenizer, int]:
     """Prepare frozen base model + standalone WeightTiedTopKDrafter."""
     if device is None:
@@ -770,6 +830,8 @@ def prepare_v3(
         soft_topk=soft_topk,
         pass2_layers=pass2_layers,
         refine_bottleneck=refine_bottleneck,
+        pass2_mode=pass2_mode,
+        fork_k=fork_k,
     ).to(device)
 
     # Drafter trainable parameters in fp32 for stable training
