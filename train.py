@@ -17,7 +17,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,20 +28,40 @@ from model import WeightTiedTopKDrafter, prepare_v3
 
 
 class OnPolicySequenceDataset(Dataset):
-    """Dataset of on-policy token sequences."""
+    """Dataset of on-policy token sequences with their valid (non-padded) lengths."""
 
     def __init__(self, data_path_or_tensor, max_len: int = 256):
         if isinstance(data_path_or_tensor, (str, Path)):
             payload = torch.load(data_path_or_tensor, map_location="cpu")
             self.seqs = payload["sequences"][:, :max_len]
+            lens = payload.get("seq_lens")
+            if lens is None:
+                self.seq_lens = torch.full((len(self.seqs),), self.seqs.shape[1], dtype=torch.long)
+            else:
+                self.seq_lens = lens.long().clamp(max=self.seqs.shape[1])
+                if len(self.seq_lens) != len(self.seqs):
+                    raise ValueError(
+                        f"seq_lens has {len(self.seq_lens)} rows, sequences has {len(self.seqs)}"
+                    )
         else:
             self.seqs = data_path_or_tensor[:, :max_len]
+            self.seq_lens = torch.full((len(self.seqs),), self.seqs.shape[1], dtype=torch.long)
 
     def __len__(self):
         return len(self.seqs)
 
     def __getitem__(self, idx):
-        return self.seqs[idx]
+        return self.seqs[idx], self.seq_lens[idx]
+
+    def filter_min_len(self, min_len: int) -> "OnPolicySequenceDataset":
+        """Keep only rows with at least min_len valid tokens."""
+        keep = self.seq_lens >= min_len
+        if bool(keep.all()):
+            return self
+        out = OnPolicySequenceDataset.__new__(OnPolicySequenceDataset)
+        out.seqs = self.seqs[keep]
+        out.seq_lens = self.seq_lens[keep]
+        return out
 
 
 def create_synthetic_data(num_samples: int = 64, seq_len: int = 128, vocab_size: int = 1000) -> torch.Tensor:
@@ -58,6 +78,7 @@ def compute_anchor_distill_loss(
     n_anchors: int = 16,
     lambda_kl: float = 0.5,
     d_pace_decay: float = 0.85,
+    seq_lens: Optional[torch.Tensor] = None,  # (B,) valid tokens per row
 ) -> Tuple[torch.Tensor, dict]:
     """Parallelized DFlash-Style Random-Anchor Block Training (Fix 1 & Fix 2):
     1. Base model no_grad forward pass: extracts Top-64 teacher logits and tapped hidden states.
@@ -77,9 +98,20 @@ def compute_anchor_distill_loss(
     B, S = batch_seqs.shape
     device = batch_seqs.device
 
+    if seq_lens is None:
+        seq_lens = torch.full((B,), S, dtype=torch.long, device=device)
+    seq_lens = seq_lens.to(device=device, dtype=torch.long).clamp(max=S)
+    pad_attn = (torch.arange(S, device=device)[None, :] < seq_lens[:, None]).long()
+    min_len = int(seq_lens.min().item())
+
+    # Clamp the draft block so every anchor target stays inside the shortest valid row.
+    w = min(w, min_len - 2)
+    if w < 1:
+        raise ValueError(f"batch has {min_len} valid tokens, need at least 3 for a draft block")
+
     # 1. Base model teacher forward pass
     with torch.no_grad():
-        out = base_model(batch_seqs, output_hidden_states=True)
+        out = base_model(batch_seqs, attention_mask=pad_attn, output_hidden_states=True)
         teacher_logits = out.logits  # (B, S, vocab)
         top64_vals, top64_idx = torch.topk(teacher_logits, k=64, dim=-1)  # (B, S, 64)
         top64_probs = F.softmax(top64_vals.float(), dim=-1)
@@ -93,9 +125,9 @@ def compute_anchor_distill_loss(
 
     # 3. Sample random clean anchors
     # Each anchor t needs prefix of length >= 1 (so t >= 1, meaning token t-1 exists)
-    # and targets up to t + w (so t + w <= S - 1, meaning targets t+1..t+w exist in batch_seqs)
+    # and targets up to t + w (so t + w <= min_len - 1, i.e. inside every valid row)
     min_anchor = 1
-    max_anchor = max(2, S - w - 1)
+    max_anchor = max(2, min_len - w)
     if max_anchor <= min_anchor:
         min_anchor = 1
         max_anchor = 2
@@ -166,12 +198,16 @@ def compute_anchor_distill_loss(
     t_top64_idx = torch.stack([top64_idx[:, t : t + w] for t in anchors], dim=1)        # (B, N, W, 64)
     t_top64_probs = torch.stack([top64_probs[:, t : t + w] for t in anchors], dim=1)    # (B, N, W, 64)
 
-    # Gather student logits on teacher Top-64
-    s_gathered = torch.gather(student_logits.float(), dim=-1, index=t_top64_idx)  # (B, N, W, 64)
-    s_log_probs = F.log_softmax(s_gathered, dim=-1)
+    # Gather student logits on teacher Top-64 and normalise over the full vocabulary.
+    # ponytail: one full-vocab fp32 copy per batch, chunk over N if RSS matters.
+    logits_f32 = student_logits.float()
+    lse = torch.logsumexp(logits_f32, dim=-1, keepdim=True)
+    s_gathered = torch.gather(logits_f32, dim=-1, index=t_top64_idx)  # (B, N, W, 64)
+    s_log_probs = s_gathered - lse
 
     kl = F.kl_div(s_log_probs, t_top64_probs, reduction="none").sum(dim=-1)  # (B, N, W)
-    ce = F.cross_entropy(student_logits.reshape(-1, student_logits.shape[-1]), targets.reshape(-1), reduction="none").view(B, N, w)
+    target_logp = torch.gather(logits_f32, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    ce = lse.squeeze(-1) - target_logp
 
     # D-PACE position weighting
     d_pace = torch.tensor([d_pace_decay ** j for j in range(w)], device=device, dtype=torch.float32)
@@ -269,46 +305,75 @@ def main():
         dataset = OnPolicySequenceDataset(args.data)
     else:
         dataset = OnPolicySequenceDataset(create_synthetic_data(num_samples=128, seq_len=96))
+    dataset = dataset.filter_min_len(args.w + 2)
+    if len(dataset) < args.batch_size:
+        raise ValueError(
+            f"dataset has {len(dataset)} sequences of at least {args.w + 2} valid tokens, "
+            f"need at least batch_size={args.batch_size}. Regenerate the dataset with "
+            "generate_onpolicy.py or lower --batch_size."
+        )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     loader_iter = iter(loader)
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
+    def next_batch():
+        nonlocal loader_iter
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            batch = next(loader_iter)
+        return [t.to(device) for t in batch]
+
     # Probe loss for smoke test convergence check
-    probe_batch = next(loader_iter).to(device)
+    probe_batch = next_batch()
     with torch.no_grad():
         initial_loss, _ = compute_anchor_distill_loss(
-            base_model, drafter, probe_batch, mask_id, w=args.w, n_anchors=2
+            base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1]
         )
     before_loss = initial_loss.item()
     if args.smoke_test:
         print(f"smoke probe loss (before): {before_loss:.4f}")
 
     start_time = time.time()
+    base_model.eval()
     drafter.train()
 
+    stats = {}
     for step in range(1, args.steps + 1):
-        try:
-            batch = next(loader_iter).to(device)
-        except StopIteration:
-            loader_iter = iter(loader)
-            batch = next(loader_iter).to(device)
-
         opt.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_fp16):
-            loss, stats = compute_anchor_distill_loss(
-                base_model, drafter, batch, mask_id, w=args.w, n_anchors=args.n_anchors
-            )
+        accum_count = 0
+        accum_loss = 0.0
+
+        for _ in range(args.grad_accum):
+            batch_seqs, batch_lens = next_batch()
+            with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_fp16):
+                loss, stats = compute_anchor_distill_loss(
+                    base_model, drafter, batch_seqs, mask_id, w=args.w,
+                    n_anchors=args.n_anchors, seq_lens=batch_lens,
+                )
+            # Divide now, rescale after unscale_ if the inner loop came up short.
+            (loss / args.grad_accum).backward()
+            accum_loss += stats["loss"]
+            accum_count += 1
+
+        if accum_count == 0:
+            continue
 
         if use_fp16:
-            scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        if 0 < accum_count < args.grad_accum:
+            rescale = args.grad_accum / accum_count
+            for p in trainable_params:
+                if p.grad is not None:
+                    p.grad.mul_(rescale)
+
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        if use_fp16:
             scaler.step(opt)
             scaler.update()
         else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
 
         sched.step()
@@ -316,7 +381,7 @@ def main():
         if step % args.log_every == 0 or step == 1:
             elapsed = time.time() - start_time
             print(
-                f"step {step:5d}/{args.steps} loss {stats['loss']:.4f} "
+                f"step {step:5d}/{args.steps} loss {accum_loss / max(1, accum_count):.4f} "
                 f"lr {sched.get_last_lr()[0]:.2e} "
                 f"A_+1: {stats['acc_offset1']:.1%} A_+2: {stats['acc_offset2']:.1%} A_+3: {stats['acc_offset3']:.1%} "
                 f"elapsed {elapsed:.0f}s"
@@ -347,7 +412,7 @@ def main():
     if args.smoke_test:
         with torch.no_grad():
             after_loss_t, _ = compute_anchor_distill_loss(
-                base_model, drafter, probe_batch, mask_id, w=args.w, n_anchors=2
+                base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1]
             )
         after_loss = after_loss_t.item()
         ok = math.isfinite(after_loss) and after_loss < before_loss

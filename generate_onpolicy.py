@@ -216,6 +216,7 @@ def generate_onpolicy_dataset(
     print(f"Loaded {len(prompts)} unique diverse prompts (source={prompt_source}). Generating responses at batch_size={batch_size}...")
 
     all_sequences = []
+    all_seq_lens = []
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
@@ -243,8 +244,23 @@ def generate_onpolicy_dataset(
                     pad_token_id=tok.pad_token_id,
                 )
 
-        # Append CPU tensor
-        all_sequences.append(gen_out.cpu())
+        # Strip the left prompt padding and cut each row right after its first EOS.
+        # The saved sequences then have a valid span that starts at index 0, which is
+        # what train.py's shared anchor window needs.
+        gen_cpu = gen_out.cpu()
+        attn_cpu = inputs["attention_mask"].cpu()
+        for r in range(gen_cpu.shape[0]):
+            row = gen_cpu[r]
+            prompt_len = int(attn_cpu[r].sum())
+            left_pad = int((attn_cpu[r] == 0).sum())
+            row = row[left_pad:]
+            if tok.eos_token_id is not None and prompt_len < row.shape[0]:
+                tail = row[prompt_len:]
+                hit = (tail == tok.eos_token_id).nonzero(as_tuple=False)
+                if hit.numel() > 0:
+                    row = row[: prompt_len + int(hit[0, 0]) + 1]
+            all_sequences.append(row)
+            all_seq_lens.append(int(row.shape[0]))
         total_tokens += gen_out.numel()
 
         now = time.time()
@@ -253,19 +269,21 @@ def generate_onpolicy_dataset(
         tok_s = total_tokens / max(1e-4, elapsed)
         print(f"Progress: {done_samples:5d}/{len(prompts)} sequences | {tok_s:,.0f} tok/s | elapsed {elapsed:.0f}s")
 
-    # Pad/truncate and concatenate
-    max_len = max(s.shape[1] for s in all_sequences)
+    # Right-pad to equal length and record the valid length of every row
+    max_len = max(s.shape[0] for s in all_sequences)
     padded_seqs = []
     for s in all_sequences:
-        if s.shape[1] < max_len:
-            pad = torch.full((s.shape[0], max_len - s.shape[1]), tok.pad_token_id, dtype=torch.long)
-            s = torch.cat([s, pad], dim=-1)
+        if s.shape[0] < max_len:
+            pad = torch.full((max_len - s.shape[0],), tok.pad_token_id, dtype=torch.long)
+            s = torch.cat([s, pad], dim=0)
         padded_seqs.append(s)
 
-    final_dataset = torch.cat(padded_seqs, dim=0)
+    final_dataset = torch.stack(padded_seqs, dim=0)
+    seq_lens = torch.tensor(all_seq_lens, dtype=torch.long)
     torch.save(
         {
             "sequences": final_dataset,
+            "seq_lens": seq_lens,
             "vocab_size": model.config.vocab_size,
             "pad_token_id": tok.pad_token_id,
             "model_name": model_name,
@@ -273,7 +291,7 @@ def generate_onpolicy_dataset(
         },
         out_path,
     )
-    print(f"Saved {len(final_dataset)} sequences to {out_path} (shape: {final_dataset.shape})")
+    print(f"Saved {len(final_dataset)} sequences to {out_path} (shape: {final_dataset.shape}, min valid len: {int(seq_lens.min())})")
     return out_path
 
 
