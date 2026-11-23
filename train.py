@@ -354,7 +354,11 @@ def main():
                     n_anchors=args.n_anchors, seq_lens=batch_lens,
                 )
             # Divide now, rescale after unscale_ if the inner loop came up short.
-            (loss / args.grad_accum).backward()
+            scaled_loss = loss / args.grad_accum
+            if use_fp16:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             accum_loss += stats["loss"]
             accum_count += 1
 
