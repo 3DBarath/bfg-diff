@@ -162,6 +162,7 @@ def run_benchmark(
     device: str = "auto",
     smoke_test: bool = False,
     v_tokens: int = None,
+    draft_vocab: Optional[str] = None,
 ):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,6 +185,12 @@ def run_benchmark(
     else:
         base_dtype = torch.bfloat16
     base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
+
+    draft_vocab_ids = None
+    if draft_vocab and Path(draft_vocab).exists():
+        print(f"Loading draft vocab IDs from {draft_vocab}...")
+        draft_vocab_ids = torch.load(draft_vocab, map_location=device)
+        print(f"Loaded {len(draft_vocab_ids)} draft vocab IDs.")
 
     if checkpoint and Path(checkpoint).exists():
         print(f"Loading drafter checkpoint from {checkpoint}...")
@@ -305,6 +312,7 @@ def run_benchmark(
         dtype=base_dtype,
         use_cuda_graph=(batch_size == 1),
         hedge_margin=hedge_margin,
+        draft_vocab_ids=draft_vocab_ids,
     )
     if shared_engine.device.type == "cuda" and batch_size == 1:
         shared_engine.capture_cuda_graphs(mask_id)
@@ -386,6 +394,7 @@ def run_benchmark(
     eng = StaticDraftEngine(
         base_model, drafter, max_len=256, batch_size=1, v_tokens=v_tokens,
         device=device, dtype=base_dtype, use_cuda_graph=(device == "cuda"),
+        draft_vocab_ids=draft_vocab_ids,
     )
     if eng.device.type == "cuda":
         eng.capture_cuda_graphs(mask_id)
@@ -456,6 +465,7 @@ def main():
     p.add_argument("--device", default="auto")
     p.add_argument("--smoke_test", action="store_true")
     p.add_argument("--v_tokens", type=int, default=None, help="Draft window W (default: auto, 3 on CPU / 7 on CUDA)")
+    p.add_argument("--draft_vocab", type=str, default=None, help="Path to draft_vocab_ids tensor")
     args = p.parse_args()
 
     run_benchmark(
@@ -470,6 +480,7 @@ def main():
         device=args.device,
         smoke_test=args.smoke_test,
         v_tokens=args.v_tokens,
+        draft_vocab=args.draft_vocab,
     )
 
 

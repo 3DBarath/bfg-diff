@@ -67,11 +67,12 @@ V3_CONFIGS = {
 class V3ModelManager:
     """Thread-safe manager that keeps a single BFG-Diff v4 model resident."""
 
-    def __init__(self, device: Optional[str] = None, cpu_quant: str = "none"):
+    def __init__(self, device: Optional[str] = None, cpu_quant: str = "none", draft_vocab: Optional[str] = None):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.cpu_quant = (cpu_quant or "none").lower().strip() if self.device.type == "cpu" else "none"
+        self.draft_vocab = draft_vocab
         # On CUDA: strictly fp16. On CPU: bfloat16 (3.1 GB memory, zero quantization degradation), or fp32 if INT8 quantizing.
         if self.device.type == "cuda":
             self.dtype = torch.float16
@@ -131,6 +132,12 @@ class V3ModelManager:
                 print(f"[V3ModelManager] Auto-adapting for CPU: applying {self.cpu_quant.upper()} quantization...")
                 base_model, drafter = quantize_for_cpu(base_model, drafter, mode=self.cpu_quant)
 
+            draft_vocab_ids = None
+            if self.draft_vocab and Path(self.draft_vocab).exists():
+                print(f"[V3ModelManager] Loading draft vocab IDs from {self.draft_vocab}...")
+                draft_vocab_ids = torch.load(self.draft_vocab, map_location=self.device)
+                print(f"[V3ModelManager] Loaded {len(draft_vocab_ids)} draft vocab IDs.")
+
             engine = StaticDraftEngine(
                 base_model=base_model,
                 drafter=drafter,
@@ -140,6 +147,7 @@ class V3ModelManager:
                 device=self.device,
                 dtype=self.dtype,
                 use_cuda_graph=(self.device.type == "cuda"),
+                draft_vocab_ids=draft_vocab_ids,
             )
 
             bundle = {
@@ -151,6 +159,7 @@ class V3ModelManager:
                 "engine": engine,
                 "engine_cache": {(engine.v_tokens, engine.max_len): engine},
                 "dtype": self.dtype,
+                "draft_vocab_ids": draft_vocab_ids,
                 "config": cfg,
             }
             self._models[cache_key] = bundle
@@ -198,6 +207,7 @@ def generate_v3_stream(
             dtype=bundle.get("dtype"),
             use_cuda_graph=(device.type == "cuda"),
             hedge_margin=hedge_margin,
+            draft_vocab_ids=bundle.get("draft_vocab_ids"),
         )
         cache[(eff_v, capacity)] = engine
         while len(cache) > 2:
@@ -2256,6 +2266,9 @@ def main():
     parser.add_argument(
         "--cpu_quant", default="none", choices=["none", "int8", "int4"], help="CPU quantization mode (default: none for bfloat16 full quality)"
     )
+    parser.add_argument(
+        "--draft_vocab", type=str, default=None, help="Path to draft_vocab_ids tensor"
+    )
     args = parser.parse_args()
     args.checkpoint_specified = ("--checkpoint" in sys.argv)
     ckpt_override = None
@@ -2266,7 +2279,7 @@ def main():
             print(f"[Notice] Legacy checkpoint argument '{args.checkpoint}' ignored in v3; using production v3 checkpoint.")
 
     device = "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
-    model_mgr = V3ModelManager(device=device, cpu_quant=args.cpu_quant)
+    model_mgr = V3ModelManager(device=device, cpu_quant=args.cpu_quant, draft_vocab=args.draft_vocab)
 
     if args.server:
         print(f"Pre-warming production default model ({args.model})...")

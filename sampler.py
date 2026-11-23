@@ -110,6 +110,7 @@ class StaticDraftEngine:
         hedge_margin: float = 1.0,
         buckets: Optional[Tuple[int, ...]] = None,
         mask_token_id: int = MASK_TOKEN_ID,
+        draft_vocab_ids: Optional[torch.Tensor] = None,
     ):
         self.base_model = base_model
         self.drafter = drafter
@@ -131,6 +132,16 @@ class StaticDraftEngine:
         self.use_cuda_graph = use_cuda_graph
         self.hedge_margin = float(hedge_margin)
 
+        # Draft Vocabulary Pruning
+        self.draft_vocab_ids = None
+        self.draft_lm_head_w = None
+        self.draft_lm_head_b = None
+        if draft_vocab_ids is not None:
+            self.draft_vocab_ids = draft_vocab_ids.to(device=self.device, dtype=torch.long).contiguous()
+            self.draft_lm_head_w = self.base_model.lm_head.weight[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
+            if getattr(self.base_model.lm_head, "bias", None) is not None:
+                self.draft_lm_head_b = self.base_model.lm_head.bias[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
+
         # Ensure drafter is cast to self.dtype in inference
         if self.device.type == "cuda" or self.dtype in (torch.float16, torch.bfloat16):
             self.drafter.to(dtype=self.dtype)
@@ -146,6 +157,31 @@ class StaticDraftEngine:
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
         self.dim = config.hidden_size
+
+        # Probe hardware/PyTorch support for enable_gqa=True with 4D float additive mask
+        self.supports_enable_gqa = False
+        if self.num_heads != self.num_kv_heads:
+            try:
+                # Probe with exact shapes, device, dtype, and 4D float mask
+                probe_q = torch.zeros(1, self.num_heads, 1, self.head_dim, dtype=self.dtype, device=self.device)
+                probe_k = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
+                probe_v = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
+                probe_mask = torch.zeros(1, 1, 1, 2, dtype=self.dtype, device=self.device)
+                probe_mask[0, 0, 0, 1] = -1e4
+
+                # Reference output via repeat_kv
+                k_rep = repeat_kv(probe_k, self.num_heads // self.num_kv_heads)
+                v_rep = repeat_kv(probe_v, self.num_heads // self.num_kv_heads)
+                out_ref = F.scaled_dot_product_attention(probe_q, k_rep, v_rep, attn_mask=probe_mask)
+
+                # Test enable_gqa=True
+                out_gqa = F.scaled_dot_product_attention(probe_q, probe_k, probe_v, attn_mask=probe_mask, enable_gqa=True)
+                diff = (out_ref - out_gqa).abs().max().item()
+                tol = 1e-2 if self.dtype in (torch.float16, torch.bfloat16) else 1e-4
+                if diff <= tol:
+                    self.supports_enable_gqa = True
+            except Exception:
+                self.supports_enable_gqa = False
 
         # Buckets for Power-of-2 CUDA Graphs (or bucketed attention views)
         cand_buckets = buckets if buckets is not None else self.DEFAULT_BUCKETS
@@ -199,9 +235,10 @@ class StaticDraftEngine:
 
         # Pre-allocate static output buffers
         vocab_size = config.vocab_size
+        draft_v_size = len(self.draft_vocab_ids) if self.draft_vocab_ids is not None else vocab_size
         self.static_verify_logits = torch.zeros(batch_size, self.q_a, vocab_size, dtype=dtype, device=device)
         self.static_f_ctx_verify = torch.zeros(batch_size, self.q_a, self.dim, dtype=dtype, device=device)
-        self.static_draft_logits = torch.zeros(batch_size, self.w, vocab_size, dtype=dtype, device=device)
+        self.static_draft_logits = torch.zeros(batch_size, self.w, draft_v_size, dtype=dtype, device=device)
         self.static_draft_ids = torch.zeros(batch_size, self.w, dtype=torch.long, device=device)
 
         # Bucketed CUDA Graph storage: dict mapping S_bucket -> (verify_graph, draft_graph)
@@ -305,12 +342,14 @@ class StaticDraftEngine:
             v_active = self.target_cache.v[l_idx][:, :, :S_b, :]
 
             if self.num_heads != self.num_kv_heads:
-                k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
-                v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask_A_view, enable_gqa=True)
+                else:
+                    k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
+                    v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_A_view)
             else:
-                k_attn, v_attn = k_active, v_active
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_A_view)
+                attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask_A_view)
             attn_out = attn_out.transpose(1, 2).reshape(1, self.q_a, self.dim)
             h = h + layer.self_attn.o_proj(attn_out)
             norm_post = layer.post_attention_layernorm(h)
@@ -386,12 +425,14 @@ class StaticDraftEngine:
             v_total = self.draft_cache.v[layer_idx][:, :, :self.w + S_b, :]
 
             if self.num_heads != self.num_kv_heads:
-                k_attn = repeat_kv(k_total, self.num_heads // self.num_kv_heads)
-                v_attn = repeat_kv(v_total, self.num_heads // self.num_kv_heads)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view, enable_gqa=True)
+                else:
+                    k_attn = repeat_kv(k_total, self.num_heads // self.num_kv_heads)
+                    v_attn = repeat_kv(v_total, self.num_heads // self.num_kv_heads)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_B_view)
             else:
-                k_attn, v_attn = k_total, v_total
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_B_view)
+                attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view)
             attn_out = attn_out.transpose(1, 2).reshape(1, self.w, self.dim)
 
             if self.drafter.has_ghost_layers:
@@ -410,9 +451,15 @@ class StaticDraftEngine:
                 h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
         h_norm = self.drafter.norm(h)
-        logits = self.drafter.lm_head(h_norm)
-        self.static_draft_logits.copy_(logits)
-        self.static_draft_ids.copy_(torch.argmax(logits, dim=-1))
+        if self.draft_lm_head_w is not None:
+            logits = F.linear(h_norm, self.draft_lm_head_w, self.draft_lm_head_b)
+            self.static_draft_logits.copy_(logits)
+            local_ids = torch.argmax(logits, dim=-1)
+            self.static_draft_ids.copy_(self.draft_vocab_ids[local_ids])
+        else:
+            logits = self.drafter.lm_head(h_norm)
+            self.static_draft_logits.copy_(logits)
+            self.static_draft_ids.copy_(torch.argmax(logits, dim=-1))
 
     def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Stage 1 prefill on prompt tokens (length P).
@@ -442,13 +489,15 @@ class StaticDraftEngine:
             self.target_cache.update(l_idx, k, v, torch.arange(P, device=self.device))
 
             if self.num_heads != self.num_kv_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                k_attn = repeat_kv(k, n_rep)
-                v_attn = repeat_kv(v, n_rep)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
+                else:
+                    n_rep = self.num_heads // self.num_kv_heads
+                    k_attn = repeat_kv(k, n_rep)
+                    v_attn = repeat_kv(v, n_rep)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
             else:
-                k_attn, v_attn = k, v
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
             attn_out = attn_out.transpose(1, 2).reshape(B, P, self.dim)
             h = h + layer.self_attn.o_proj(attn_out)
 
@@ -503,12 +552,14 @@ class StaticDraftEngine:
             k_active = self.target_cache.k[l_idx][:, :, :max_total_len]
             v_active = self.target_cache.v[l_idx][:, :, :max_total_len]
             if self.num_heads != self.num_kv_heads:
-                k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
-                v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask, enable_gqa=True)
+                else:
+                    k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
+                    v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask)
             else:
-                k_attn, v_attn = k_active, v_active
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask)
+                attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask)
             attn_out = attn_out.transpose(1, 2).reshape(B, 1, self.dim)
             h = h + layer.self_attn.o_proj(attn_out)
             norm_post = layer.post_attention_layernorm(h)
@@ -647,13 +698,15 @@ class StaticDraftEngine:
             v_active = self.target_cache.v[l_idx][:, :, :S_active]
 
             if self.num_heads != self.num_kv_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                k_attn = repeat_kv(k_active, n_rep)
-                v_attn = repeat_kv(v_active, n_rep)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask, enable_gqa=True)
+                else:
+                    n_rep = self.num_heads // self.num_kv_heads
+                    k_attn = repeat_kv(k_active, n_rep)
+                    v_attn = repeat_kv(v_active, n_rep)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask)
             else:
-                k_attn, v_attn = k_active, v_active
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask)
+                attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask)
             attn_out = attn_out.transpose(1, 2).reshape(B, Q_A, self.dim)
             h = h + layer.self_attn.o_proj(attn_out)
             norm_post = layer.post_attention_layernorm(h)
@@ -792,13 +845,15 @@ class StaticDraftEngine:
             v_total = self.draft_cache.v[layer_idx][:, :, :W + S_active, :]
 
             if self.num_heads != self.num_kv_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                k_attn = repeat_kv(k_total, n_rep)
-                v_attn = repeat_kv(v_total, n_rep)
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask, enable_gqa=True)
+                else:
+                    n_rep = self.num_heads // self.num_kv_heads
+                    k_attn = repeat_kv(k_total, n_rep)
+                    v_attn = repeat_kv(v_total, n_rep)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
             else:
-                k_attn, v_attn = k_total, v_total
-
-            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
+                attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask)
             attn_out = attn_out.transpose(1, 2).reshape(B, W, self.dim)
 
             if self.drafter.has_ghost_layers:
@@ -817,8 +872,13 @@ class StaticDraftEngine:
                 h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
         h_norm = self.drafter.norm(h)
-        logits = self.drafter.lm_head(h_norm)
-        draft_ids = torch.argmax(logits, dim=-1)
+        if self.draft_lm_head_w is not None:
+            logits = F.linear(h_norm, self.draft_lm_head_w, self.draft_lm_head_b)
+            local_ids = torch.argmax(logits, dim=-1)
+            draft_ids = self.draft_vocab_ids[local_ids]
+        else:
+            logits = self.drafter.lm_head(h_norm)
+            draft_ids = torch.argmax(logits, dim=-1)
 
         if return_logits:
             return draft_ids, logits
@@ -1011,7 +1071,13 @@ def generate_speculative_v3(
             top2_vals = top2.values.tolist()
             top2_inds = top2.indices.tolist()
             v1, v2 = top2_vals[0], top2_vals[1]
-            d0_1, d0_2 = top2_inds[0], top2_inds[1]
+            raw_d0_1, raw_d0_2 = top2_inds[0], top2_inds[1]
+            if engine.draft_vocab_ids is not None:
+                d0_1 = int(engine.draft_vocab_ids[raw_d0_1].item())
+                d0_2 = int(engine.draft_vocab_ids[raw_d0_2].item())
+            else:
+                d0_1 = raw_d0_1
+                d0_2 = raw_d0_2
             margin = v1 - v2
             if margin < hedge_margin:
                 is_hedge = True
