@@ -549,18 +549,21 @@ def run_benchmark(
                         probs = F.softmax(logits / max(1e-4, temperature), dim=-1)
                         cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
 
-                    gen_tokens_count = 0
-                    for step_idx in range(1, max_new_tokens):
-                        cur_pos = P_len + step_idx - 1
-                        logits_step = graphed_runner.step(cur_tok, cur_pos)
-                        if temperature == 0.0:
-                            cur_tok = torch.argmax(logits_step, dim=-1)
-                        else:
-                            probs = F.softmax(logits_step / max(1e-4, temperature), dim=-1)
-                            cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
-                        gen_tokens_count += 1
-                        if tok.eos_token_id is not None and int(cur_tok.item()) == tok.eos_token_id:
-                            break
+                    gen_tokens_count = 1
+                    if tok.eos_token_id is not None and int(cur_tok.item()) == tok.eos_token_id:
+                        pass
+                    else:
+                        for step_idx in range(1, max_new_tokens):
+                            cur_pos = P_len + step_idx - 1
+                            logits_step = graphed_runner.step(cur_tok, cur_pos)
+                            if temperature == 0.0:
+                                cur_tok = torch.argmax(logits_step, dim=-1)
+                            else:
+                                probs = F.softmax(logits_step / max(1e-4, temperature), dim=-1)
+                                cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
+                            gen_tokens_count += 1
+                            if tok.eos_token_id is not None and int(cur_tok.item()) == tok.eos_token_id:
+                                break
                 sync_device()
                 elapsed = time.perf_counter() - t0
                 graphed_times.append(elapsed)
@@ -755,8 +758,9 @@ def run_benchmark(
     print(f"{'A_+3 Acceptance Rate':<35}{'-':>15}{f'{a3:.1f}%':>15}")
     print(f"{'A_+4 Acceptance Rate':<35}{'-':>15}{f'{a4:.1f}%':>15}")
     print(f"{'Leaf-Hedge Hit Rate':<35}{'-':>15}{f'{hedge_hit_rate:.1f}% ({total_hedge_hits}/{total_hedge_attempts})':>15}")
+    steps_label = f", Steps={getattr(drafter, 'num_draft_steps', 1)}" if getattr(drafter, 'num_draft_steps', 1) > 1 else ""
     print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
-    print(f"{'T_draft (4L, W=%d)' % eng.w:<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+    print(f"{'T_draft (%dL%s, W=%d)' % (eng.k_layers, steps_label, eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     print(f"{'Exact Lossless Consistency %':<35}{'100.0%' if consistency_str != 'N/A' else 'N/A':>15}{consistency_str:>15}")
     if divergence_margins:
         min_m = min(divergence_margins)

@@ -474,15 +474,12 @@ class StaticDraftEngine:
                 z1_shift = self.drafter.lm_head(h_norm1)
                 embed_w = self.drafter.embed_tokens.weight
 
-            # Pad z1 to length W so compute_shifted_soft_embeds can slice [:w-1]
-            z1_padded = torch.zeros(1, self.w, z1_shift.shape[-1], dtype=z1_shift.dtype, device=self.device)
-            z1_padded[:, :self.w - 1, :].copy_(z1_shift)
-
             tok_emb_2 = compute_shifted_soft_embeds(
                 y_star_emb=y_star_emb,
-                z1=z1_padded,
+                z1=z1_shift,
                 embed_weight=embed_w,
                 top_k=getattr(self.drafter, "soft_topk", 4),
+                z1_is_shifted=True,
             )
             h = self.drafter.refine_bridge(tok_emb_2, h, self.static_f_ctx_last)
 
@@ -978,15 +975,12 @@ class StaticDraftEngine:
                 z1_shift = self.drafter.lm_head(h_norm1)
                 embed_w = self.drafter.embed_tokens.weight
 
-            # Pad z1 to length W so compute_shifted_soft_embeds can slice [:W-1]
-            z1_padded = torch.zeros(B, W, z1_shift.shape[-1], dtype=z1_shift.dtype, device=self.device)
-            z1_padded[:, :W - 1, :].copy_(z1_shift)
-
             tok_emb_2 = compute_shifted_soft_embeds(
                 y_star_emb=y_star_emb,
-                z1=z1_padded,
+                z1=z1_shift,
                 embed_weight=embed_w,
                 top_k=getattr(self.drafter, "soft_topk", 4),
+                z1_is_shifted=True,
             )
             h = self.drafter.refine_bridge(tok_emb_2, h, f_ctx_last)
 

@@ -2286,10 +2286,7 @@ def main():
     args.checkpoint_specified = ("--checkpoint" in sys.argv)
     ckpt_override = None
     if args.checkpoint_specified and args.checkpoint:
-        if "v3" in args.checkpoint:
-            ckpt_override = args.checkpoint
-        else:
-            print(f"[Notice] Legacy checkpoint argument '{args.checkpoint}' ignored in v3; using production v3 checkpoint.")
+        ckpt_override = args.checkpoint
 
     device = "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
     model_mgr = V3ModelManager(device=device, cpu_quant=args.cpu_quant, draft_vocab=args.draft_vocab)

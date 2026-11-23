@@ -35,10 +35,17 @@ TEST_PROMPTS_10 = [
 ]
 
 
-def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
+def test_unit_gate_b(
+    model_names: Optional[List[str]] = None,
+    k_layers: int = 4,
+    drafter_r: int = 32,
+    drafter_alpha: float = 64.0,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
+) -> bool:
     """Unit Gate B: Assert trainable_params / total_params < 0.01 on both 1.5B and 3B."""
     print("\n" + "=" * 60)
-    print("UNIT GATE B: Parameter Budget Check (<1% PEFT)")
+    print(f"UNIT GATE B: Parameter Budget Check (<1% PEFT, k_layers={k_layers}, r={drafter_r}, steps={num_draft_steps})")
     print("=" * 60)
     all_pass = True
 
@@ -56,7 +63,7 @@ def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
         head_dim = getattr(cfg, "head_dim", D // num_heads)
         mlp_dim = cfg.intermediate_size
         L = cfg.num_hidden_layers
-        r = 32
+        r = drafter_r
 
         # 1. Fusion: 4*D -> 512 -> D + RMSNorm(D)
         p_fusion = (4 * D * 512) + (512 * D) + D
@@ -64,7 +71,10 @@ def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
         # 2. Bridge: 2*D -> 512 -> D + RMSNorm(D) + slot_emb(8*D)
         p_bridge = (2 * D * 512) + (512 * D) + D + (8 * D)
 
-        # 3. 4 layers of LoRA deltas: q, k, v, o, gate, up, down
+        # Refine bridge if num_draft_steps > 1
+        p_refine = (2 * D * 512) + (512 * D) + (2 * D) + (8 * D) if num_draft_steps > 1 else 0
+
+        # 3. k_layers of LoRA deltas: q, k, v, o, gate, up, down
         p_delta_per_layer = (
             r * D + D * r +
             r * D + (num_kv * head_dim) * r +
@@ -74,8 +84,8 @@ def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
             r * D + mlp_dim * r +
             r * mlp_dim + D * r
         )
-        p_deltas = 4 * p_delta_per_layer
-        p_trainable = p_fusion + p_bridge + p_deltas
+        p_deltas = k_layers * p_delta_per_layer
+        p_trainable = p_fusion + p_bridge + p_refine + p_deltas
 
         # Total base parameters estimate
         if "1.5B" in m_name:
@@ -107,14 +117,29 @@ def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
     return all_pass
 
 
-def test_unit_gate_a(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> bool:
+def test_unit_gate_a(
+    model_name: str = "Qwen/Qwen2.5-0.5B",
+    device: str = "cpu",
+    k_layers: int = 4,
+    drafter_r: int = 32,
+    drafter_alpha: float = 64.0,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
+) -> bool:
     """Unit Gate A: 100% token-identical output to raw model.generate() across 10 prompts (B=1 and B=4)."""
     print("\n" + "=" * 60)
-    print(f"UNIT GATE A: Lossless Parity Check on {model_name} (device={device})")
+    print(f"UNIT GATE A: Lossless Parity Check on {model_name} (device={device}, k_layers={k_layers}, steps={num_draft_steps})")
     print("=" * 60)
 
     base_model, drafter, tok, mask_id = prepare_v3(
-        model_name, device=device, dtype=torch.float32 if device == "cpu" else torch.float16
+        model_name,
+        device=device,
+        dtype=torch.float32 if device == "cpu" else torch.float16,
+        k_layers=k_layers,
+        drafter_r=drafter_r,
+        drafter_alpha=drafter_alpha,
+        num_draft_steps=num_draft_steps,
+        soft_topk=soft_topk,
     )
 
     # 1. Test B=1 across 10 prompts
@@ -433,14 +458,31 @@ def test_unit_gate_d(
     return passed
 
 
-def test_gate0_gate1_profile(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> dict:
+def test_gate0_gate1_profile(
+    model_name: str = "Qwen/Qwen2.5-0.5B",
+    device: str = "cpu",
+    k_layers: int = 4,
+    drafter_r: int = 32,
+    drafter_alpha: float = 64.0,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
+) -> dict:
     """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling with populated P=128 KV cache."""
     print("\n" + "=" * 60)
-    print(f"GATE 0 & GATE 1: Overhead and Draft Cost Ratio Profile ({model_name}, device={device})")
+    print(f"GATE 0 & GATE 1: Overhead and Draft Cost Ratio Profile ({model_name}, device={device}, k_layers={k_layers}, steps={num_draft_steps})")
     print("=" * 60)
 
     base_dtype = torch.float32 if device == "cpu" else torch.float16
-    base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
+    base_model, drafter, tok, mask_id = prepare_v3(
+        model_name,
+        device=device,
+        dtype=base_dtype,
+        k_layers=k_layers,
+        drafter_r=drafter_r,
+        drafter_alpha=drafter_alpha,
+        num_draft_steps=num_draft_steps,
+        soft_topk=soft_topk,
+    )
 
     from sampler import StaticDraftEngine
     P = 128
@@ -532,10 +574,24 @@ def main():
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
 
     # 1. Unit Gate B (Param Budget)
-    gate_b_pass = test_unit_gate_b()
+    gate_b_pass = test_unit_gate_b(
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
+    )
 
     # 2. Unit Gate A (Lossless Parity)
-    gate_a_pass = test_unit_gate_a(model_name=args.model, device=device)
+    gate_a_pass = test_unit_gate_a(
+        model_name=args.model,
+        device=device,
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
+    )
 
     # 3. Unit Gate C (Gradient Flow)
     gate_c_pass = test_unit_gate_c(
@@ -560,7 +616,15 @@ def main():
     )
 
     # 5. Gate 0 & 1 Roofline Profiling
-    profile_stats = test_gate0_gate1_profile(model_name=args.model, device=device)
+    profile_stats = test_gate0_gate1_profile(
+        model_name=args.model,
+        device=device,
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
+    )
 
     print("\n" + "=" * 60)
     print("PHASE 1 SUMMARY:")

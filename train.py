@@ -153,6 +153,7 @@ def compute_anchor_distill_loss(
 
     # Multi-layer target feature fusion (with grad enabled for fusion parameters)
     f_ctx = drafter.fuse_stage1_features(out.hidden_states)  # (B, S, D)
+    del out, teacher_logits
 
     # 2. Project full prefix KV ONCE for the entire sequence (B, S, D)
     pos_all = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
@@ -240,18 +241,24 @@ def compute_anchor_distill_loss(
         student_logits1, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
     )
 
+    p1_acc2 = None
     if getattr(drafter, "num_draft_steps", 1) > 1 and getattr(drafter, "refine_bridge", None) is not None:
+        with torch.no_grad():
+            preds_p1 = torch.argmax(student_logits1, dim=-1)
+            p1_acc2 = (preds_p1[:, :, 1] == targets[:, :, 1]).float().mean().item() if w > 1 else 0.0
+
         # Pass 2: Differentiable soft embedding refinement
         # Unpack h from (B, M, D) to (B * N, W, D) matching y_star_packed and f_last_packed
         # h was constructed as: h_packed.view(N, B, w, D).permute(1, 0, 2, 3).reshape(B, M, D)
         h1_unpacked = h.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
-        z1_unpacked = student_logits1.permute(1, 0, 2, 3).reshape(B * N, w, -1)
+        z1_shift_unpacked = student_logits1[:, :, :w - 1, :].permute(1, 0, 2, 3).reshape(B * N, w - 1, -1)
 
         tok_emb_2 = compute_shifted_soft_embeds(
             y_star_emb=y_star_emb,
-            z1=z1_unpacked,
+            z1=z1_shift_unpacked,
             embed_weight=drafter.embed_tokens.weight,
             top_k=getattr(drafter, "soft_topk", 4),
+            z1_is_shifted=True,
         )
         h2_packed = drafter.refine_bridge(tok_emb_2, h1_unpacked, f_last_packed)
         h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
@@ -291,6 +298,8 @@ def compute_anchor_distill_loss(
         "acc_offset3": acc_per_offset[2] if w > 2 else 0.0,
         "acc_offset4": acc_per_offset[3] if w > 3 else 0.0,
     }
+    if p1_acc2 is not None:
+        stats["p1_acc2"] = p1_acc2
     return loss, stats
 
 
@@ -465,10 +474,13 @@ def main():
 
         if step % args.log_every == 0 or step == 1:
             elapsed = time.time() - start_time
+            acc2_str = f"A_+2: {stats['acc_offset2']:.1%}"
+            if "p1_acc2" in stats:
+                acc2_str = f"P1->P2 A_+2: {stats['p1_acc2']:.1%}->{stats['acc_offset2']:.1%}"
             print(
                 f"step {step:5d}/{args.steps} loss {accum_loss / max(1, accum_count):.4f} "
                 f"lr {sched.get_last_lr()[0]:.2e} "
-                f"A_+1: {stats['acc_offset1']:.1%} A_+2: {stats['acc_offset2']:.1%} A_+3: {stats['acc_offset3']:.1%} "
+                f"A_+1: {stats['acc_offset1']:.1%} {acc2_str} A_+3: {stats['acc_offset3']:.1%} "
                 f"elapsed {elapsed:.0f}s"
             )
 

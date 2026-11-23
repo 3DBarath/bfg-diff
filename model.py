@@ -134,10 +134,11 @@ class SoftRefinementBridge(nn.Module):
 
 def compute_shifted_soft_embeds(
     y_star_emb: torch.Tensor,   # (B, 1, D)
-    z1: torch.Tensor,           # (B, w, V_or_Vd)
+    z1: torch.Tensor,           # (B, w, V_or_Vd) or (B, w-1, V_or_Vd) if z1_is_shifted=True
     embed_weight: torch.Tensor, # (V_or_Vd, D)
     top_k: int = 4,
     tau: float = 1.0,
+    z1_is_shifted: bool = False,
 ) -> torch.Tensor:
     """Compute shifted soft expected embeddings for Pass 2 refinement.
 
@@ -145,11 +146,16 @@ def compute_shifted_soft_embeds(
     which form the soft inputs for Pass 2 slots 1..w-1.
     Returns: (B, w, D)
     """
-    B, w, _ = z1.shape
-    if w == 1:
-        return y_star_emb
+    if z1_is_shifted:
+        if z1.shape[1] == 0:
+            return y_star_emb
+        z1_shift = z1
+    else:
+        B, w, _ = z1.shape
+        if w == 1:
+            return y_star_emb
+        z1_shift = z1[:, :w - 1, :]
 
-    z1_shift = z1[:, :w - 1, :]
     vals, idx = torch.topk(z1_shift, k=min(top_k, z1_shift.shape[-1]), dim=-1)
     probs = F.softmax(vals.float() / tau, dim=-1).to(y_star_emb.dtype)
     embs = F.embedding(idx, embed_weight)  # (B, w-1, K, D)

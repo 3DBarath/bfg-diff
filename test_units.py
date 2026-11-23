@@ -442,6 +442,7 @@ def test_v5_path_b_two_step_parity():
             mask_token_id=mask_id,
             max_new_tokens=max_new,
             temperature=0.0,
+            eos_token_id=tok.eos_token_id,
         )
 
     match_full = torch.equal(ref_out[:, :spec_out.shape[1]], spec_out)
@@ -451,12 +452,17 @@ def test_v5_path_b_two_step_parity():
     # 2. Speculative decoding with synthetic draft_vocab_ids
     vocab_size = getattr(base_model.config, "vocab_size", 151936)
     # Use top 32k tokens including prompt tokens and special tokens
-    special_ids = {0, 1, 2, mask_id, tok.eos_token_id, getattr(tok, "pad_token_id", 0)}
+    raw_special = [0, 1, 2, mask_id, tok.eos_token_id, getattr(tok, "pad_token_id", None)]
+    special_ids = {s for s in raw_special if s is not None}
     prompt_ids = set(input_ids[0].tolist())
     all_needed = special_ids | prompt_ids
-    rem = 32768 - len(all_needed)
-    cand_ids = sorted(list(all_needed) + list(range(len(all_needed), len(all_needed) + rem)))
-    draft_vocab_ids = torch.tensor(cand_ids[:32768], dtype=torch.long, device=device)
+    target_vocab_size = min(32768, vocab_size)
+    i = 0
+    while len(all_needed) < target_vocab_size and i < vocab_size:
+        all_needed.add(i)
+        i += 1
+    cand_ids = sorted(list(all_needed))
+    draft_vocab_ids = torch.tensor(cand_ids, dtype=torch.long, device=device)
 
     engine_pruned = StaticDraftEngine(
         base_model=base_model,
@@ -479,6 +485,7 @@ def test_v5_path_b_two_step_parity():
             max_new_tokens=max_new,
             temperature=0.0,
             engine=engine_pruned,
+            eos_token_id=tok.eos_token_id,
         )
 
     match_pruned = torch.equal(ref_out[:, :spec_out_pruned.shape[1]], spec_out_pruned)
