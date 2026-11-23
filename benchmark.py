@@ -19,11 +19,9 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import time
 from collections import Counter
 from pathlib import Path
-from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
 
 from model import prepare_v3, quantize_for_cpu
 from sampler import generate_speculative_v3, StaticDraftEngine
@@ -178,7 +176,13 @@ def run_benchmark(
     print(f"BFG-Diff v4 Benchmark | Model: {model_name} | Device: {device} (CPU Quant: {cpu_quant_mode}) | Prompts: {num_prompts} | C: {max_new_tokens} | B: {batch_size}")
     print("=" * 80)
 
-    base_dtype = torch.float16 if device == "cuda" else torch.float32
+    # Match chat.py's runtime dtype so server and benchmark numbers are comparable.
+    if device == "cuda":
+        base_dtype = torch.float16
+    elif cpu_quant_mode in ("int8", "int4"):
+        base_dtype = torch.float32
+    else:
+        base_dtype = torch.bfloat16
     base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
 
     if checkpoint and Path(checkpoint).exists():
@@ -253,8 +257,14 @@ def run_benchmark(
         try:
             print("\n[2/3] Running Compiled Baseline (torch.compile reduce-overhead)...")
             compiled_model = torch.compile(base_model, mode="reduce-overhead")
+            # Untimed warmup: the first call pays the whole graph compilation cost.
+            w_inputs = tok(prompts[:1], return_tensors="pt", padding=True).to(device)
+            sync_device()
+            with torch.no_grad():
+                compiled_model.generate(**w_inputs, max_new_tokens=8, do_sample=False)
+            sync_device()
             comp_times, comp_tokens = [], []
-            for i in range(0, min(len(prompts), 4), batch_size):
+            for i in range(0, len(prompts), batch_size):
                 b_prompts = prompts[i : i + batch_size]
                 inputs = tok(b_prompts, return_tensors="pt", padding=True).to(device)
                 sync_device()
@@ -338,8 +348,8 @@ def run_benchmark(
         a_plus_totals[2] += stats.get("a_plus_3", 0.0)
         a_plus_totals[3] += stats.get("a_plus_4", 0.0)
 
-        # Check token-exact match against raw baseline for temperature=0
-        if temperature == 0.0:
+        # Check token-exact match against raw baseline for greedy B=1
+        if temperature == 0.0 and batch_size == 1:
             batch_idx = i // batch_size
             raw_batch = raw_outputs[batch_idx]
             if torch.equal(raw_batch.cpu(), spec_gen_only.cpu()):
@@ -356,7 +366,7 @@ def run_benchmark(
     ]
     all_spec_seqs = torch.cat(padded_spec, dim=0)
 
-    n_batches = max(1, len(prompts) // batch_size)
+    n_batches = max(1, math.ceil(len(prompts) / batch_size))
     a1 = (a_plus_totals[0] / n_batches) * 100.0
     a2 = (a_plus_totals[1] / n_batches) * 100.0
     a3 = (a_plus_totals[2] / n_batches) * 100.0
@@ -365,15 +375,29 @@ def run_benchmark(
 
     alpha = (total_accepted_drafts + total_steps) / max(1, total_steps)
     speedup = spec_tps / max(1e-4, raw_tps)
-    consistency_pct = (exact_matches / max(1, len(prompts))) * 100.0 if temperature == 0.0 else 100.0
+    if temperature == 0.0 and batch_size == 1:
+        consistency_str = f"{(exact_matches / max(1, len(prompts))) * 100.0:.1f}%"
+    else:
+        consistency_str = "N/A"
     hedge_hit_rate = (total_hedge_hits / max(1, total_hedge_attempts)) * 100.0
 
-    # Profile isolated verify and draft step times on populated P=128 cache
-    eng = StaticDraftEngine(base_model, drafter, max_len=256, batch_size=1, v_tokens=v_tokens, device=device, dtype=base_dtype)
+    # Profile isolated verify and draft step times on populated P=128 cache.
+    # Capture the CUDA graphs first: capture runs dummy kernels that overwrite both caches.
+    eng = StaticDraftEngine(
+        base_model, drafter, max_len=256, batch_size=1, v_tokens=v_tokens,
+        device=device, dtype=base_dtype, use_cuda_graph=(device == "cuda"),
+    )
+    if eng.device.type == "cuda":
+        eng.capture_cuda_graphs(mask_id)
     dummy_p = torch.randint(100, 1000, (1, 128), device=device)
     _, f_last = eng.prefill(dummy_p)
     dummy_y = dummy_p[:, -1:]
     dummy_v = torch.randint(100, 1000, (1, eng.q_a), device=device)
+
+    for _ in range(3):
+        with torch.no_grad():
+            eng.forward_verify_step(dummy_v, [128])
+            eng.forward_draft_step(dummy_y, mask_id, f_last, [128])
 
     sync_device()
     t0 = time.perf_counter()
@@ -409,7 +433,7 @@ def run_benchmark(
     print(f"{'Leaf-Hedge Hit Rate':<35}{'-':>15}{f'{hedge_hit_rate:.1f}% ({total_hedge_hits}/{total_hedge_attempts})':>15}")
     print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
     print(f"{'T_draft (4L, W=%d)' % eng.w:<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
-    print(f"{'Exact Lossless Consistency %':<35}{'100.0%':>15}{f'{consistency_pct:.1f}%':>15}")
+    print(f"{'Exact Lossless Consistency %':<35}{'100.0%' if consistency_str != 'N/A' else 'N/A':>15}{consistency_str:>15}")
     print(f"{'4-gram Entropy (H4)':<35}{ngram_entropy(all_raw_seqs):>15.3f}{ngram_entropy(all_spec_seqs):>15.3f}")
     print(f"{'4-gram Repetition (rep4)':<35}{repeat_rate(all_raw_seqs):>14.1%}{repeat_rate(all_spec_seqs):>14.1%}")
     print(f"{'Adjacent Duplication (adj_dup)':<35}{adj_dup(all_raw_seqs):>14.1%}{adj_dup(all_spec_seqs):>14.1%}")

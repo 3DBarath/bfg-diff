@@ -11,14 +11,14 @@ Verifies:
 import argparse
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
 
-from model import WeightTiedTopKDrafter, prepare_v3
+from model import prepare_v3
 from sampler import generate_speculative_v3
 
 TEST_PROMPTS_10 = [
@@ -35,12 +35,15 @@ TEST_PROMPTS_10 = [
 ]
 
 
-def test_unit_gate_b(model_names: List[str] = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-3B"]) -> bool:
+def test_unit_gate_b(model_names: Optional[List[str]] = None) -> bool:
     """Unit Gate B: Assert trainable_params / total_params < 0.01 on both 1.5B and 3B."""
     print("\n" + "=" * 60)
     print("UNIT GATE B: Parameter Budget Check (<1% PEFT)")
     print("=" * 60)
     all_pass = True
+
+    if model_names is None:
+        model_names = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-3B"]
 
     for m_name in model_names:
         try:

@@ -6,9 +6,8 @@
 
 import torch
 import torch.nn.functional as F
-from model import prepare_v3, apply_linear_with_delta, apply_rotary_pos_emb_k, quantize_for_cpu
+from model import prepare_v3, apply_linear_with_delta, quantize_for_cpu
 from sampler import StaticDraftEngine, generate_speculative_v3
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 def test_ghost_weights_unit():
     print("--- Test 1: merge_ghost_weights() Unit Check ---")
@@ -263,7 +262,7 @@ def test_hedge_case_c_callback():
         base_model=torch.nn.Linear(1, 1),
         drafter=None,
         input_ids=torch.tensor([[10, 11, 12, 13]]),
-        max_new_tokens=1,
+        max_new_tokens=2,
         engine=_StubEngine(),
         hedge_margin=2.0,
         step_callback=events.append,
@@ -327,8 +326,10 @@ def test_cpu_lazy_commit_v3_leaf_hedge():
     print(f"Engine W={engine.w}, Q_A={engine.q_a} | hedge attempts={stats['hedge_attempts']}, hits={stats['hedge_hits']}")
     print(f"Reference={len(ref_gen)} Speculative={len(spec_gen)} Streamed={len(stream_t)} tokens")
 
-    assert len(stream_t) >= len(spec_gen), f"Streamed {len(stream_t)} tokens, generated {len(spec_gen)}"
-    assert torch.equal(stream_t[: len(spec_gen)], spec_gen), "Streamed tokens differ from generated tokens (token 0 dropped?)"
+    # The callback drops the stop token, so it may stream at most one token fewer.
+    assert len(stream_t) <= len(spec_gen), f"Streamed {len(stream_t)} tokens, generated {len(spec_gen)}"
+    assert len(spec_gen) - len(stream_t) <= 1, "Streaming lost more than one trailing stop token"
+    assert torch.equal(stream_t, spec_gen[: len(stream_t)]), "Streamed tokens differ from generated tokens (token 0 dropped?)"
     assert int(stream_t[0]) == int(spec_gen[0]), "First streamed token is not the prefill token"
     assert torch.equal(ref_gen, spec_gen), "CPU lazy-commit output differs from base model greedy"
     assert stats["hedge_attempts"] > 0, "hedge_margin=2.0 produced no hedge attempts"
