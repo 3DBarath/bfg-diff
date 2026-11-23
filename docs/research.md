@@ -500,6 +500,37 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
   - Replaced legacy v2 parameters (`sub_canvas_len`, `sub_steps`, `tau`, `branching`) in settings modal and presets with active v4 parameters (`canvas_len`, `temperature`, `hedge_margin`, `v_tokens`).
   - Updated Manual tab documentation to detail the v4 speculative architecture.
 
+### 6. Architectural and Runtime Hardening (v4 Post-Review)
+
+#### A. Speculative Budgeting & Stop Contracts
+- **Strict Token Budget Bounds**:
+  - Off-by-one budget leak resolved: `cur_pos - P + 1` is strictly enforced across loop termination and per-row completion checks.
+  - Sliced callback generation strictly bounds total emissions to `max_new_tokens`.
+  - In-block stop token handling: speculative multi-token blocks truncate immediately at the first emitted stop delimiter across all hedge branches. Batched sequences ($B > 1$) right-pad with EOS to ensure uniform stacking.
+- **Dynamic Mask ID & Zero-Allocation Graph Kernels**:
+  - `StaticDraftEngine` accepts variable `mask_token_id` without breaking graph capture pointers, updating buffers in-place only upon integer divergence.
+  - Eliminates per-step temporary allocations in the graph path via static pre-allocated index buffers and in-place `copy_().add_()` position offsets.
+
+#### B. Memory Isolation & Backbone Registration
+- **Backbone Submodule Decoupling**:
+  - Base model submodules (`base_model`, `norm`, `lm_head`, `embed_tokens`, `rotary_emb`) are decoupled from PyTorch `nn.Module` tracking via `object.__setattr__`.
+  - Drafter-level mutations (`.to()`, `.train()`, `.state_dict()`) strictly touch the 4-layer speculative adapter parameters (~78M parameters) without cloning or re-casting the 1.54B base model backbone.
+  - `draft_layers` is structured as a dynamic `@property` over the live base layers, preventing stale references or memory leaks during CPU INT8 quantization.
+
+#### C. Concurrency & Re-entrant Serving
+- **Thread-Safe Re-entrant Generation**:
+  - `ThreadingHTTPServer` endpoints (`/api/chat`, `/api/generate`) synchronize across model access and token generation using `threading.RLock()`.
+  - Strict input validation clamps `canvas_len`, `messages`, `v_tokens`, `temperature`, and `hedge_margin` before acquiring the lock, rejecting malformed requests immediately.
+  - Multi-engine capacity caching tracks `(v_tokens, capacity)` to eliminate re-initialization overhead across conversation turns.
+
+#### D. Training Data Sanitation & Exact Gradient Accumulation
+- **Sequence Boundary Masking**:
+  - `generate_onpolicy.py` strips prompt left-padding, truncates sequences at the first generated EOS, and exports true sequence lengths (`seq_lens`).
+  - `train.py` builds 2D `long` attention masks and constrains anchor sampling within strictly unpadded token spans (`hi = min_len - w_eff`).
+- **Exact Gradient Accumulation & Full-Vocab Distillation**:
+  - Nested micro-batch accumulation decouples gradient step increments from optimizer updates, ensuring the cosine learning rate schedule completes.
+  - Shared full-vocab `logsumexp` unifies top-64 Kullback-Leibler divergence with Cross-Entropy loss under exact mathematical normalization.
+
 
 
 

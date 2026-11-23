@@ -1881,3 +1881,70 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
 - **Known behavior:** the Visualizer groups the step-0 prefill event and the first speculative
   pass into block 0 (`block_idx = max(0, step - 1)`), and the block header keeps the accepted
   count of the event that created it.
+
+## 10. Runtime Bug Fixes from Code Review (2026-11-23)
+
+### 10.1 Token budget off-by-one in `generate_speculative_v3`
+- **Cause:** the loop condition and the per-row guards used `cur_pos - P`, but the generated
+  count is `cur_pos - P + 1` because prefill emits token 1. Every run did one extra
+  draft and verify pass, then sliced the result off.
+- **Change:** all four guards now use `cur_pos - P + 1`. The callback slices `committed_tokens`
+  to `max(0, max_new_tokens - generated_before)` and reports
+  `total_generated = generated_before + len(cb_tokens)`.
+- **Effect:** `max_new_tokens = 1` now runs zero speculative steps instead of one.
+
+### 10.2 Stop token in the middle of a committed block
+- **Cause:** the whole block was appended to `generated_per_row` even when a stop token
+  appeared in the middle. `torch.stack` then failed for `B > 1` when rows had different
+  lengths.
+- **Change:** `_truncate_at_stop` cuts each block after its first stop token, inclusive.
+  Rows are right-padded to the longest row with `eos_token_id`. `stats["lengths"]` gives the
+  unpadded length of each row. For `B == 1` no padding is added.
+
+### 10.3 Bucket bounds and `mask_token_id`
+- **Cause 1:** `get_bucket` returned `buckets[-1]` when `cur_pos + Q_A` exceeded it, which
+  allowed an out-of-bounds `scatter_` on a non-power-of-2 `max_len`.
+- **Change 1:** `max_len` is always the last bucket, and `get_bucket` raises `ValueError`
+  past it.
+- **Cause 2:** `static_mask_token` was hardcoded to `151665` and the `mask_token_id` argument
+  of `forward_draft_step` was ignored.
+- **Change 2:** the id is a constructor argument and a Python int is cached. The buffer is
+  refilled only when the id changes, so there is no device sync per step.
+
+### 10.4 Backbone registered inside the drafter
+- **Cause:** `self.base_model`, `norm`, `lm_head`, `embed_tokens` and `rotary_emb` were
+  assigned as normal attributes, so `nn.Module` registered them. `drafter.to()`,
+  `drafter.train()` and `drafter.state_dict()` then touched all 1.54B base tensors.
+- **Change:** those references use `object.__setattr__`. `draft_layers` is now a property
+  over the live base layers, so `quantize_for_cpu` cannot leave a stale fp32 copy alive.
+
+### 10.5 Concurrent requests shared one engine
+- **Cause:** `ThreadingHTTPServer` runs one thread per request. `StaticDraftEngine` holds
+  per-request KV state and the manager only locked model loading.
+- **Change:** `V3ModelManager.infer_lock` is a single `threading.RLock`. The POST handlers
+  hold it across `get_model` and the full generation. Eviction uses the same lock. A second
+  request waits. It does not share the engine.
+
+### 10.6 Training data carried prompt padding
+- **Cause:** `generate_onpolicy.py` left-padded prompts and right-padded the batch. `train.py`
+  passed the rows to the teacher with no `attention_mask` and sampled anchors over the pads.
+- **Change:** `generate_onpolicy.py` strips the left pads, cuts each row after its first EOS,
+  right-pads, and saves `seq_lens`. `train.py` builds a 2D `long` mask, passes it to
+  `base_model`, and samples anchors inside `[1, min_len - w)`. `w` is clamped to
+  `min_len - 2`, and the dataset drops rows shorter than `w + 2`.
+- **Note:** datasets written before this change have no `seq_lens`. The loader treats them as
+  fully valid, so old files still load but stay padding-polluted. Regenerate them.
+
+### 10.7 Gradient accumulation, KL normalisation, benchmark fairness
+- **`--grad_accum`:** the flag was parsed and never used. It now runs an inner loop over
+  micro-batches. The loss is divided before `backward()`. If the inner loop comes up short,
+  gradients are rescaled by `grad_accum / accum_count` after `unscale_`. The optimizer step
+  and the scheduler step happen once per outer step, so the cosine schedule still completes.
+- **KL term:** `log_softmax` was applied after the top-64 gather, so probability mass outside
+  the top-64 was never penalised. The code now computes `lse = logsumexp(logits_f32, -1)`
+  once and uses `s_gathered - lse` for KL and `lse - target_logp` for CE. `logits_f32` is one
+  full-vocab fp32 copy. Chunk over the anchor count if RSS matters.
+- **Benchmark:** the compiled baseline now warms up untimed and runs all prompts.
+  `n_batches` uses `ceil`. Consistency prints `N/A` when `temperature > 0` or `batch_size > 1`.
+  The isolated `T_verify` / `T_draft` engine captures CUDA graphs before `prefill` and warms
+  up. CPU dtype is `bfloat16` unless quantising, to match `chat.py`.

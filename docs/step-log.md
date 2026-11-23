@@ -1013,4 +1013,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 - Fixed test numbering header in `test_units.py` from `Test 5` to `Test 7: INT8 Quantized CPU Execution & Parity`.
 - **Verification:** `python -m py_compile chat.py test_units.py` verified compilation with zero errors.
 
+## 56. Code Review Hardening: Sampler, Model, Server, Training & Benchmarks (2026-11-23)
+- Implemented full code review remediation across all core modules:
+  - **`sampler.py` (Phase A)**: Fixed budget off-by-one (`cur_pos - P + 1`), callback truncation and total token reporting, in-block stop token truncation via `_truncate_at_stop`, $B > 1$ right-padding with `stats["lengths"]`, bucket bounds checking with `ValueError` on OOB, dynamic `mask_token_id` in-place buffer fill, and zero-allocation position updates using `copy_().add_()`.
+  - **`model.py` (Phase B)**: Set backbone tensor attributes using `object.__setattr__` to prevent 1.54B base model registration in drafter; implemented `draft_layers` as dynamic `@property` over live base layers; updated `quantize_for_cpu` docstring.
+  - **`chat.py` (Phase C)**: Added re-entrant `self.infer_lock = threading.RLock()`; added robust request validation and SSE error event emission with matching frontend error handling; added engine capacity caching; cleaned up dead flags and duplicate presets.
+  - **`generate_onpolicy.py` & `train.py` (Phase D)**: Sanitized sequence generation by stripping prompt left-padding and cutting at first EOS; clamped dataset `seq_lens` with 2D `long` attention masks; constrained anchor sampling to `hi = min_len - w_eff`; implemented nested inner micro-batch accumulation for exact `--grad_accum` cosine schedule maintenance; unified top-64 KL and CE over shared full-vocab `logsumexp`.
+  - **`benchmark.py` & tests (Phase E & F)**: Set `ceil` for batch counts; reported `N/A` for consistency when `temperature > 0` or `batch_size > 1`; warmed up compiled causal baseline across all prompts; captured CUDA graphs prior to prefill in isolated profiler; fixed mutable default argument in `test_gates.py`; updated test suite assertions.
+- **Verification**:
+  - `python3 -m py_compile *.py` verified clean compilation across all modules (`ALL_COMPILE_OK`).
+  - AST analysis verified zero mutable default arguments and clean imports.
+  - `git diff --check` verified no whitespace or formatting errors.
+  - Note: PyTorch and Qwen model weights are not present in this local coding environment; dynamic smoke tests (`train.py --smoke_test`, `benchmark.py --smoke_test`) did not execute and remain pending for remote GPU verification.
+
 
