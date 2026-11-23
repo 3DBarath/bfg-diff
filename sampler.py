@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import WeightTiedTopKDrafter, apply_linear_with_delta, apply_rotary_pos_emb_k
+from model import MASK_TOKEN_ID, WeightTiedTopKDrafter, apply_linear_with_delta, apply_rotary_pos_emb_k
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 
@@ -109,6 +109,7 @@ class StaticDraftEngine:
         use_cuda_graph: bool = True,
         hedge_margin: float = 1.0,
         buckets: Optional[Tuple[int, ...]] = None,
+        mask_token_id: int = MASK_TOKEN_ID,
     ):
         self.base_model = base_model
         self.drafter = drafter
@@ -148,9 +149,8 @@ class StaticDraftEngine:
 
         # Buckets for Power-of-2 CUDA Graphs (or bucketed attention views)
         cand_buckets = buckets if buckets is not None else self.DEFAULT_BUCKETS
-        self.buckets = sorted(list(set(b for b in cand_buckets if b <= max_len)))
-        if not self.buckets:
-            self.buckets = [max_len]
+        # max_len is always a bucket, so every position up to max_len is capturable.
+        self.buckets = sorted(set(b for b in cand_buckets if b < max_len) | {max_len})
 
         # 1. Target Cache: full max_len across base model layers
         self.target_cache = StaticKVCache(
@@ -181,7 +181,12 @@ class StaticDraftEngine:
         self.static_y_star = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.static_f_ctx_last = torch.zeros(batch_size, 1, self.dim, dtype=dtype, device=device)
         self.static_pos_draft = torch.zeros(batch_size, self.w, dtype=torch.long, device=device)
-        self.static_mask_token = torch.tensor([[151665]], dtype=torch.long, device=device)
+        self._mask_token_id = int(mask_token_id)
+        self.static_mask_token = torch.tensor([[self._mask_token_id]], dtype=torch.long, device=device)
+
+        # Pre-allocated position ranges, reused every step with an in-place add
+        self.arange_qa = torch.arange(self.q_a, dtype=torch.long, device=device).unsqueeze(0)
+        self.arange_w = torch.arange(self.w, dtype=torch.long, device=device).unsqueeze(0)
 
         # Pre-allocate master static attention masks (shared zero-copy backing buffers)
         # static_mask_A: (B, 1, Q_A, max_len)
@@ -205,12 +210,15 @@ class StaticDraftEngine:
         self.cuda_graph_draft = None
 
     def get_bucket(self, cur_pos: int) -> int:
-        """Find the smallest power-of-2 bucket that covers cur_pos + Q_A."""
+        """Find the smallest bucket that covers cur_pos + Q_A. max_len is always a bucket."""
         needed = cur_pos + self.q_a
         for b in self.buckets:
             if b >= needed:
                 return b
-        return self.buckets[-1]
+        raise ValueError(
+            f"position {cur_pos} + Q_A {self.q_a} exceeds engine max_len {self.max_len}. "
+            "Create the engine with a larger max_len."
+        )
 
     def capture_cuda_graphs(self, mask_token_id: int):
         """Warmup and capture separate power-of-2 bucketed CUDA graphs on CUDA for B=1."""
@@ -221,7 +229,8 @@ class StaticDraftEngine:
         if len(self.cuda_graphs) > 0:
             return
 
-        self.static_mask_token = torch.tensor([[mask_token_id]], dtype=torch.long, device=self.device)
+        self.static_mask_token.fill_(mask_token_id)
+        self._mask_token_id = int(mask_token_id)
         self.drafter.to(dtype=self.dtype)
         if not getattr(self.drafter, "has_ghost_layers", False):
             self.drafter.merge_ghost_weights(dtype=self.dtype)
@@ -236,10 +245,7 @@ class StaticDraftEngine:
                     self.static_pos_verify.copy_(torch.arange(0, self.q_a, device=self.device).unsqueeze(0))
                     self.static_pos_scatter.copy_(torch.arange(0, self.q_a, device=self.device).unsqueeze(0))
                     self.static_mask_A[:, :, :, :S_b].fill_(-1e4)
-                    causal_block = torch.triu(
-                        torch.full((self.q_a, self.q_a), -1e4, dtype=self.dtype, device=self.device), diagonal=1
-                    )
-                    self.static_mask_A[0, 0, :, :self.q_a] = causal_block
+                    self.static_mask_A[0, 0, :, :self.q_a] = self.causal_qa_block
 
                     self.static_y_star.zero_()
                     self.static_f_ctx_last.zero_()
@@ -558,7 +564,7 @@ class StaticDraftEngine:
         # CUDA Graph replay path for B=1
         if len(self.cuda_graphs) > 0 and B == 1 and S_b in self.cuda_graphs:
             self.static_verify_input_ids.copy_(verify_tokens)
-            self.static_pos_scatter.copy_(torch.arange(t, t + Q_A, device=self.device).unsqueeze(0))
+            self.static_pos_scatter.copy_(self.arange_qa).add_(t)
             if pos_verify_override is not None:
                 self.static_pos_verify.copy_(pos_verify_override)
             else:
@@ -571,13 +577,11 @@ class StaticDraftEngine:
 
             if not is_hedge:
                 # Standard linear causal chain
-                causal_block = torch.triu(torch.full((Q_A, Q_A), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-                mask_A_view[0, 0, :, t : t + Q_A] = causal_block
+                mask_A_view[0, 0, :, t : t + Q_A] = self.causal_qa_block
             else:
                 # Leaf-Hedge Micro-Tree:
                 # Slots 0..W-1: causal chain over [y*, d0_1, ..., d_{W-2}]
-                causal_wxw = torch.triu(torch.full((self.w, self.w), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
-                mask_A_view[0, 0, :self.w, t : t + self.w] = causal_wxw
+                mask_A_view[0, 0, :self.w, t : t + self.w] = self.causal_wxw_block
                 mask_A_view[0, 0, :self.w, t + self.w] = -1e4
                 # Slot Q_A-1 (d0_2): attends ONLY to prefix [0:t] + slot 0 (y*) + slot Q_A-1 (itself). Slots 1..W-1 masked out!
                 mask_A_view[0, 0, self.q_a - 1, t : t + self.q_a] = -1e4
@@ -693,7 +697,7 @@ class StaticDraftEngine:
     def forward_draft_step(
         self,
         y_star_ids: torch.Tensor,    # (B, 1) concrete bonus token at position t
-        mask_token_id: int,          # 151665
+        mask_token_id: int,          # [MASK] token id, from setup_tokenizer
         f_ctx_last: torch.Tensor,    # (B, 1, D) F_ctx of token at t - 1
         cur_pos_list: List[int],     # list of B ints: sequence position t
         return_logits: bool = False,
@@ -707,11 +711,16 @@ class StaticDraftEngine:
         t = cur_pos_list[0]
         S_b = self.get_bucket(t)
 
+        # The [MASK] row is a graph input buffer. Refill it only when the id changes.
+        if self._mask_token_id != mask_token_id:
+            self.static_mask_token.fill_(mask_token_id)
+            self._mask_token_id = int(mask_token_id)
+
         # CUDA Graph replay path for B=1
         if len(self.cuda_graphs) > 0 and B == 1 and S_b in self.cuda_graphs:
             self.static_y_star.copy_(y_star_ids)
             self.static_f_ctx_last.copy_(f_ctx_last)
-            self.static_pos_draft.copy_(torch.arange(t, t + W, device=self.device).unsqueeze(0))
+            self.static_pos_draft.copy_(self.arange_w).add_(t)
 
             mask_B_view = self.static_mask_B[:, :, :, :self.w + S_b]
             mask_B_view.fill_(-1e4)
@@ -875,7 +884,7 @@ def generate_speculative_v3(
     base_model: nn.Module,
     drafter: WeightTiedTopKDrafter,
     input_ids: torch.Tensor,
-    mask_token_id: int = 151665,
+    mask_token_id: int = MASK_TOKEN_ID,
     max_new_tokens: int = 64,
     v_tokens: Optional[int] = None,
     temperature: float = 0.0,
@@ -925,6 +934,15 @@ def generate_speculative_v3(
         else:
             stop_set.update(stop_token_ids)
 
+    def _truncate_at_stop(tokens: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+        """Cut a committed block right after its first stop token (inclusive)."""
+        if not stop_set:
+            return tokens, False
+        for i, tid in enumerate(tokens.tolist()):
+            if tid in stop_set:
+                return tokens[: i + 1], True
+        return tokens, False
+
     # 1. Warm up & capture CUDA graphs BEFORE prefill if not yet captured
     if engine.device.type == "cuda" and engine.batch_size == 1 and engine.use_cuda_graph:
         engine.capture_cuda_graphs(mask_token_id)
@@ -968,9 +986,10 @@ def generate_speculative_v3(
     verify_input_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
     pos_override_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
 
-    while not all(done) and any((cur_pos_list[b] - P) < max_new_tokens for b in range(B)):
+    while not all(done) and any((cur_pos_list[b] - P + 1) < max_new_tokens for b in range(B)):
         y_star = next_token  # (B, 1) concrete bonus token at position t
         t = cur_pos_list[0]
+        generated_before = cur_pos_list[0] - P + 1
         step_committed = []
         step_accepted = 0
         hedge_hit = False
@@ -1063,15 +1082,16 @@ def generate_speculative_v3(
                         engine.w + pos_acc,
                     )
 
+                committed_tokens, hit_stop = _truncate_at_stop(committed_tokens)
                 generated_per_row[0].append(committed_tokens)
 
                 next_token = target_tokens[0, k : k + 1].unsqueeze(0)
                 f_ctx_last = f_ctx_verify[0:1, k : k + 1]
                 cur_pos_list[0] += num_committed
 
-                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
+                if hit_stop:
                     done[0] = True
-                if (cur_pos_list[0] - P) >= max_new_tokens:
+                if (cur_pos_list[0] - P + 1) >= max_new_tokens:
                     done[0] = True
 
             elif t0 == d0_2:
@@ -1102,6 +1122,7 @@ def generate_speculative_v3(
                         engine.w + pos_hedge,
                     )
 
+                committed_tokens, hit_stop = _truncate_at_stop(committed_tokens)
                 generated_per_row[0].append(committed_tokens)
 
                 cur_pos_list[0] += 2
@@ -1111,9 +1132,9 @@ def generate_speculative_v3(
                 a_plus[0] += 1
                 accept_counts[2] += 1
 
-                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
+                if hit_stop:
                     done[0] = True
-                if (cur_pos_list[0] - P) >= max_new_tokens:
+                if (cur_pos_list[0] - P + 1) >= max_new_tokens:
                     done[0] = True
 
             else:
@@ -1131,15 +1152,16 @@ def generate_speculative_v3(
                         engine.w + pos_acc,
                     )
 
+                committed_tokens, hit_stop = _truncate_at_stop(committed_tokens)
                 generated_per_row[0].append(committed_tokens)
                 cur_pos_list[0] += 1
                 next_token = committed_tokens.unsqueeze(0)
                 f_ctx_last = f_ctx_verify[0:1, 0:1]
                 accept_counts[1] += 1
 
-                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
+                if hit_stop:
                     done[0] = True
-                if (cur_pos_list[0] - P) >= max_new_tokens:
+                if (cur_pos_list[0] - P + 1) >= max_new_tokens:
                     done[0] = True
 
         else:
@@ -1148,7 +1170,7 @@ def generate_speculative_v3(
             f_ctx_last_list = []
 
             for b in range(B):
-                if done[b] or (cur_pos_list[b] - P) >= max_new_tokens:
+                if done[b] or (cur_pos_list[b] - P + 1) >= max_new_tokens:
                     next_token_list.append(y_star[b : b + 1])
                     f_ctx_last_list.append(f_ctx_last[b : b + 1])
                     continue
@@ -1187,6 +1209,7 @@ def generate_speculative_v3(
                         engine.w + pos_acc,
                     )
 
+                committed_tokens, hit_stop = _truncate_at_stop(committed_tokens)
                 generated_per_row[b].append(committed_tokens)
 
                 b_token = target_tokens[b, k : k + 1].unsqueeze(0)
@@ -1194,9 +1217,9 @@ def generate_speculative_v3(
                 f_ctx_last_list.append(f_ctx_verify[b : b + 1, k : k + 1])
                 cur_pos_list[b] += num_committed
 
-                if stop_set and any(int(tid) in stop_set for tid in committed_tokens):
+                if hit_stop:
                     done[b] = True
-                if (cur_pos_list[b] - P) >= max_new_tokens:
+                if (cur_pos_list[b] - P + 1) >= max_new_tokens:
                     done[b] = True
 
             next_token = torch.cat(next_token_list, dim=0)
@@ -1209,6 +1232,7 @@ def generate_speculative_v3(
                 if tid in stop_set:
                     break
                 cb_tokens.append(tid)
+            cb_tokens = cb_tokens[: max(0, max_new_tokens - generated_before)]
             step_callback({
                 "step": steps,
                 "committed_tokens": cb_tokens,
@@ -1216,18 +1240,25 @@ def generate_speculative_v3(
                 "is_hedge": is_hedge,
                 "hedge_hit": hedge_hit,
                 "q_a": engine.q_a,
-                "total_generated": sum(len(c) for c in generated_per_row[0]) - P,
+                "total_generated": generated_before + len(cb_tokens),
             })
 
+    clipped = [torch.cat(generated_per_row[b], dim=-1)[: P + max_new_tokens] for b in range(B)]
+    max_row_len = max(int(r.shape[0]) for r in clipped)
+    pad_id = eos_token_id if eos_token_id is not None else 0
     final_outputs = []
-    for b in range(B):
-        row_tokens = torch.cat(generated_per_row[b], dim=-1)[: P + max_new_tokens]
-        final_outputs.append(row_tokens)
+    for r in clipped:
+        n_pad = max_row_len - int(r.shape[0])
+        if n_pad > 0:
+            filler = torch.full((n_pad,), pad_id, dtype=r.dtype, device=r.device)
+            r = torch.cat([r, filler], dim=0)
+        final_outputs.append(r)
     output_ids = torch.stack(final_outputs, dim=0)
 
     n_queries = max(1, steps * B)
     stats = {
         "steps": steps,
+        "lengths": [int(r.shape[0]) for r in clipped],
         "total_draft_tokens": total_draft_tokens,
         "accepted_draft_tokens": accepted_draft_tokens,
         "alpha": (accepted_draft_tokens + steps * B) / n_queries,
