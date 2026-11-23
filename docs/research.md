@@ -531,6 +531,21 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
   - Nested micro-batch accumulation decouples gradient step increments from optimizer updates, ensuring the cosine learning rate schedule completes.
   - Shared full-vocab `logsumexp` unifies top-64 Kullback-Leibler divergence with Cross-Entropy loss under exact mathematical normalization.
 
+### 7. Zero-Retraining High-Performance Tier 1 Substrate
+
+#### A. Scaled Autocast Gradients
+- `train.py` scales micro-batch gradients via `scaler.scale(loss / args.grad_accum).backward()` when `use_fp16=True` (CUDA), guaranteeing safe FP16 dynamic loss scaling across inner accumulation steps.
+
+#### B. Frequency-Pruned Draft Vocabulary ($V_d = 32{,}768$)
+- `tools/build_draft_vocab.py` extracts top frequent token IDs from on-policy rollouts while preserving essential control tokens (EOS, PAD, `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`), with deterministic backfill for small corpora.
+- Slices drafter output projection to $V_d$ dimensions (`F.linear(h_norm, draft_lm_head_w)`).
+- Local prediction indices in $[0, V_d - 1]$ remap cleanly back to global vocabulary token IDs via `engine.draft_vocab_ids[local_ids]` across both standard draft and leaf-hedge branching paths.
+- Stage 1 verification retains the full 151,936 base model vocabulary projection, preserving exact lossless speculative decoding.
+
+#### C. Hardware-Validated SDPA GQA Attention
+- Replaces repetitive KV tensor expansions (`repeat_kv`) with PyTorch native Grouped-Query Attention (`enable_gqa=True`) in `F.scaled_dot_product_attention`.
+- Guarded by runtime probe checking device, dtype, head configuration, and 4D additive float attention masks (`attn_mask`) against reference outputs (`max_abs_diff <= 1e-2`), automatically falling back to `repeat_kv` on non-compliant backends.
+
 
 
 

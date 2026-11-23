@@ -1026,4 +1026,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - `git diff --check` verified no whitespace or formatting errors.
   - Note: PyTorch and Qwen model weights are not present in this local coding environment; dynamic smoke tests (`train.py --smoke_test`, `benchmark.py --smoke_test`) did not execute and remain pending for remote GPU verification.
 
+## 57. Tier 1 Upgrades: Scaled Autocast Gradients, Pruned Draft Vocab, SDPA GQA (2026-11-23)
+- **Phase 1: CUDA Training Scaler & Draft Vocab Tooling**:
+  - `train.py`: Wrapped inner accumulation `.backward()` calls in `scaler.scale(loss / args.grad_accum).backward()` when `use_fp16=True`, preventing FP16 gradient underflow and `unscale_` crashes on CUDA.
+  - `tools/build_draft_vocab.py`: Implemented pad-safe token frequency counter slicing rows with `seq_lens`, preserving control tokens (`eos`, `pad`, `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`), with automatic backfill from low BPE IDs for small datasets to guarantee exact $V_d = 32{,}768$ tensor sizes.
+- **Phase 2: Lossless Pruned Draft Vocab & GQA Attention Optimization**:
+  - `sampler.py`: Sliced draft lm_head projection to $V_d$ (`F.linear(h_norm, draft_lm_head_w)`) when `draft_vocab_ids` is active; mapped draft local indices back to global token IDs across standard and hedge slot-0 checks (`engine.draft_vocab_ids[local_ids]`); retained full 151,936 vocab on base model verify.
+  - `sampler.py`: Added numerical + 4D float mask runtime probe for native `enable_gqa=True` in `F.scaled_dot_product_attention` (`max_abs_diff <= 1e-2`), applied across all 6 attention call-sites with safe `repeat_kv` fallback.
+  - `benchmark.py` & `chat.py`: Wired `--draft_vocab` argument and engine capacity caching support.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` verified clean syntax across all modified modules.
+  - AST analysis verified zero mutable default arguments and clean imports.
+  - `git diff --check` verified no whitespace or EOF formatting errors.
+
 
