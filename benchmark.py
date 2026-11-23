@@ -19,10 +19,11 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model import prepare_v3, quantize_for_cpu
 from sampler import generate_speculative_v3, StaticDraftEngine, StaticKVCache
@@ -84,12 +85,26 @@ class GraphedCausalRunner:
         if self.num_heads != self.num_kv_heads:
             try:
                 with torch.no_grad():
-                    q_p = torch.zeros(1, self.num_heads, 1, self.head_dim, dtype=self.dtype, device=self.device)
-                    k_p = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
-                    v_p = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
-                    m_p = torch.zeros(1, 1, 1, 2, dtype=self.dtype, device=self.device)
-                    _ = F.scaled_dot_product_attention(q_p, k_p, v_p, attn_mask=m_p, enable_gqa=True)
-                    self.supports_enable_gqa = True
+                    q_len, kv_len = 8, 16
+                    probe_q = torch.linspace(-1, 1, self.num_heads * q_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_q = probe_q.view(1, self.num_heads, q_len, self.head_dim)
+                    probe_k = torch.linspace(-0.5, 0.5, self.num_kv_heads * kv_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_k = probe_k.view(1, self.num_kv_heads, kv_len, self.head_dim)
+                    probe_v = torch.linspace(0.1, 0.9, self.num_kv_heads * kv_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_v = probe_v.view(1, self.num_kv_heads, kv_len, self.head_dim)
+
+                    probe_mask = torch.zeros(1, 1, q_len, kv_len, dtype=self.dtype, device=self.device)
+                    probe_mask[:, :, :, kv_len // 2:] = -1e4
+
+                    k_rep = repeat_kv(probe_k, self.num_heads // self.num_kv_heads)
+                    v_rep = repeat_kv(probe_v, self.num_heads // self.num_kv_heads)
+                    out_ref = F.scaled_dot_product_attention(probe_q, k_rep, v_rep, attn_mask=probe_mask)
+
+                    out_gqa = F.scaled_dot_product_attention(probe_q, probe_k, probe_v, attn_mask=probe_mask, enable_gqa=True)
+                    diff = (out_ref - out_gqa).abs().max().item()
+                    tol = 1e-2 if self.dtype in (torch.float16, torch.bfloat16) else 1e-4
+                    if diff <= tol:
+                        self.supports_enable_gqa = True
             except Exception:
                 self.supports_enable_gqa = False
 
@@ -117,7 +132,6 @@ class GraphedCausalRunner:
             v = layer.self_attn.v_proj(norm_h).view(1, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-            p_val = self.static_pos.item() if not torch.cuda.is_current_stream_capturing() else 0
             idx = self.static_pos.view(1, 1, 1, 1).expand(1, self.num_kv_heads, 1, self.head_dim)
             self.cache.k[l_idx].scatter_(2, idx, k)
             self.cache.v[l_idx].scatter_(2, idx, v)
@@ -202,9 +216,9 @@ class GraphedCausalRunner:
             norm_post = layer.post_attention_layernorm(h)
             h = h + layer.mlp(norm_post)
 
-        h_norm = self.base_model.model.norm(h)
-        logits = self.base_model.lm_head(h_norm)
-        return logits[:, -1:]
+        h_last = self.base_model.model.norm(h[:, -1:])
+        logits = self.base_model.lm_head(h_last)
+        return logits
 
     def step(self, token: torch.Tensor, cur_pos: int) -> torch.Tensor:
         S_b = self.get_bucket(cur_pos)

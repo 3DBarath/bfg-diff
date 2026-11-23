@@ -1138,9 +1138,11 @@ def generate_speculative_v3(
         })
 
     # Pre-allocated reusable buffers for hot loop (zero per-step heap allocations)
+    engine_dtype = getattr(engine, "dtype", dtype)
     verify_input_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
     pos_override_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
-    tree_mask_buf = torch.full((engine.q_a, engine.q_a), -1e4, dtype=engine.dtype, device=engine.device)
+    tree_mask_buf = torch.full((engine.q_a, engine.q_a), -1e4, dtype=engine_dtype, device=engine.device)
+    tree_mask_cpu = torch.full((engine.q_a, engine.q_a), -1e4, dtype=engine_dtype, device="cpu")
 
     while not all(done) and any((cur_pos_list[b] - P + 1) < max_new_tokens for b in range(B)):
         y_star = next_token  # (B, 1) concrete bonus token at position t
@@ -1166,7 +1168,7 @@ def generate_speculative_v3(
         if B == 1:
             if tree_mode == "tree" or (tree_mode == "auto" and engine.q_a > engine.w + 1):
                 use_tree = True
-            elif hedge_margin > 0.0:
+            elif tree_mode != "linear" and hedge_margin > 0.0 and engine.q_a == engine.w + 1:
                 # Leaf-Hedge Margin Check at Slot 0
                 top2 = torch.topk(draft_logits[0, 0], k=2)
                 top2_vals = top2.values.tolist()
@@ -1203,13 +1205,14 @@ def generate_speculative_v3(
             verify_input_buf[0].copy_(torch.tensor(t_tokens, dtype=torch.long, device=engine.device))
             pos_override_buf[0].copy_(torch.tensor([t + d for d in t_depths], dtype=torch.long, device=engine.device))
 
-            # Build ancestor mask in tree_mask_buf
-            tree_mask_buf.fill_(-1e4)
+            # Build ancestor mask in tree_mask_cpu and transfer once to GPU (zero micro-kernel launches)
+            tree_mask_cpu.fill_(-1e4)
             for i in range(engine.q_a):
                 curr = i
                 while curr != -1:
-                    tree_mask_buf[i, curr] = 0.0
+                    tree_mask_cpu[i, curr] = 0.0
                     curr = t_parents[curr]
+            tree_mask_buf.copy_(tree_mask_cpu, non_blocking=True)
 
             verify_logits, f_ctx_verify = engine.forward_verify_step(
                 verify_input_buf,
@@ -1253,12 +1256,12 @@ def generate_speculative_v3(
 
         if use_tree:
             # Walk tree from root slot 0 along greedy verified path
+            # Extract target predictions once to CPU to avoid per-node GPU-CPU syncs
+            t_preds = target_tokens[0].tolist()
             accepted_slots = [0]
             curr_slot = 0
             while True:
-                # Find children of curr_slot
-                # Prediction of target at curr_slot is target_tokens[0, curr_slot]
-                t_pred = int(target_tokens[0, curr_slot].item())
+                t_pred = t_preds[curr_slot]
                 matched_child = None
                 for c_slot in range(curr_slot + 1, engine.q_a):
                     if t_parents[c_slot] == curr_slot and t_tokens[c_slot] == t_pred:
@@ -1278,6 +1281,12 @@ def generate_speculative_v3(
             accept_counts[num_committed] += 1
             total_draft_tokens += v_tokens
             accepted_draft_tokens += k
+
+            # Track tree hedge rescues (non-linear branch accepted)
+            hedge_attempts += 1
+            if k > 0 and any(accepted_slots[m] != m for m in range(1, len(accepted_slots))):
+                hedge_hits += 1
+                hedge_hit = True
 
             # Final bonus token is predicted by last accepted slot
             last_slot = accepted_slots[-1]

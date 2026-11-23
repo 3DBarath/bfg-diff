@@ -1056,6 +1056,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - Implemented `GraphedCausalRunner` base-model-only bucketed CUDA Graph runner ($Q=1$) to measure true systems speedup.
   - Added first-divergence diagnostic logger for greedy baseline mismatches reporting exact base model top-2 logit margins.
   - Exposed `--q_a` and `--tree_mode` CLI parameters in `benchmark.py`.
+- **Post-Phase 3/4 T4 Runtime Hardening**:
+  - Imported `List` and `torch.nn.functional as F` in `benchmark.py`.
+  - Guarded `engine.dtype` fallback with `getattr(engine, "dtype", dtype)` in `sampler.py`.
+  - Deleted dead `.item()` sync in `GraphedCausalRunner._step_kernel`.
+  - Batch-transferred `tree_mask_cpu` to `tree_mask_buf` via `copy_(..., non_blocking=True)`, eliminating per-element micro-kernels, and extracted `target_tokens[0].tolist()` once before tree-walk.
+  - Guarded linear mode against hedge mask corruption and counted tree branch rescues.
+  - Sliced `h[:, -1:]` in `GraphedCausalRunner.prefill` and aligned GQA numerical probe.
 - **Verification**:
   - `python3 -m py_compile *.py tools/*.py` verified clean compilation across all modules.
   - `git diff --check` verified clean formatting with no trailing whitespace or extra newlines.

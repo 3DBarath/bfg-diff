@@ -1960,3 +1960,11 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
 - **Positional invariance in CUDA Graph replay:** verification graph replay uses identical static buffers and graph captures regardless of tree geometry.
 - **Ascending compaction safety:** verified that `parent[i] < i` ensures $n_m \ge m$, making in-place KV compaction strictly forward-moving and overwrite-safe.
 - **Graphed $Q=1$ baseline:** added `GraphedCausalRunner` to benchmark to isolate systems speedup against framework overheads.
+
+### 10.10 T4 Silicon & Benchmark Polish
+- **Missing imports in `benchmark.py`:** added `List` from `typing` and `import torch.nn.functional as F`.
+- **`_StubEngine` dtype fallback:** wrapped `engine.dtype` in `getattr(engine, "dtype", dtype)` in `generate_speculative_v3`.
+- **Eliminated dead `.item()`:** removed dead `p_val = self.static_pos.item() ...` in `GraphedCausalRunner._step_kernel`.
+- **Single CPU-to-GPU mask transfer:** built `tree_mask_cpu` on host and transferred via `copy_(..., non_blocking=True)`, eliminating 60+ micro-kernel launches per step. Extracted `target_tokens[0].tolist()` once before tree walk to avoid repeated GPU-CPU syncs.
+- **Linear mode mask guard:** ensured `tree_mode == "linear"` does not fall into legacy hedge mask logic when `q_a != w + 1`, and tracked tree rescues under `hedge_hits` / `hedge_attempts`.
+- **Fair `Q=1` prefill & GQA probe:** sliced `h[:, -1:]` before lm_head in `GraphedCausalRunner.prefill`, and aligned the GQA probe with `StaticDraftEngine`'s deterministic `linspace` + `repeat_kv` check.
