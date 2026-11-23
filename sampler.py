@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import MASK_TOKEN_ID, WeightTiedTopKDrafter, apply_linear_with_delta, apply_rotary_pos_emb_k
+from model import MASK_TOKEN_ID, WeightTiedTopKDrafter, apply_linear_with_delta, apply_rotary_pos_emb_k, compute_shifted_soft_embeds
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 
@@ -141,10 +141,12 @@ class StaticDraftEngine:
         self._draft_vocab_list = None
         self.draft_lm_head_w = None
         self.draft_lm_head_b = None
+        self.draft_embed_w = None
         if draft_vocab_ids is not None:
             self.draft_vocab_ids = draft_vocab_ids.to(device=self.device, dtype=torch.long).contiguous()
             self._draft_vocab_list = self.draft_vocab_ids.cpu().tolist()
             self.draft_lm_head_w = self.base_model.lm_head.weight[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
+            self.draft_embed_w = self.drafter.embed_tokens.weight[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
             if getattr(self.base_model.lm_head, "bias", None) is not None:
                 self.draft_lm_head_b = self.base_model.lm_head.bias[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
 
@@ -461,6 +463,82 @@ class StaticDraftEngine:
                 up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
                 mlp_act = base_l.mlp.act_fn(gate) * up
                 h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
+
+        # Pass 2: Differentiable soft embedding refinement if num_draft_steps > 1
+        if getattr(self.drafter, "num_draft_steps", 1) > 1 and getattr(self.drafter, "refine_bridge", None) is not None:
+            h_norm1 = self.drafter.norm(h[:, :self.w - 1])
+            if self.draft_lm_head_w is not None:
+                z1_shift = F.linear(h_norm1, self.draft_lm_head_w, self.draft_lm_head_b)
+                embed_w = self.draft_embed_w if self.draft_embed_w is not None else self.drafter.embed_tokens.weight
+            else:
+                z1_shift = self.drafter.lm_head(h_norm1)
+                embed_w = self.drafter.embed_tokens.weight
+
+            # Pad z1 to length W so compute_shifted_soft_embeds can slice [:w-1]
+            z1_padded = torch.zeros(1, self.w, z1_shift.shape[-1], dtype=z1_shift.dtype, device=self.device)
+            z1_padded[:, :self.w - 1, :].copy_(z1_shift)
+
+            tok_emb_2 = compute_shifted_soft_embeds(
+                y_star_emb=y_star_emb,
+                z1=z1_padded,
+                embed_weight=embed_w,
+                top_k=getattr(self.drafter, "soft_topk", 4),
+            )
+            h = self.drafter.refine_bridge(tok_emb_2, h, self.static_f_ctx_last)
+
+            # Re-run k_layers with new h
+            for layer_idx in range(self.k_layers):
+                if self.drafter.has_ghost_layers:
+                    ghost_l = self.drafter.ghost_layers[layer_idx]
+                    norm_h = ghost_l.input_layernorm(h)
+                    q = ghost_l.self_attn.q_proj(norm_h).view(1, self.w, self.num_heads, self.head_dim).transpose(1, 2)
+                    k_d = ghost_l.self_attn.k_proj(norm_h).view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                    v_d = ghost_l.self_attn.v_proj(norm_h).view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                else:
+                    base_l = self.drafter.draft_layers[layer_idx]
+                    deltas = self.drafter.layer_deltas[layer_idx]
+                    norm_h = base_l.input_layernorm(h)
+                    q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h, deltas.q_proj)
+                    q = q.view(1, self.w, self.num_heads, self.head_dim).transpose(1, 2)
+                    k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h, deltas.k_proj)
+                    k_d = k_d.view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                    v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h, deltas.v_proj)
+                    v_d = v_d.view(1, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+                cos_d, sin_d = self.drafter.rotary_emb(norm_h, self.static_pos_draft)
+                q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
+
+                self.draft_cache.k[layer_idx][:, :, :self.w, :] = k_d
+                self.draft_cache.v[layer_idx][:, :, :self.w, :] = v_d
+
+                k_total = self.draft_cache.k[layer_idx][:, :, :self.w + S_b, :]
+                v_total = self.draft_cache.v[layer_idx][:, :, :self.w + S_b, :]
+
+                if self.num_heads != self.num_kv_heads:
+                    if self.supports_enable_gqa:
+                        attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view, enable_gqa=True)
+                    else:
+                        k_attn = repeat_kv(k_total, self.num_heads // self.num_kv_heads)
+                        v_attn = repeat_kv(v_total, self.num_heads // self.num_kv_heads)
+                        attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_B_view)
+                else:
+                    attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view)
+                attn_out = attn_out.transpose(1, 2).reshape(1, self.w, self.dim)
+
+                if self.drafter.has_ghost_layers:
+                    h = h + ghost_l.self_attn.o_proj(attn_out)
+                    norm_post = ghost_l.post_attention_layernorm(h)
+                    gate = ghost_l.mlp.gate_proj(norm_post)
+                    up = ghost_l.mlp.up_proj(norm_post)
+                    mlp_act = ghost_l.mlp.act_fn(gate) * up
+                    h = h + ghost_l.mlp.down_proj(mlp_act)
+                else:
+                    h = h + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
+                    norm_post = base_l.post_attention_layernorm(h)
+                    gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
+                    up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
+                    mlp_act = base_l.mlp.act_fn(gate) * up
+                    h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
         h_norm = self.drafter.norm(h)
         if self.draft_lm_head_w is not None:
@@ -889,6 +967,83 @@ class StaticDraftEngine:
                 up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
                 mlp_act = base_l.mlp.act_fn(gate) * up
                 h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
+
+        # Pass 2: Differentiable soft embedding refinement if num_draft_steps > 1
+        if getattr(self.drafter, "num_draft_steps", 1) > 1 and getattr(self.drafter, "refine_bridge", None) is not None:
+            h_norm1 = self.drafter.norm(h[:, :W - 1])
+            if self.draft_lm_head_w is not None:
+                z1_shift = F.linear(h_norm1, self.draft_lm_head_w, self.draft_lm_head_b)
+                embed_w = self.draft_embed_w if self.draft_embed_w is not None else self.drafter.embed_tokens.weight
+            else:
+                z1_shift = self.drafter.lm_head(h_norm1)
+                embed_w = self.drafter.embed_tokens.weight
+
+            # Pad z1 to length W so compute_shifted_soft_embeds can slice [:W-1]
+            z1_padded = torch.zeros(B, W, z1_shift.shape[-1], dtype=z1_shift.dtype, device=self.device)
+            z1_padded[:, :W - 1, :].copy_(z1_shift)
+
+            tok_emb_2 = compute_shifted_soft_embeds(
+                y_star_emb=y_star_emb,
+                z1=z1_padded,
+                embed_weight=embed_w,
+                top_k=getattr(self.drafter, "soft_topk", 4),
+            )
+            h = self.drafter.refine_bridge(tok_emb_2, h, f_ctx_last)
+
+            # Re-run k_layers with new h writing to [0:W] scratch tail
+            for layer_idx in range(self.k_layers):
+                if self.drafter.has_ghost_layers:
+                    ghost_l = self.drafter.ghost_layers[layer_idx]
+                    norm_h = ghost_l.input_layernorm(h)
+                    q = ghost_l.self_attn.q_proj(norm_h).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                    k_d = ghost_l.self_attn.k_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                    v_d = ghost_l.self_attn.v_proj(norm_h).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                else:
+                    base_l = self.drafter.draft_layers[layer_idx]
+                    deltas = self.drafter.layer_deltas[layer_idx]
+                    norm_h = base_l.input_layernorm(h)
+                    q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h, deltas.q_proj)
+                    q = q.view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                    k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h, deltas.k_proj)
+                    k_d = k_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                    v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h, deltas.v_proj)
+                    v_d = v_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+                cos_d, sin_d = self.drafter.rotary_emb(norm_h, pos_draft)
+                q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
+
+                self.draft_cache.k[layer_idx][:, :, :W, :] = k_d
+                self.draft_cache.v[layer_idx][:, :, :W, :] = v_d
+
+                k_total = self.draft_cache.k[layer_idx][:, :, :W + S_active, :]
+                v_total = self.draft_cache.v[layer_idx][:, :, :W + S_active, :]
+
+                if self.num_heads != self.num_kv_heads:
+                    if self.supports_enable_gqa:
+                        attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask, enable_gqa=True)
+                    else:
+                        n_rep = self.num_heads // self.num_kv_heads
+                        k_attn = repeat_kv(k_total, n_rep)
+                        v_attn = repeat_kv(v_total, n_rep)
+                        attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
+                else:
+                    attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask)
+                attn_out = attn_out.transpose(1, 2).reshape(B, W, self.dim)
+
+                if self.drafter.has_ghost_layers:
+                    h = h + ghost_l.self_attn.o_proj(attn_out)
+                    norm_post = ghost_l.post_attention_layernorm(h)
+                    gate = ghost_l.mlp.gate_proj(norm_post)
+                    up = ghost_l.mlp.up_proj(norm_post)
+                    mlp_act = ghost_l.mlp.act_fn(gate) * up
+                    h = h + ghost_l.mlp.down_proj(mlp_act)
+                else:
+                    h = h + apply_linear_with_delta(base_l.self_attn.o_proj, attn_out, deltas.o_proj)
+                    norm_post = base_l.post_attention_layernorm(h)
+                    gate = apply_linear_with_delta(base_l.mlp.gate_proj, norm_post, deltas.gate_proj)
+                    up = apply_linear_with_delta(base_l.mlp.up_proj, norm_post, deltas.up_proj)
+                    mlp_act = base_l.mlp.act_fn(gate) * up
+                    h = h + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
         h_norm = self.drafter.norm(h)
         if self.draft_lm_head_w is not None:

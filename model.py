@@ -95,6 +95,68 @@ class BottleneckFusion(nn.Module):
         return self.norm(out).to(tapped_states[0].dtype)
 
 
+class SoftRefinementBridge(nn.Module):
+    """Path B Soft Refinement Bridge for Pass-2 Differentiable Diffusion Refinement.
+
+    Takes Pass-2 inputs:
+    - tok_emb_2: (B, w, D) (slot 0 = y*_emb, slots 1..w-1 = shifted soft expected embeddings from Pass 1)
+    - h1: (B, w, D) (Pass 1 top-layer output before drafter.norm)
+    - f_ctx_last: (B, 1, D) (prefix context anchor)
+    """
+
+    def __init__(self, dim: int, max_w: int = 8, bottleneck: int = 512):
+        super().__init__()
+        self.dim = dim
+        self.max_w = max_w
+        self.emb_norm = Qwen2RMSNorm(dim, eps=1e-6)
+        self.h1_norm = Qwen2RMSNorm(dim, eps=1e-6)
+        self.slot_emb = nn.Parameter(torch.zeros(max_w, dim, dtype=torch.float32))
+        nn.init.normal_(self.slot_emb, std=0.02)
+        self.down = nn.Linear(2 * dim, bottleneck, bias=False)
+        self.act = nn.SiLU()
+        self.up = nn.Linear(bottleneck, dim, bias=False)
+        nn.init.normal_(self.up.weight, std=1e-3)
+
+    def forward(
+        self,
+        tok_emb_2: torch.Tensor,  # (B, w, D)
+        h1: torch.Tensor,         # (B, w, D)
+        f_ctx_last: torch.Tensor, # (B, 1, D)
+    ) -> torch.Tensor:
+        B, w, D = tok_emb_2.shape
+        w_dtype = self.down.weight.dtype if isinstance(getattr(self.down, "weight", None), torch.Tensor) else tok_emb_2.dtype
+
+        norm_tok = self.emb_norm(tok_emb_2.to(w_dtype)) + self.slot_emb[:w].unsqueeze(0).to(w_dtype)
+        norm_h1 = self.h1_norm(h1.to(w_dtype))
+        delta = self.up(self.act(self.down(torch.cat([norm_tok, norm_h1], dim=-1))))
+        return (f_ctx_last.expand(B, w, self.dim).to(w_dtype) + delta).to(tok_emb_2.dtype)
+
+
+def compute_shifted_soft_embeds(
+    y_star_emb: torch.Tensor,   # (B, 1, D)
+    z1: torch.Tensor,           # (B, w, V_or_Vd)
+    embed_weight: torch.Tensor, # (V_or_Vd, D)
+    top_k: int = 4,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """Compute shifted soft expected embeddings for Pass 2 refinement.
+
+    Pass 1 slots 0..w-2 predict tokens for sequence positions t+1..t+w-1,
+    which form the soft inputs for Pass 2 slots 1..w-1.
+    Returns: (B, w, D)
+    """
+    B, w, _ = z1.shape
+    if w == 1:
+        return y_star_emb
+
+    z1_shift = z1[:, :w - 1, :]
+    vals, idx = torch.topk(z1_shift, k=min(top_k, z1_shift.shape[-1]), dim=-1)
+    probs = F.softmax(vals.float() / tau, dim=-1).to(y_star_emb.dtype)
+    embs = F.embedding(idx, embed_weight)  # (B, w-1, K, D)
+    e_bar = (probs.unsqueeze(-1) * embs).sum(dim=-2)  # (B, w-1, D)
+    return torch.cat([y_star_emb, e_bar], dim=1)
+
+
 class ManifoldAlignmentBridge(nn.Module):
     """Manifold Alignment Bridge (Fixing Layer-0 vs. Layer-(L-4) Mismatch):
     Slot 0 (concrete bonus token y*): input_bridge(cat([RMSNorm(Emb(y*)), F_ctx_last]))
@@ -185,12 +247,16 @@ class WeightTiedTopKDrafter(nn.Module):
         r: int = 32,
         alpha: float = 64.0,
         max_w: int = 8,
+        num_draft_steps: int = 1,
+        soft_topk: int = 4,
     ):
         super().__init__()
         self.k_layers = k_layers
         self.max_w = max_w
         self.r = r
         self.alpha = alpha
+        self.num_draft_steps = num_draft_steps
+        self.soft_topk = soft_topk
 
         # Frozen backbone references, kept out of _modules so that .to(), .train()
         # and .state_dict() never touch the 1.5B base model.
@@ -216,6 +282,11 @@ class WeightTiedTopKDrafter(nn.Module):
         # Trainable drafter modules (instantiated in fp32)
         self.fusion = BottleneckFusion(self.dim, num_tapped=4, bottleneck=512)
         self.bridge = ManifoldAlignmentBridge(self.dim, max_w=max_w, bottleneck=512)
+        self.refine_bridge = (
+            SoftRefinementBridge(self.dim, max_w=max_w, bottleneck=512)
+            if self.num_draft_steps > 1
+            else None
+        )
         self.layer_deltas = nn.ModuleList(
             [
                 LayerDeltas(
@@ -271,10 +342,12 @@ class WeightTiedTopKDrafter(nn.Module):
         return self
 
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Return list of trainable parameters (fusion, bridge, layer_deltas)."""
+        """Return list of trainable parameters (fusion, bridge, refine_bridge, layer_deltas)."""
         params = []
         params.extend(self.fusion.parameters())
         params.extend(self.bridge.parameters())
+        if self.refine_bridge is not None:
+            params.extend(self.refine_bridge.parameters())
         params.extend(self.layer_deltas.parameters())
         return params
 
@@ -282,18 +355,22 @@ class WeightTiedTopKDrafter(nn.Module):
         """Compute exact parameter breakdown."""
         p_fusion = sum(p.numel() for p in self.fusion.parameters())
         p_bridge = sum(p.numel() for p in self.bridge.parameters())
+        p_refine = sum(p.numel() for p in self.refine_bridge.parameters()) if self.refine_bridge is not None else 0
         p_deltas = sum(p.numel() for p in self.layer_deltas.parameters())
-        p_trainable = p_fusion + p_bridge + p_deltas
+        p_trainable = p_fusion + p_bridge + p_refine + p_deltas
         p_base = sum(p.numel() for p in self.base_model.parameters())
         return {
             "dim": self.dim,
             "fusion": p_fusion,
             "bridge": p_bridge,
-            "deltas_4l": p_deltas,
+            "refine_bridge": p_refine,
+            "deltas": p_deltas,
             "total_drafter": p_trainable,
             "total_base": p_base,
             "trainable_ratio_pct": (p_trainable / max(1, p_base)) * 100.0,
             "tapped_layers": self.tapped_layer_indices,
+            "k_layers": self.k_layers,
+            "num_draft_steps": self.num_draft_steps,
         }
 
     def fuse_stage1_features(self, all_hidden_states: Tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -452,7 +529,7 @@ class WeightTiedTopKDrafter(nn.Module):
         if pos_draft is None:
             pos_draft = torch.arange(cur_pos, cur_pos + w, device=device).unsqueeze(0).expand(B, w)
 
-        # Execute 4 draft layers
+        # Execute draft layers (Pass 1)
         for layer_idx in range(self.k_layers):
             kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
             vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
@@ -464,6 +541,30 @@ class WeightTiedTopKDrafter(nn.Module):
                 v_prefix=vp,
                 attn_mask=attn_mask,
             )
+
+        if self.num_draft_steps > 1 and self.refine_bridge is not None:
+            # Pass 2: Differentiable soft embedding refinement
+            z1 = self.lm_head(self.norm(h))  # (B, W, vocab_size)
+            tok_emb_2 = compute_shifted_soft_embeds(
+                y_star_emb=y_star_emb,
+                z1=z1,
+                embed_weight=self.embed_tokens.weight,
+                top_k=self.soft_topk,
+            )
+            h = self.refine_bridge(tok_emb_2, h, f_ctx_last)
+
+            # Re-run same draft layers with same prefix KV and mask
+            for layer_idx in range(self.k_layers):
+                kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
+                vp = v_prefix_list[layer_idx] if v_prefix_list is not None else None
+                h, _, _ = self.forward_draft_layer(
+                    layer_idx=layer_idx,
+                    hidden_states=h,
+                    pos_draft=pos_draft,
+                    k_prefix=kp,
+                    v_prefix=vp,
+                    attn_mask=attn_mask,
+                )
 
         # Output head: frozen norm + frozen lm_head
         h_norm = self.norm(h)
@@ -529,9 +630,12 @@ def prepare_v3(
     model_name: str,
     device: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
+    k_layers: int = 4,
     drafter_r: int = 32,
     drafter_alpha: float = 64.0,
     max_w: int = 8,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
 ) -> Tuple[AutoModelForCausalLM, WeightTiedTopKDrafter, AutoTokenizer, int]:
     """Prepare frozen base model + standalone WeightTiedTopKDrafter."""
     if device is None:
@@ -548,10 +652,12 @@ def prepare_v3(
 
     drafter = WeightTiedTopKDrafter(
         base_model=base_model,
-        k_layers=4,
+        k_layers=k_layers,
         r=drafter_r,
         alpha=drafter_alpha,
         max_w=max_w,
+        num_draft_steps=num_draft_steps,
+        soft_topk=soft_topk,
     ).to(device)
 
     # Drafter trainable parameters in fp32 for stable training

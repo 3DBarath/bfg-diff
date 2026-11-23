@@ -161,16 +161,31 @@ def test_unit_gate_a(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
     return passed
 
 
-def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> bool:
-    """Unit Gate C: Verify grad flow across fusion, bridge, slot_emb, and all 4-layer DraftLoRADelta weights."""
+def test_unit_gate_c(
+    model_name: str = "Qwen/Qwen2.5-0.5B",
+    device: str = "cpu",
+    k_layers: int = 4,
+    drafter_r: int = 32,
+    drafter_alpha: float = 64.0,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
+) -> bool:
+    """Unit Gate C: Verify grad flow across fusion, bridge, slot_emb, and all DraftLoRADelta weights."""
     print("\n" + "=" * 60)
-    print(f"UNIT GATE C: Gradient Flow Check on {model_name} (device={device})")
+    print(f"UNIT GATE C: Gradient Flow Check on {model_name} (device={device}, k_layers={k_layers}, steps={num_draft_steps})")
     print("=" * 60)
 
     # Base in float16 (or float32 on CPU), drafter in float32
     base_dtype = torch.float32 if device == "cpu" else torch.float16
     base_model, drafter, tok, mask_id = prepare_v3(
-        model_name, device=device, dtype=base_dtype
+        model_name,
+        device=device,
+        dtype=base_dtype,
+        k_layers=k_layers,
+        drafter_r=drafter_r,
+        drafter_alpha=drafter_alpha,
+        num_draft_steps=num_draft_steps,
+        soft_topk=soft_topk,
     )
 
     # Dummy input sequence
@@ -233,7 +248,15 @@ def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
     if not slot_ok:
         all_ok = False
 
-    # 4-layer LoRA deltas gradients
+    # Refine bridge gradients if num_draft_steps > 1
+    if drafter.num_draft_steps > 1 and drafter.refine_bridge is not None:
+        rb_grads = [p.grad for p in drafter.refine_bridge.parameters() if p.grad is not None]
+        rb_ok = len(rb_grads) > 0 and all(torch.isfinite(g).all() for g in rb_grads)
+        print(f"  Refine Bridge ({len(rb_grads)} tensors): all finite and non-empty: {rb_ok}")
+        if not rb_ok:
+            all_ok = False
+
+    # LoRA deltas gradients
     deltas_ok = True
     for l_idx in range(drafter.k_layers):
         ld = drafter.layer_deltas[l_idx]
@@ -252,7 +275,7 @@ def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
                 deltas_ok = False
                 print(f"    Layer {l_idx} {name}_proj grad issue!")
 
-    print(f"  4-Layer LoRA Deltas (7 projections x 4 layers): all finite: {deltas_ok}")
+    print(f"  Draft LoRA Deltas (7 projections x {drafter.k_layers} layers): all finite: {deltas_ok}")
     if not deltas_ok:
         all_ok = False
 
@@ -266,17 +289,34 @@ def test_unit_gate_c(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
     return all_ok
 
 
-def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu") -> bool:
+def test_unit_gate_d(
+    model_name: str = "Qwen/Qwen2.5-0.5B",
+    device: str = "cpu",
+    k_layers: int = 4,
+    drafter_r: int = 32,
+    drafter_alpha: float = 64.0,
+    num_draft_steps: int = 1,
+    soft_topk: int = 4,
+) -> bool:
     """Unit Gate D: Exact Numerical Identity between Training & Inference at position t.
     Enforces that train.py's parallel block anchor forward and sampler.py's forward_draft_step
     produce identical logits (< 1e-4) from the same prefix and inputs.
     """
     print("\n" + "=" * 60)
-    print(f"UNIT GATE D: Train-Inference Numerical Parity Check ({model_name}, device={device})")
+    print(f"UNIT GATE D: Train-Inference Numerical Parity Check ({model_name}, device={device}, k_layers={k_layers}, steps={num_draft_steps})")
     print("=" * 60)
 
     base_dtype = torch.float32 if device == "cpu" else torch.float16
-    base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
+    base_model, drafter, tok, mask_id = prepare_v3(
+        model_name,
+        device=device,
+        dtype=base_dtype,
+        k_layers=k_layers,
+        drafter_r=drafter_r,
+        drafter_alpha=drafter_alpha,
+        num_draft_steps=num_draft_steps,
+        soft_topk=soft_topk,
+    )
 
     torch.manual_seed(42)
     S = 64
@@ -315,7 +355,30 @@ def test_unit_gate_d(model_name: str = "Qwen/Qwen2.5-0.5B", device: str = "cpu")
                 v_prefix=vp_all[layer_idx],
                 attn_mask=attn_mask,
             )
-        train_logits = drafter.lm_head(drafter.norm(h))  # (1, W, vocab)
+
+        if drafter.num_draft_steps > 1 and drafter.refine_bridge is not None:
+            from model import compute_shifted_soft_embeds
+            h_norm1 = drafter.norm(h)
+            z1_1 = drafter.lm_head(h_norm1)
+            tok_emb_2 = compute_shifted_soft_embeds(
+                y_star_emb=y_star_emb,
+                z1=z1_1,
+                embed_weight=drafter.embed_tokens.weight,
+                top_k=getattr(drafter, "soft_topk", 4),
+            )
+            h2 = drafter.refine_bridge(tok_emb_2, h, f_last)
+            for layer_idx in range(drafter.k_layers):
+                h2, _, _ = drafter.forward_draft_layer(
+                    layer_idx=layer_idx,
+                    hidden_states=h2,
+                    pos_draft=pos_draft,
+                    k_prefix=kp_all[layer_idx],
+                    v_prefix=vp_all[layer_idx],
+                    attn_mask=attn_mask,
+                )
+            train_logits = drafter.lm_head(drafter.norm(h2))
+        else:
+            train_logits = drafter.lm_head(drafter.norm(h))  # (1, W, vocab)
 
     # 2. Inference forward path using StaticDraftEngine at position t
     from sampler import StaticDraftEngine
@@ -459,6 +522,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     p.add_argument("--device", default="auto")
+    p.add_argument("--k_layers", type=int, default=4)
+    p.add_argument("--drafter_r", type=int, default=32)
+    p.add_argument("--drafter_alpha", type=float, default=64.0)
+    p.add_argument("--num_draft_steps", type=int, default=1)
+    p.add_argument("--soft_topk", type=int, default=4)
     args = p.parse_args()
 
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
@@ -470,10 +538,26 @@ def main():
     gate_a_pass = test_unit_gate_a(model_name=args.model, device=device)
 
     # 3. Unit Gate C (Gradient Flow)
-    gate_c_pass = test_unit_gate_c(model_name=args.model, device=device)
+    gate_c_pass = test_unit_gate_c(
+        model_name=args.model,
+        device=device,
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
+    )
 
     # 4. Unit Gate D (Train-Inference Parity)
-    gate_d_pass = test_unit_gate_d(model_name=args.model, device=device)
+    gate_d_pass = test_unit_gate_d(
+        model_name=args.model,
+        device=device,
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
+    )
 
     # 5. Gate 0 & 1 Roofline Profiling
     profile_stats = test_gate0_gate1_profile(model_name=args.model, device=device)

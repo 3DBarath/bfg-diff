@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from model import WeightTiedTopKDrafter, prepare_v3
+from model import WeightTiedTopKDrafter, compute_shifted_soft_embeds, prepare_v3
 
 
 class OnPolicySequenceDataset(Dataset):
@@ -69,6 +69,39 @@ def create_synthetic_data(num_samples: int = 64, seq_len: int = 128, vocab_size:
     return torch.randint(100, vocab_size - 1, (num_samples, seq_len), dtype=torch.long)
 
 
+def _chunked_distill_loss(
+    student_logits: torch.Tensor,   # (B, N, W, vocab)
+    t_top64_idx: torch.Tensor,      # (B, N, W, 64)
+    t_top64_probs: torch.Tensor,    # (B, N, W, 64)
+    targets: torch.Tensor,          # (B, N, W)
+    d_pace: torch.Tensor,           # (W,)
+    lambda_kl: float = 0.5,
+    chunk_size: int = 4,
+) -> torch.Tensor:
+    """Compute combined Top-64 KL and Cross-Entropy loss chunking over N anchors in fp32."""
+    B, N, W, V = student_logits.shape
+    losses = []
+    for c_start in range(0, N, chunk_size):
+        c_end = min(c_start + chunk_size, N)
+        s_chunk = student_logits[:, c_start:c_end].float()
+        lse = torch.logsumexp(s_chunk, dim=-1, keepdim=True)
+        top64_idx_chunk = t_top64_idx[:, c_start:c_end]
+        top64_probs_chunk = t_top64_probs[:, c_start:c_end]
+        s_gathered = torch.gather(s_chunk, dim=-1, index=top64_idx_chunk)
+        s_log_probs = s_gathered - lse
+
+        kl = F.kl_div(s_log_probs, top64_probs_chunk, reduction="none").sum(dim=-1)
+        targets_chunk = targets[:, c_start:c_end]
+        target_logp = torch.gather(s_chunk, dim=-1, index=targets_chunk.unsqueeze(-1)).squeeze(-1)
+        ce = lse.squeeze(-1) - target_logp
+
+        anchor_loss = lambda_kl * kl + (1.0 - lambda_kl) * ce
+        w_loss = (anchor_loss * d_pace.view(1, 1, W)).sum(dim=-1).mean(dim=0)
+        losses.append(w_loss)
+
+    return torch.cat(losses, dim=0).mean()
+
+
 def compute_anchor_distill_loss(
     base_model: nn.Module,
     drafter: WeightTiedTopKDrafter,
@@ -79,6 +112,8 @@ def compute_anchor_distill_loss(
     lambda_kl: float = 0.5,
     d_pace_decay: float = 0.85,
     seq_lens: Optional[torch.Tensor] = None,  # (B,) valid tokens per row
+    lambda_pass1: float = 0.3,
+    loss_chunk_anchors: int = 4,
 ) -> Tuple[torch.Tensor, dict]:
     """Parallelized DFlash-Style Random-Anchor Block Training (Fix 1 & Fix 2):
     1. Base model no_grad forward pass: extracts Top-64 teacher logits and tapped hidden states.
@@ -178,7 +213,7 @@ def compute_anchor_distill_loss(
         k_end = S + (m + 1) * w
         attn_mask[0, 0, r_start : r_end, k_start : k_end] = 0.0
 
-    # 6. Execute 4 draft layers in ONE parallel forward pass
+    # 6. Execute draft layers in parallel forward pass (Pass 1)
     for layer_idx in range(drafter.k_layers):
         h, _, _ = drafter.forward_draft_layer(
             layer_idx=layer_idx,
@@ -189,36 +224,63 @@ def compute_anchor_distill_loss(
             attn_mask=attn_mask,
         )
 
-    h_norm = drafter.norm(h)
-    student_logits = drafter.lm_head(h_norm)  # (B, M, vocab)
-    student_logits = student_logits.view(B, N, w, -1)  # (B, N, W, vocab)
+    h_norm1 = drafter.norm(h)
+    student_logits1 = drafter.lm_head(h_norm1).view(B, N, w, -1)  # (B, N, W, vocab)
 
     # 7. Targets and teacher distributions for all anchors
     targets = torch.stack([batch_seqs[:, t + 1 : t + 1 + w] for t in anchors], dim=1)  # (B, N, W)
     t_top64_idx = torch.stack([top64_idx[:, t : t + w] for t in anchors], dim=1)        # (B, N, W, 64)
     t_top64_probs = torch.stack([top64_probs[:, t : t + w] for t in anchors], dim=1)    # (B, N, W, 64)
 
-    # Gather student logits on teacher Top-64 and normalise over the full vocabulary.
-    # ponytail: one full-vocab fp32 copy per batch, chunk over N if RSS matters.
-    logits_f32 = student_logits.float()
-    lse = torch.logsumexp(logits_f32, dim=-1, keepdim=True)
-    s_gathered = torch.gather(logits_f32, dim=-1, index=t_top64_idx)  # (B, N, W, 64)
-    s_log_probs = s_gathered - lse
-
-    kl = F.kl_div(s_log_probs, t_top64_probs, reduction="none").sum(dim=-1)  # (B, N, W)
-    target_logp = torch.gather(logits_f32, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-    ce = lse.squeeze(-1) - target_logp
-
     # D-PACE position weighting
     d_pace = torch.tensor([d_pace_decay ** j for j in range(w)], device=device, dtype=torch.float32)
     d_pace = d_pace / d_pace.sum()
 
-    anchor_loss = lambda_kl * kl + (1.0 - lambda_kl) * ce  # (B, N, W)
-    loss = (anchor_loss * d_pace.view(1, 1, w)).sum(dim=-1).mean()
+    loss_p1 = _chunked_distill_loss(
+        student_logits1, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
+    )
+
+    if getattr(drafter, "num_draft_steps", 1) > 1 and getattr(drafter, "refine_bridge", None) is not None:
+        # Pass 2: Differentiable soft embedding refinement
+        # Unpack h from (B, M, D) to (B * N, W, D) matching y_star_packed and f_last_packed
+        # h was constructed as: h_packed.view(N, B, w, D).permute(1, 0, 2, 3).reshape(B, M, D)
+        h1_unpacked = h.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
+        z1_unpacked = student_logits1.permute(1, 0, 2, 3).reshape(B * N, w, -1)
+
+        tok_emb_2 = compute_shifted_soft_embeds(
+            y_star_emb=y_star_emb,
+            z1=z1_unpacked,
+            embed_weight=drafter.embed_tokens.weight,
+            top_k=getattr(drafter, "soft_topk", 4),
+        )
+        h2_packed = drafter.refine_bridge(tok_emb_2, h1_unpacked, f_last_packed)
+        h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+
+        # Re-run draft layers with refined h2
+        for layer_idx in range(drafter.k_layers):
+            h2, _, _ = drafter.forward_draft_layer(
+                layer_idx=layer_idx,
+                hidden_states=h2,
+                pos_draft=pos_draft,
+                k_prefix=kp_all[layer_idx],
+                v_prefix=vp_all[layer_idx],
+                attn_mask=attn_mask,
+            )
+
+        h_norm2 = drafter.norm(h2)
+        student_logits2 = drafter.lm_head(h_norm2).view(B, N, w, -1)
+        loss_p2 = _chunked_distill_loss(
+            student_logits2, t_top64_idx, t_top64_probs, targets, d_pace, lambda_kl, chunk_size=loss_chunk_anchors
+        )
+        loss = lambda_pass1 * loss_p1 + loss_p2
+        eval_logits = student_logits2
+    else:
+        loss = loss_p1
+        eval_logits = student_logits1
 
     # Track offset accuracy
     with torch.no_grad():
-        preds = torch.argmax(student_logits, dim=-1)  # (B, N, W)
+        preds = torch.argmax(eval_logits, dim=-1)  # (B, N, W)
         correct = (preds == targets).float().mean(dim=(0, 1))  # (W,)
         acc_per_offset = [correct[j].item() for j in range(w)]
 
@@ -249,6 +311,14 @@ def parse_args():
     p.add_argument("--smoke_test", action="store_true")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--k_layers", type=int, default=4, help="number of draft layers (default 4)")
+    p.add_argument("--drafter_r", type=int, default=32, help="drafter LoRA rank (default 32)")
+    p.add_argument("--drafter_alpha", type=float, default=64.0, help="drafter LoRA alpha (default 64.0)")
+    p.add_argument("--num_draft_steps", type=int, default=1, help="draft refinement steps (1 or 2, default 1)")
+    p.add_argument("--soft_topk", type=int, default=4, help="top-k tokens for soft expected embedding (default 4)")
+    p.add_argument("--lambda_pass1", type=float, default=0.3, help="weight for pass 1 loss in 2-step training (default 0.3)")
+    p.add_argument("--d_pace_decay", type=float, default=0.70, help="D-PACE position discount decay (default 0.70)")
+    p.add_argument("--loss_chunk_anchors", type=int, default=4, help="anchor chunk size for fp32 loss computation (default 4)")
     args = p.parse_args()
 
     if args.smoke_test:
@@ -271,7 +341,15 @@ def main():
     # Prepare model + drafter
     base_dtype = torch.float16 if device == "cuda" else torch.float32
     base_model, drafter, tok, mask_id = prepare_v3(
-        args.model, device=device, dtype=base_dtype, max_w=args.w + 1
+        args.model,
+        device=device,
+        dtype=base_dtype,
+        max_w=args.w + 1,
+        k_layers=args.k_layers,
+        drafter_r=args.drafter_r,
+        drafter_alpha=args.drafter_alpha,
+        num_draft_steps=args.num_draft_steps,
+        soft_topk=args.soft_topk,
     )
 
     # Print parameter breakdown
@@ -330,7 +408,8 @@ def main():
     probe_batch = next_batch()
     with torch.no_grad():
         initial_loss, _ = compute_anchor_distill_loss(
-            base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1]
+            base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1],
+            d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1, loss_chunk_anchors=args.loss_chunk_anchors,
         )
     before_loss = initial_loss.item()
     if args.smoke_test:
@@ -352,6 +431,8 @@ def main():
                 loss, stats = compute_anchor_distill_loss(
                     base_model, drafter, batch_seqs, mask_id, w=args.w,
                     n_anchors=args.n_anchors, seq_lens=batch_lens,
+                    d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1,
+                    loss_chunk_anchors=args.loss_chunk_anchors,
                 )
             # Divide now, rescale after unscale_ if the inner loop came up short.
             scaled_loss = loss / args.grad_accum
@@ -392,31 +473,32 @@ def main():
             )
 
         if step % args.save_every == 0 or step == args.steps:
+            save_payload = {
+                "step": step,
+                "drafter_state_dict": {
+                    k: v for k, v in drafter.state_dict().items()
+                    if k.startswith(("fusion.", "bridge.", "refine_bridge.", "layer_deltas."))
+                },
+                "args": vars(args),
+                "bd": bd,
+                "arch": {
+                    "k_layers": args.k_layers,
+                    "r": args.drafter_r,
+                    "alpha": args.drafter_alpha,
+                    "num_draft_steps": args.num_draft_steps,
+                    "soft_topk": args.soft_topk,
+                },
+            }
             save_path = Path(args.out) / f"ckpt-{step}.pt"
-            torch.save(
-                {
-                    "step": step,
-                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
-                    "args": vars(args),
-                    "bd": bd,
-                },
-                save_path,
-            )
+            torch.save(save_payload, save_path)
             # Link/copy last.pt
-            torch.save(
-                {
-                    "step": step,
-                    "drafter_state_dict": {k: v for k, v in drafter.state_dict().items() if k.startswith(("fusion.", "bridge.", "layer_deltas."))},
-                    "args": vars(args),
-                    "bd": bd,
-                },
-                Path(args.out) / "last.pt",
-            )
+            torch.save(save_payload, Path(args.out) / "last.pt")
 
     if args.smoke_test:
         with torch.no_grad():
             after_loss_t, _ = compute_anchor_distill_loss(
-                base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1]
+                base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1],
+                d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1, loss_chunk_anchors=args.loss_chunk_anchors,
             )
         after_loss = after_loss_t.item()
         ok = math.isfinite(after_loss) and after_loss < before_loss

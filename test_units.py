@@ -406,6 +406,87 @@ def test_quantized_int8_cpu_parity():
     print("PASS: INT8 Quantized CPU execution maintains mathematical verification parity\n")
 
 
+def test_v5_path_b_two_step_parity():
+    print("--- Test 8: BFG-Diff v5 Path B (2-Layer, 2-Step Soft Refinement) Greedy Parity ---")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    # Instantiate 2-layer, 2-step drafter
+    base_model, drafter, tok, mask_id = prepare_v3(
+        "Qwen/Qwen2.5-0.5B",
+        device=device,
+        dtype=dtype,
+        k_layers=2,
+        drafter_r=32,
+        drafter_alpha=64.0,
+        num_draft_steps=2,
+        soft_topk=4,
+    )
+    drafter.merge_ghost_weights(dtype=dtype)
+
+    prompt = "Artificial intelligence and machine learning models are transforming modern"
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+    P = input_ids.shape[1]
+    max_new = 30
+
+    with torch.no_grad():
+        ref_out = base_model.generate(input_ids=input_ids, max_new_tokens=max_new, do_sample=False)
+
+    # 1. Speculative decoding with full vocab
+    with torch.no_grad():
+        spec_out, stats = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+        )
+
+    match_full = torch.equal(ref_out[:, :spec_out.shape[1]], spec_out)
+    print(f"Path B Full Vocab Match: {match_full} (steps={stats['steps']}, alpha={stats['alpha']:.2f})")
+    assert match_full, "Path B 2-step drafter output differed from base_model.generate() (full vocab)"
+
+    # 2. Speculative decoding with synthetic draft_vocab_ids
+    vocab_size = getattr(base_model.config, "vocab_size", 151936)
+    # Use top 32k tokens including prompt tokens and special tokens
+    special_ids = {0, 1, 2, mask_id, tok.eos_token_id, getattr(tok, "pad_token_id", 0)}
+    prompt_ids = set(input_ids[0].tolist())
+    all_needed = special_ids | prompt_ids
+    rem = 32768 - len(all_needed)
+    cand_ids = sorted(list(all_needed) + list(range(len(all_needed), len(all_needed) + rem)))
+    draft_vocab_ids = torch.tensor(cand_ids[:32768], dtype=torch.long, device=device)
+
+    engine_pruned = StaticDraftEngine(
+        base_model=base_model,
+        drafter=drafter,
+        max_len=512,
+        batch_size=1,
+        v_tokens=7,
+        device=device,
+        dtype=dtype,
+        use_cuda_graph=(device == "cuda"),
+        draft_vocab_ids=draft_vocab_ids,
+    )
+
+    with torch.no_grad():
+        spec_out_pruned, stats_pruned = generate_speculative_v3(
+            base_model=base_model,
+            drafter=drafter,
+            input_ids=input_ids,
+            mask_token_id=mask_id,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine_pruned,
+        )
+
+    match_pruned = torch.equal(ref_out[:, :spec_out_pruned.shape[1]], spec_out_pruned)
+    print(f"Path B Pruned Vocab Match: {match_pruned} (steps={stats_pruned['steps']}, alpha={stats_pruned['alpha']:.2f})")
+    assert match_pruned, "Path B 2-step drafter output differed from base_model.generate() (pruned vocab)"
+    print("PASS: BFG-Diff v5 Path B 2-layer, 2-step maintains exact lossless greedy parity\n")
+
+
 if __name__ == "__main__":
     test_hedge_case_c_callback()
     test_ghost_weights_unit()
@@ -414,4 +495,5 @@ if __name__ == "__main__":
     test_synthetic_case_b_hedge_hit()
     test_cpu_lazy_commit_v3_leaf_hedge()
     test_quantized_int8_cpu_parity()
-    print("ALL V4 UNIT TESTS PASSED!")
+    test_v5_path_b_two_step_parity()
+    print("ALL UNIT TESTS PASSED!")

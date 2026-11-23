@@ -1067,7 +1067,19 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - `python3 -m py_compile *.py tools/*.py` verified clean compilation across all modules.
   - `git diff --check` verified clean formatting with no trailing whitespace or extra newlines.
 
-## 59. T4 Empirical Benchmark & Substrate Finalization (2026-11-23)
+## 60. BFG-Diff v5 Path B Implementation (2026-11-23)
+- **Branch**: `v5-path-b-diff2` created from `v4` (`c729954`).
+- **Implementation**:
+  - `model.py`: Implemented `SoftRefinementBridge` with normalized token/h1 embeddings, learnable `slot_emb`, and near-zero initialized up-projection. Implemented `compute_shifted_soft_embeds` performing top-$k$ normalized softmax over tied embeddings for slots $1 \dots W-1$. Updated `WeightTiedTopKDrafter` to support `num_draft_steps` and `soft_topk`, and updated `prepare_v3`.
+  - `sampler.py`: Pre-sliced `draft_embed_w` when `draft_vocab_ids` is present. Implemented Pass 2 in both `_step_draft_kernel` (CUDA Graph capture) and eager `forward_draft_step`, writing back into `[0:W]` scratch tail without cache reallocation.
+  - `train.py`: Added CLI arguments (`--k_layers`, `--drafter_r`, `--drafter_alpha`, `--num_draft_steps`, `--soft_topk`, `--lambda_pass1`, `--d_pace_decay`, `--loss_chunk_anchors`). Implemented `_chunked_distill_loss`. In `compute_anchor_distill_loss`, added Pass 1 loss, shape-safe $(B \cdot N, W, D)$ unpack/re-pack for `compute_shifted_soft_embeds` and `refine_bridge`, Pass 2 forward, and combined joint loss. Updated checkpoint payload to persist `"arch"` and save `refine_bridge.` state dict.
+  - `benchmark.py` & `chat.py`: Dynamically inspect `ckpt.get("arch", {})` on load and forward to `prepare_v3` with fallback to v4 defaults.
+  - `test_gates.py`: Added CLI args for architecture flags. Extended Unit Gate C to check `refine_bridge` gradients when `num_draft_steps > 1`. Extended Unit Gate D for 2-step train-inference parity.
+  - `test_units.py`: Added Test 8 (`test_v5_path_b_two_step_parity`) verifying exact greedy match against base model with full and 32k pruned draft vocabularies.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` verified zero syntax errors.
+  - `git diff --check` confirmed clean whitespace and formatting.
+
 - **Tooling & Benchmark Parity Cleanups**:
   - `tools/build_draft_vocab.py`: Added `--vocab_size` alias, bounded control token IDs by vocab size, and implemented clean dataset fallback to deterministic lowest BPE backfill.
   - `benchmark.py`: Wired `eos_token_id=tok.eos_token_id` into `generate_speculative_v3`, added EOS break and dynamic token counting to `GraphedCausalRunner`, and added `[Divergence Margins Summary]` logging min/max margins across diverging prompts.

@@ -106,19 +106,31 @@ class V3ModelManager:
             cfg = V3_CONFIGS[key]
             model_name = cfg["model_name"]
             ckpt_path = checkpoint_override or cfg["checkpoint"]
+            ck_file = Path(ckpt_path)
+            arch_kwargs = {}
+            ck_payload = None
+            if ck_file.exists():
+                print(f"[V3ModelManager] Inspecting drafter weights from {ck_file}...")
+                ck_payload = torch.load(ck_file, map_location=self.device)
+                arch_kwargs = ck_payload.get("arch", {})
+                if arch_kwargs:
+                    print(f"[V3ModelManager] Detected architecture from checkpoint: {arch_kwargs}")
+
             print(f"[V3ModelManager] Loading {key.upper()} base ({model_name}) on {self.device}...")
 
             base_model, drafter, tok, mask_id = prepare_v3(
                 model_name=model_name,
                 device=str(self.device),
                 dtype=self.dtype,
+                k_layers=arch_kwargs.get("k_layers", 4),
+                drafter_r=arch_kwargs.get("r", 32),
+                drafter_alpha=arch_kwargs.get("alpha", 64.0),
+                num_draft_steps=arch_kwargs.get("num_draft_steps", 1),
+                soft_topk=arch_kwargs.get("soft_topk", 4),
             )
 
-            ck_file = Path(ckpt_path)
-            if ck_file.exists():
-                print(f"[V3ModelManager] Loading drafter weights from {ck_file}...")
-                ck = torch.load(ck_file, map_location=self.device)
-                sd = ck.get("drafter_state_dict", ck)
+            if ck_payload is not None:
+                sd = ck_payload.get("drafter_state_dict", ck_payload)
                 drafter.load_state_dict(sd, strict=False)
                 print(f"[V3ModelManager] Loaded {len(sd)} drafter tensors into {key.upper()}")
             else:

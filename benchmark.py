@@ -400,7 +400,25 @@ def run_benchmark(
         base_dtype = torch.float32
     else:
         base_dtype = torch.bfloat16
-    base_model, drafter, tok, mask_id = prepare_v3(model_name, device=device, dtype=base_dtype)
+    arch_kwargs = {}
+    ckpt_payload = None
+    if checkpoint and Path(checkpoint).exists():
+        print(f"Inspecting drafter checkpoint from {checkpoint}...")
+        ckpt_payload = torch.load(checkpoint, map_location=device)
+        arch_kwargs = ckpt_payload.get("arch", {})
+        if arch_kwargs:
+            print(f"Detected checkpoint architecture: {arch_kwargs}")
+
+    base_model, drafter, tok, mask_id = prepare_v3(
+        model_name,
+        device=device,
+        dtype=base_dtype,
+        k_layers=arch_kwargs.get("k_layers", 4),
+        drafter_r=arch_kwargs.get("r", 32),
+        drafter_alpha=arch_kwargs.get("alpha", 64.0),
+        num_draft_steps=arch_kwargs.get("num_draft_steps", 1),
+        soft_topk=arch_kwargs.get("soft_topk", 4),
+    )
 
     draft_vocab_ids = None
     if draft_vocab and Path(draft_vocab).exists():
@@ -409,10 +427,8 @@ def run_benchmark(
         draft_vocab_ids = loaded["draft_vocab_ids"] if isinstance(loaded, dict) else loaded
         print(f"Loaded {len(draft_vocab_ids)} draft vocab IDs.")
 
-    if checkpoint and Path(checkpoint).exists():
-        print(f"Loading drafter checkpoint from {checkpoint}...")
-        ckpt = torch.load(checkpoint, map_location=device)
-        drafter.load_state_dict(ckpt["drafter_state_dict"], strict=False)
+    if ckpt_payload is not None:
+        drafter.load_state_dict(ckpt_payload["drafter_state_dict"], strict=False)
         print("Loaded drafter weights successfully.")
 
     drafter.merge_ghost_weights(dtype=base_dtype)

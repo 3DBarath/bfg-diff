@@ -1969,7 +1969,15 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
 - **Linear mode mask guard:** ensured `tree_mode == "linear"` does not fall into legacy hedge mask logic when `q_a != w + 1`, and tracked tree rescues under `hedge_hits` / `hedge_attempts`.
 - **Fair `Q=1` prefill & GQA probe:** sliced `h[:, -1:]` before lm_head in `GraphedCausalRunner.prefill`, and aligned the GQA probe with `StaticDraftEngine`'s deterministic `linspace` + `repeat_kv` check.
 
-### 10.11 Verified T4 Silicon Empirical Ablation (2026-11-23)
+### 10.12 BFG-Diff v5 Path B (2-Layer, 2-Step Soft Diffusion) Integration (2026-11-23)
+- **Architecture**: Implemented Weight-Tied 2-Layer, 2-Step Differentiable Soft-Embedding Block Diffusion on branch `v5-path-b-diff2`.
+- **Key Modules & Changes**:
+  - `SoftRefinementBridge` and `compute_shifted_soft_embeds` in `model.py`.
+  - `StaticDraftEngine` and eager `forward_draft_step` in `sampler.py`: Pass 1 -> shifted top-$k$ soft embedding -> `refine_bridge` -> Pass 2 overwriting `[0:W]` scratch tail within a single CUDA graph.
+  - `_chunked_distill_loss` and shape-safe $(B \cdot N, W, D)$ 2-pass anchor distillation in `train.py`.
+  - Architecture-aware checkpointing with `"arch"` metadata in `train.py`, `benchmark.py`, and `chat.py`.
+  - Test suite expansion: Unit Gate C gradient verification for `refine_bridge`, Unit Gate D train-infer parity for 2-step drafters in `test_gates.py`, and Test 8 in `test_units.py` for exact greedy parity with full and pruned vocab.
+
 Hardware: NVIDIA T4 GPU (sm_75, Turing), PyTorch 2.14+, CUDA.
 Model: `Qwen/Qwen2.5-1.5B`, Checkpoint: `runs/bfg_v3_1.5b_15k/last.pt`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
 
