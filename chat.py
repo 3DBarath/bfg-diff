@@ -16,8 +16,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import parse_qs, urlparse
+from typing import Callable, Dict, List, Optional
 
 import torch
 from model import prepare_v3, quantize_for_cpu
@@ -79,7 +78,10 @@ class V3ModelManager:
         else:
             self.dtype = torch.float32 if self.cpu_quant in ("int8", "int4") else torch.bfloat16
         self._models: Dict[str, dict] = {}
-        self._lock = threading.Lock()
+        # One re-entrant lock covers model loading, eviction and the full generation
+        # lifecycle. StaticDraftEngine holds per-request KV state, so two requests
+        # must never share it.
+        self.infer_lock = threading.RLock()
 
     def get_model(self, key: str = "1.5b-instruct", checkpoint_override: Optional[str] = None) -> dict:
         key = (key or "1.5b-instruct").lower().strip()
@@ -87,7 +89,7 @@ class V3ModelManager:
             key = "1.5b-instruct" if "1.5b-instruct" in V3_CONFIGS else "1.5b"
         cache_key = f"{key}:{checkpoint_override}" if checkpoint_override else key
 
-        with self._lock:
+        with self.infer_lock:
             if cache_key in self._models:
                 return self._models[cache_key]
 
@@ -147,6 +149,8 @@ class V3ModelManager:
                 "tok": tok,
                 "mask_id": mask_id,
                 "engine": engine,
+                "engine_cache": {(engine.v_tokens, engine.max_len): engine},
+                "dtype": self.dtype,
                 "config": cfg,
             }
             self._models[cache_key] = bundle
@@ -168,14 +172,36 @@ def generate_v3_stream(
     """
     tok = bundle["tok"]
     mask_id = bundle["mask_id"]
-    engine = bundle["engine"]
-    device = engine.device
+    device = bundle["engine"].device
 
     with torch.no_grad():
         input_ids = tok.encode(prompt_text, return_tensors="pt").to(device)
 
     B, P = input_ids.shape
     assert B == 1, "Streaming generation currently requires B=1"
+
+    # Reuse one engine per (W, capacity). Rebuilding drops the KV caches and the
+    # captured CUDA graphs, which costs more than the generation itself.
+    eff_v = v_tokens if v_tokens is not None else bundle["engine"].v_tokens
+    need = P + max_new_tokens + 64
+    capacity = 2048 if need <= 2048 else ((need + 1023) // 1024) * 1024
+    cache = bundle.setdefault("engine_cache", {})
+    engine = cache.get((eff_v, capacity))
+    if engine is None:
+        engine = StaticDraftEngine(
+            base_model=bundle["base_model"],
+            drafter=bundle["drafter"],
+            max_len=capacity,
+            batch_size=1,
+            v_tokens=eff_v,
+            device=device,
+            dtype=bundle.get("dtype"),
+            use_cuda_graph=(device.type == "cuda"),
+            hedge_margin=hedge_margin,
+        )
+        cache[(eff_v, capacity)] = engine
+        while len(cache) > 2:
+            cache.pop(next(iter(cache)))
 
     stop_token_ids = set()
     if tok.eos_token_id is not None:
@@ -352,7 +378,7 @@ def generate_causal_stream(model, tok, prompt_text, max_new_tokens=32, callback=
     return {"text": full_text, "tokens": len(generated_ids), "elapsed": elapsed, "tps": tps}
 
 
-def generate_causal(model, tok, prompt_text, max_new_tokens=32):
+def generate_causal(model, tok, prompt_text, max_new_tokens=32, temperature: float = 0.0):
     """Generate baseline response using causal generate()."""
     prefix_ids = tok.encode(prompt_text, return_tensors="pt").to(model.device)
     start_time = time.perf_counter()
@@ -360,7 +386,8 @@ def generate_causal(model, tok, prompt_text, max_new_tokens=32):
         out = model.generate(
             prefix_ids,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=(temperature > 0.0),
+            temperature=(temperature if temperature > 0.0 else None),
             pad_token_id=tok.eos_token_id,
         )
     elapsed = time.perf_counter() - start_time
@@ -1217,12 +1244,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                   <div class="item-sub">T=0.0 · Hedge Margin=1.0 · high speculative throughput</div>
                 </div>
               </div>
-              <div class="custom-menu-item" onclick="pickCustomPreset('greedy', 'Pure Argmax (Greedy)', this)">
-                <div>
-                  <div style="font-weight:500;">Pure Argmax</div>
-                  <div class="item-sub">T=0.0 · exact greedy decoding for benchmarks</div>
-                </div>
-              </div>
               <div class="custom-menu-item" onclick="pickCustomPreset('code', 'Code & Exact Syntax', this)">
                 <div>
                   <div style="font-weight:500;">Code & Exact Syntax</div>
@@ -1444,13 +1465,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <td style="padding: 8px 6px;">General dialogue, high fluency, optimal throughput.</td>
               </tr>
               <tr style="border-bottom: 1px solid var(--border-subtle);">
-                <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Pure Argmax (Greedy)</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">1.0</td>
-                <td style="padding: 8px 6px; font-family: var(--mono-font);">Auto</td>
-                <td style="padding: 8px 6px;">Exact greedy decoding for formal benchmarks & testing.</td>
-              </tr>
-              <tr style="border-bottom: 1px solid var(--border-subtle);">
                 <td style="padding: 8px 6px; font-weight: 500; color: var(--text-primary);">Code & Exact Syntax</td>
                 <td style="padding: 8px 6px; font-family: var(--mono-font);">0.0</td>
                 <td style="padding: 8px 6px; font-family: var(--mono-font);">0.5</td>
@@ -1572,8 +1586,6 @@ function onSelectPreset(preset) {
     cLen.value = 48; scTemp.value = 0.0; scMargin.value = 0.5; scVTokens.value = "auto";
   } else if (preset === 'creative') {
     cLen.value = 64; scTemp.value = 0.7; scMargin.value = 1.5; scVTokens.value = "auto";
-  } else if (preset === 'greedy') {
-    cLen.value = 48; scTemp.value = 0.0; scMargin.value = 1.0; scVTokens.value = "auto";
   }
 }
 
@@ -1703,6 +1715,9 @@ async function transmitChatMessage() {
           replyMeta.innerText = `${evt.tps.toFixed(1)} TPS · ${evt.tokens} tokens · ${evt.elapsed.toFixed(2)}s`;
           sessionChatHistory.push({ role: "assistant", content: completedReply });
           viewport.scrollTop = viewport.scrollHeight;
+        } else if (evt.type === 'error') {
+          replySpan.innerText = "Error: " + evt.message;
+          replyMeta.innerText = "generation failed";
         }
       }
     }
@@ -1832,6 +1847,9 @@ async function runVisualizerComparison() {
           bfgOut.innerText = evt.bfg.text;
           const alphaStr = (evt.bfg.alpha !== undefined) ? ` | α=${evt.bfg.alpha.toFixed(2)}` : '';
           bfgMeta.innerText = evt.bfg.tps.toFixed(1) + " TPS" + alphaStr + " (" + evt.bfg.elapsed.toFixed(2) + "s)";
+        } else if (evt.type === 'error') {
+          bfgOut.innerText = "Error: " + evt.message;
+          bfgMeta.innerText = "generation failed";
         }
       }
     }
@@ -1855,6 +1873,77 @@ window.addEventListener('DOMContentLoaded', () => {
 
 class VisualizerHandler(BaseHTTPRequestHandler):
     model_mgr: V3ModelManager = None
+
+    MAX_BODY_BYTES = 1 << 20
+    MAX_MESSAGES = 64
+
+    def _read_json_body(self) -> Optional[dict]:
+        raw_len = self.headers.get("Content-Length")
+        try:
+            n = int(raw_len) if raw_len is not None else 0
+        except (TypeError, ValueError):
+            self.send_error(400, "invalid Content-Length")
+            return None
+        if n <= 0:
+            self.send_error(400, "empty body")
+            return None
+        if n > self.MAX_BODY_BYTES:
+            self.send_error(413, "body too large")
+            return None
+        try:
+            payload = json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:
+            self.send_error(400, "invalid JSON")
+            return None
+        if not isinstance(payload, dict):
+            self.send_error(400, "JSON object required")
+            return None
+        return payload
+
+    @staticmethod
+    def _parse_generation_params(req: dict) -> Optional[dict]:
+        try:
+            canvas_len = int(req.get("canvas_len") if req.get("canvas_len") is not None else 32)
+            temp = float(req.get("temp") if req.get("temp") is not None else 0.0)
+            hedge_margin = float(req.get("hedge_margin") if req.get("hedge_margin") is not None else 1.0)
+            raw_v = req.get("v_tokens")
+            v_tokens = int(raw_v) if raw_v is not None else None
+        except (TypeError, ValueError):
+            return None
+        return {
+            "canvas_len": max(1, min(512, canvas_len)),
+            "temp": max(0.0, min(2.0, temp)),
+            "hedge_margin": max(0.0, min(10.0, hedge_margin)),
+            "v_tokens": None if v_tokens is None else max(2, min(7, v_tokens)),
+        }
+
+    def _slice_messages(self, messages) -> List[dict]:
+        if not isinstance(messages, list):
+            return []
+        msgs = [m for m in messages if isinstance(m, dict)]
+        if len(msgs) <= self.MAX_MESSAGES:
+            return msgs
+        head = [msgs[0]] if msgs[0].get("role") == "system" else []
+        return head + msgs[-(self.MAX_MESSAGES - len(head)):]
+
+    def _begin_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        # One flush padding is enough to defeat proxy buffering.
+        self.wfile.write(b": " + b" " * 2048 + b"\n\n")
+        self.wfile.flush()
+
+    def _send_sse(self, evt_data):
+        try:
+            self.wfile.write(f"data: {json.dumps(evt_data)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
@@ -1882,163 +1971,136 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/chat":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            req = json.loads(body.decode("utf-8"))
-
-            model_key = req.get("model", "1.5b-instruct")
-            bundle = self.model_mgr.get_model(model_key)
-            tok = bundle["tok"]
-
-            messages = req.get("messages", [])
-            canvas_len = req.get("canvas_len", 32)
-            temp = float(req.get("temp", 0.0))
-            hedge_margin = float(req.get("hedge_margin", 1.0))
-            v_tokens = req.get("v_tokens", None)
-            if v_tokens is not None:
-                v_tokens = int(v_tokens)
-
-            # Apply Jinja2/ChatML template if available, else format cleanly
-            try:
-                formatted_prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                formatted_prompt = ""
-                for m in messages:
-                    role = m.get("role", "user")
-                    content = m.get("content", "")
-                    formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-                formatted_prompt += "<|im_start|>assistant\n"
-
-            stop_tokens = ["<|im_end|>", "<|endoftext|>"]
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
+        if self.path not in ("/api/chat", "/api/generate"):
+            self.send_response(404)
             self.end_headers()
+            return
 
-            pad = ": " + (" " * 2048) + "\n\n"
+        req = self._read_json_body()
+        if req is None:
+            return
+        params = self._parse_generation_params(req)
+        if params is None:
+            self.send_error(400, "invalid generation parameters")
+            return
 
-            def send_chat_sse(evt_data):
-                msg = (f"data: {json.dumps(evt_data)}\n\n" + pad).encode("utf-8")
-                try:
-                    self.wfile.write(msg)
-                    self.wfile.flush()
-                except Exception:
-                    pass
+        # Validate before taking the lock so a malformed request never queues
+        # behind a running generation.
+        with self.model_mgr.infer_lock:
+            bundle = self.model_mgr.get_model(str(req.get("model") or "1.5b-instruct"))
+            if self.path == "/api/chat":
+                self._serve_chat(bundle, req, params)
+            else:
+                self._serve_generate(bundle, req, params)
 
+    def _serve_chat(self, bundle: dict, req: dict, params: dict):
+        tok = bundle["tok"]
+        messages = self._slice_messages(req.get("messages", []))
+
+        # Apply Jinja2/ChatML template if available, else format cleanly
+        try:
+            formatted_prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            formatted_prompt = ""
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+            formatted_prompt += "<|im_start|>assistant\n"
+
+        stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+
+        self._begin_sse()
+
+        try:
             bfg_res = generate_v3_stream(
                 bundle=bundle,
                 prompt_text=formatted_prompt,
-                max_new_tokens=canvas_len,
-                v_tokens=v_tokens,
-                temperature=temp,
-                hedge_margin=hedge_margin,
+                max_new_tokens=params["canvas_len"],
+                v_tokens=params["v_tokens"],
+                temperature=params["temp"],
+                hedge_margin=params["hedge_margin"],
                 stop_tokens=stop_tokens,
-                step_callback=lambda evt: send_chat_sse({
+                step_callback=lambda evt: self._send_sse({
                     "type": "chat_step",
                     "text": evt.get("text", ""),
                     "tps": evt.get("tps", 0.0),
                     "elapsed": evt.get("elapsed", 0.0),
                 }),
             )
-            clean_reply = bfg_res.get("text", "")
-            for st in stop_tokens:
-                clean_reply = clean_reply.replace(st, "")
-            clean_reply = clean_reply.strip()
-
-            send_chat_sse({
-                "type": "chat_done",
-                "text": clean_reply,
-                "tokens": bfg_res.get("tokens", 0),
-                "tps": bfg_res.get("tps", 0.0),
-                "elapsed": bfg_res.get("elapsed", 0.0),
-            })
+        except Exception as exc:
+            self._send_sse({"type": "error", "message": f"generation failed: {exc}"})
             return
 
-        if self.path == "/api/generate":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            req = json.loads(body.decode("utf-8"))
+        clean_reply = bfg_res.get("text", "")
+        for st in stop_tokens:
+            clean_reply = clean_reply.replace(st, "")
+        clean_reply = clean_reply.strip()
 
-            model_key = req.get("model", "1.5b-instruct")
-            bundle = self.model_mgr.get_model(model_key)
-            tok = bundle["tok"]
+        self._send_sse({
+            "type": "chat_done",
+            "text": clean_reply,
+            "tokens": bfg_res.get("tokens", 0),
+            "tps": bfg_res.get("tps", 0.0),
+            "elapsed": bfg_res.get("elapsed", 0.0),
+        })
 
-            prompt = req.get("prompt", "")
-            mode = req.get("mode", "completion")
-            canvas_len = req.get("canvas_len", 32)
-            temp = float(req.get("temp", 0.0))
-            hedge_margin = float(req.get("hedge_margin", 1.0))
-            v_tokens = req.get("v_tokens", None)
-            if v_tokens is not None:
-                v_tokens = int(v_tokens)
+    def _serve_generate(self, bundle: dict, req: dict, params: dict):
+        tok = bundle["tok"]
+        prompt = str(req.get("prompt") or "")
+        mode = str(req.get("mode") or "completion")
+        canvas_len = params["canvas_len"]
 
-            if mode == "chat" and "<|im_start|>" not in prompt:
-                if hasattr(tok, "apply_chat_template"):
-                    try:
-                        prompt = tok.apply_chat_template(
-                            [{"role": "user", "content": prompt}],
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
-                    except Exception:
-                        prompt = (
-                            f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
-                            f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-                        )
-                else:
+        if mode == "chat" and "<|im_start|>" not in prompt:
+            if hasattr(tok, "apply_chat_template"):
+                try:
+                    prompt = tok.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                except Exception:
                     prompt = (
                         f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
                         f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
                     )
+            else:
+                prompt = (
+                    f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                    f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                )
 
-            stop_tokens = ["<|im_end|>", "<|endoftext|>"] if mode == "chat" else None
+        stop_tokens = ["<|im_end|>", "<|endoftext|>"] if mode == "chat" else None
 
-            # Streaming SSE endpoint
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+        self._begin_sse()
 
-            pad = ": " + (" " * 2048) + "\n\n"
-
-            def send_sse(evt_data):
-                msg = (f"data: {json.dumps(evt_data)}\n\n" + pad).encode("utf-8")
-                try:
-                    self.wfile.write(msg)
-                    self.wfile.flush()
-                except Exception:
-                    pass
-
-            # 1. Stream BFG v4 speculative generation
+        # 1. Stream BFG v4 speculative generation
+        try:
             bfg_res = generate_v3_stream(
                 bundle=bundle,
                 prompt_text=prompt,
                 max_new_tokens=canvas_len,
-                v_tokens=v_tokens,
-                temperature=temp,
-                hedge_margin=hedge_margin,
+                v_tokens=params["v_tokens"],
+                temperature=params["temp"],
+                hedge_margin=params["hedge_margin"],
                 stop_tokens=stop_tokens,
-                step_callback=lambda evt: send_sse(evt),
+                step_callback=lambda evt: self._send_sse(evt),
             )
-            send_sse({"type": "bfg_done", "bfg": bfg_res})
+        except Exception as exc:
+            self._send_sse({"type": "error", "message": f"generation failed: {exc}"})
+            return
+        self._send_sse({"type": "bfg_done", "bfg": bfg_res})
 
-            # 2. Stream Causal Baseline token by token in real-time
+        # 2. Stream Causal Baseline token by token in real-time
+        try:
             causal_res = generate_causal_stream(
                 bundle["base_model"],
                 tok,
                 prompt,
                 max_new_tokens=canvas_len,
-                temperature=temp,
+                temperature=params["temp"],
                 stop_tokens=stop_tokens,
-                callback=lambda tok_str, total, tps, elap: send_sse({
+                callback=lambda tok_str, total, tps, elap: self._send_sse({
                     "type": "causal_token",
                     "token": tok_str,
                     "total": total,
@@ -2046,10 +2108,10 @@ class VisualizerHandler(BaseHTTPRequestHandler):
                     "elapsed": elap,
                 }),
             )
-            send_sse({"type": "causal_done", "causal": causal_res})
-        else:
-            self.send_response(404)
-            self.end_headers()
+        except Exception as exc:
+            self._send_sse({"type": "error", "message": f"baseline failed: {exc}"})
+            return
+        self._send_sse({"type": "causal_done", "causal": causal_res})
 
 
 def start_server(model_mgr: V3ModelManager, port: int = 8766):
@@ -2167,7 +2229,7 @@ def run_cli_interactive(model_mgr: V3ModelManager, default_model: str = "1.5b-in
         print(res["text"])
 
         if compare:
-            c_res = generate_causal(bundle["base_model"], bundle["tok"], formatted_prompt, max_new_tokens=canvas_len)
+            c_res = generate_causal(bundle["base_model"], bundle["tok"], formatted_prompt, max_new_tokens=canvas_len, temperature=temp)
             print(f"\nCausal Base ({c_res['tps']:.1f} TPS, {c_res['elapsed']:.2f}s):")
             print(c_res["text"])
         print("-" * 70)
@@ -2179,8 +2241,6 @@ def main():
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path override")
     parser.add_argument("--mode", choices=["chat", "completion"], default="completion")
     parser.add_argument("--canvas_len", type=int, default=32)
-    parser.add_argument("--sub_canvas_len", type=int, default=8)
-    parser.add_argument("--sub_steps", type=int, default=4)
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--visualize", action="store_true", help="Print step-by-step speculative trace")
     parser.add_argument("--compare", action="store_true", default=True)
@@ -2234,7 +2294,7 @@ def main():
         print(f"BFG-Diff v4 ({res['tps']:.1f} TPS, {res['elapsed']:.2f}s | α={res['alpha']:.2f} tok/step):")
         print(res["text"])
         if args.compare:
-            c_res = generate_causal(bundle["base_model"], bundle["tok"], args.prompt, max_new_tokens=args.canvas_len)
+            c_res = generate_causal(bundle["base_model"], bundle["tok"], args.prompt, max_new_tokens=args.canvas_len, temperature=args.temp)
             print(f"\nCausal Base ({c_res['tps']:.1f} TPS, {c_res['elapsed']:.2f}s):")
             print(c_res["text"])
     else:
