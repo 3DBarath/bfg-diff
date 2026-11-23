@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, apply_rotary_pos_emb, repeat_kv, rotate_half
 
 MASK_TOKEN = "<|extra_0|>"
@@ -192,8 +192,9 @@ class WeightTiedTopKDrafter(nn.Module):
         self.r = r
         self.alpha = alpha
 
-        # Frozen backbone references
-        self.base_model = base_model
+        # Frozen backbone references, kept out of _modules so that .to(), .train()
+        # and .state_dict() never touch the 1.5B base model.
+        object.__setattr__(self, "base_model", base_model)
         config = base_model.config
         self.dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -203,11 +204,10 @@ class WeightTiedTopKDrafter(nn.Module):
         self.total_layers = config.num_hidden_layers
 
         # Referenced backbone modules (unwrapped, zero copies)
-        self.draft_layers = base_model.model.layers[self.total_layers - k_layers :]
-        self.norm = base_model.model.norm
-        self.lm_head = base_model.lm_head
-        self.embed_tokens = base_model.get_input_embeddings()
-        self.rotary_emb = base_model.model.rotary_emb
+        object.__setattr__(self, "norm", base_model.model.norm)
+        object.__setattr__(self, "lm_head", base_model.lm_head)
+        object.__setattr__(self, "embed_tokens", base_model.get_input_embeddings())
+        object.__setattr__(self, "rotary_emb", base_model.model.rotary_emb)
 
         # Tapped layer indices: [(L // 4) * i - 1 for i in range(1, 5)]
         step = self.total_layers // 4
@@ -234,6 +234,12 @@ class WeightTiedTopKDrafter(nn.Module):
         # Ghost layers for zero-overhead inference
         self.ghost_layers = None
         self.has_ghost_layers = False
+
+    @property
+    def draft_layers(self) -> List[nn.Module]:
+        """Live view of the top K backbone layers, so quantize_for_cpu cannot leave
+        a stale float32 copy of those layers alive."""
+        return self.base_model.model.layers[self.total_layers - self.k_layers :]
 
     def merge_ghost_weights(self, dtype: Optional[torch.dtype] = None):
         """Inference-only optimization: deep-copy the 4 tapped decoder layers and fold
@@ -564,10 +570,11 @@ def quantize_for_cpu(
     
     Strict order:
     1. Merge ghost weights into drafter.ghost_layers on float32 master weights.
-    2. Quantize Linear layers in base_model (layers + lm_head) and drafter.ghost_layers
+    2. Quantize Linear layers in base_model.model.layers and drafter.ghost_layers
        in-place layer-by-layer with immediate gc.collect() so peak startup RSS stays
        safely under MemoryMax=9G cgroup cap.
-    Keeps embeddings and lightweight fusion/bridge modules unquantized for numerical stability.
+    Keeps lm_head, embeddings and the lightweight fusion/bridge modules unquantized
+    for numerical stability and sharp logit separation.
     """
     import gc
 
