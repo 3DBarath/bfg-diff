@@ -1948,3 +1948,15 @@ Chronological progression of the BFG-Diff engine evaluated on NVIDIA Tesla T4 GP
   `n_batches` uses `ceil`. Consistency prints `N/A` when `temperature > 0` or `batch_size > 1`.
   The isolated `T_verify` / `T_draft` engine captures CUDA graphs before `prefill` and warms
   up. CPU dtype is `bfloat16` unless quantising, to match `chat.py`.
+
+### 10.8 Phase 1 & 2 Bug Remediations & Tier 1 Substrate
+- **`Optional` import in `benchmark.py`:** fixed `NameError: Optional` by adding import from `typing`.
+- **`_StubEngine` compatibility in `sampler.py`:** wrapped `draft_vocab_ids` access in `getattr(engine, "draft_vocab_ids", None)` to maintain unit test stub compatibility.
+- **GQA numerical probe:** updated test probe in `sampler.py` to use non-zero `linspace` tensors with non-trivial 4D additive float mask under `torch.no_grad()`.
+- **Zero GPU-CPU sync vocabulary mapping:** cached `_draft_vocab_list` as a Python list during engine initialization to eliminate GPU tensor `.item()` syncs during token lookup.
+
+### 10.9 Generic Static-Shape Tree Verification ($Q_A \in \{8, 16\}$)
+- **Topological tree builder:** `build_topk_tree` generates an arbitrary tree candidate tile of size $Q_A$ with parent references and depths.
+- **Positional invariance in CUDA Graph replay:** verification graph replay uses identical static buffers and graph captures regardless of tree geometry.
+- **Ascending compaction safety:** verified that `parent[i] < i` ensures $n_m \ge m$, making in-place KV compaction strictly forward-moving and overwrite-safe.
+- **Graphed $Q=1$ baseline:** added `GraphedCausalRunner` to benchmark to isolate systems speedup against framework overheads.

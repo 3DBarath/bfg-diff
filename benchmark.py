@@ -25,7 +25,206 @@ import torch
 import torch.nn as nn
 
 from model import prepare_v3, quantize_for_cpu
-from sampler import generate_speculative_v3, StaticDraftEngine
+from sampler import generate_speculative_v3, StaticDraftEngine, StaticKVCache
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
+
+
+class GraphedCausalRunner:
+    """Base-model-only bucketed CUDA graph causal runner (Q=1).
+
+    Executes isolated base model autoregressive decoding using the exact same
+    StaticKVCache, power-of-2 buckets, and CUDA graph machinery as StaticDraftEngine,
+    without executing any drafter operations. Used as the fair graphed Q=1 baseline.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        max_len: int = 2048,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        buckets: Optional[List[int]] = None,
+    ):
+        self.base_model = base_model
+        self.max_len = max_len
+        if device is None:
+            device = next(base_model.parameters()).device
+        if dtype is None:
+            dtype = next(base_model.parameters()).dtype
+        self.device = torch.device(device)
+        self.dtype = dtype
+
+        config = base_model.config
+        self.total_layers = config.num_hidden_layers
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
+        self.dim = config.hidden_size
+
+        cand_buckets = buckets if buckets is not None else [256, 512, 1024, 2048]
+        self.buckets = sorted(set(b for b in cand_buckets if b < max_len) | {max_len})
+
+        self.cache = StaticKVCache(
+            num_layers=self.total_layers,
+            batch_size=1,
+            num_kv_heads=self.num_kv_heads,
+            max_len=max_len,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+        self.static_token = torch.zeros(1, 1, dtype=torch.long, device=device)
+        self.static_pos = torch.zeros(1, 1, dtype=torch.long, device=device)
+        self.static_mask = torch.full((1, 1, 1, max_len), -1e4, dtype=dtype, device=device)
+        self.static_logits = torch.zeros(1, 1, config.vocab_size, dtype=dtype, device=device)
+
+        # Check enable_gqa
+        self.supports_enable_gqa = False
+        if self.num_heads != self.num_kv_heads:
+            try:
+                with torch.no_grad():
+                    q_p = torch.zeros(1, self.num_heads, 1, self.head_dim, dtype=self.dtype, device=self.device)
+                    k_p = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
+                    v_p = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
+                    m_p = torch.zeros(1, 1, 1, 2, dtype=self.dtype, device=self.device)
+                    _ = F.scaled_dot_product_attention(q_p, k_p, v_p, attn_mask=m_p, enable_gqa=True)
+                    self.supports_enable_gqa = True
+            except Exception:
+                self.supports_enable_gqa = False
+
+        self.cuda_graphs = {}
+        if self.device.type == "cuda":
+            self._capture_cuda_graphs()
+
+    def get_bucket(self, pos: int) -> int:
+        for b in self.buckets:
+            if b >= pos + 1:
+                return b
+        if pos + 1 > self.max_len:
+            raise ValueError(f"Position {pos + 1} exceeds max_len {self.max_len}")
+        return self.buckets[-1]
+
+    def _step_kernel(self, S_b: int):
+        h = self.base_model.model.embed_tokens(self.static_token)
+        cos, sin = self.base_model.model.rotary_emb(h, self.static_pos)
+        mask_view = self.static_mask[:, :, :, :S_b]
+
+        for l_idx, layer in enumerate(self.base_model.model.layers):
+            norm_h = layer.input_layernorm(h)
+            q = layer.self_attn.q_proj(norm_h).view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = layer.self_attn.k_proj(norm_h).view(1, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = layer.self_attn.v_proj(norm_h).view(1, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+            p_val = self.static_pos.item() if not torch.cuda.is_current_stream_capturing() else 0
+            idx = self.static_pos.view(1, 1, 1, 1).expand(1, self.num_kv_heads, 1, self.head_dim)
+            self.cache.k[l_idx].scatter_(2, idx, k)
+            self.cache.v[l_idx].scatter_(2, idx, v)
+
+            k_active = self.cache.k[l_idx][:, :, :S_b, :]
+            v_active = self.cache.v[l_idx][:, :, :S_b, :]
+
+            if self.num_heads != self.num_kv_heads:
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask_view, enable_gqa=True)
+                else:
+                    k_attn = repeat_kv(k_active, self.num_heads // self.num_kv_heads)
+                    v_attn = repeat_kv(v_active, self.num_heads // self.num_kv_heads)
+                    attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_view)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k_active, v_active, attn_mask=mask_view)
+
+            attn_out = attn_out.transpose(1, 2).reshape(1, 1, self.dim)
+            h = h + layer.self_attn.o_proj(attn_out)
+            norm_post = layer.post_attention_layernorm(h)
+            h = h + layer.mlp(norm_post)
+
+        h_norm = self.base_model.model.norm(h)
+        logits = self.base_model.lm_head(h_norm)
+        self.static_logits.copy_(logits)
+
+    def _capture_cuda_graphs(self):
+        try:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for S_b in self.buckets:
+                    self.static_token.zero_()
+                    self.static_pos.zero_()
+                    self.static_mask[:, :, :, :S_b].fill_(-1e4)
+                    self.static_mask[0, 0, 0, 0] = 0.0
+
+                    for _ in range(3):
+                        self._step_kernel(S_b)
+
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        self._step_kernel(S_b)
+                    self.cuda_graphs[S_b] = g
+            torch.cuda.current_stream().wait_stream(s)
+            print(f"[GraphedCausalRunner] Captured {len(self.cuda_graphs)} CUDA graphs.")
+        except Exception as e:
+            print(f"[GraphedCausalRunner] CUDA Graph capture skipped/failed: {e}")
+            self.cuda_graphs = {}
+
+    def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
+        self.cache.reset()
+        B, P = input_ids.shape
+        pos_ids = torch.arange(P, device=self.device).unsqueeze(0)
+        mask = torch.triu(torch.full((1, 1, P, P), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
+
+        h = self.base_model.model.embed_tokens(input_ids)
+        cos, sin = self.base_model.model.rotary_emb(h, pos_ids)
+
+        for l_idx, layer in enumerate(self.base_model.model.layers):
+            norm_h = layer.input_layernorm(h)
+            q = layer.self_attn.q_proj(norm_h).view(B, P, self.num_heads, self.head_dim).transpose(1, 2)
+            k = layer.self_attn.k_proj(norm_h).view(B, P, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = layer.self_attn.v_proj(norm_h).view(B, P, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+            self.cache.k[l_idx][0, :, :P] = k[0]
+            self.cache.v[l_idx][0, :, :P] = v[0]
+
+            if self.num_heads != self.num_kv_heads:
+                if self.supports_enable_gqa:
+                    attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+                else:
+                    k_rep = repeat_kv(k, self.num_heads // self.num_kv_heads)
+                    v_rep = repeat_kv(v, self.num_heads // self.num_kv_heads)
+                    attn_out = F.scaled_dot_product_attention(q, k_rep, v_rep, attn_mask=mask)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+            attn_out = attn_out.transpose(1, 2).reshape(B, P, self.dim)
+            h = h + layer.self_attn.o_proj(attn_out)
+            norm_post = layer.post_attention_layernorm(h)
+            h = h + layer.mlp(norm_post)
+
+        h_norm = self.base_model.model.norm(h)
+        logits = self.base_model.lm_head(h_norm)
+        return logits[:, -1:]
+
+    def step(self, token: torch.Tensor, cur_pos: int) -> torch.Tensor:
+        S_b = self.get_bucket(cur_pos)
+        if cur_pos in self.cuda_graphs or S_b in self.cuda_graphs:
+            g = self.cuda_graphs.get(S_b)
+            if g is not None:
+                self.static_token.copy_(token)
+                self.static_pos.fill_(cur_pos)
+                mask_view = self.static_mask[:, :, :, :S_b]
+                mask_view.fill_(-1e4)
+                mask_view[0, 0, 0, :cur_pos + 1] = 0.0
+                g.replay()
+                return self.static_logits
+
+        # Fallback eager step
+        self.static_token.copy_(token)
+        self.static_pos.fill_(cur_pos)
+        self.static_mask[:, :, :, :cur_pos + 1] = 0.0
+        self._step_kernel(cur_pos + 1)
+        return self.static_logits
 
 def setup_cpu_threads():
     """Auto-detect physical core count and pin PyTorch CPU execution once at startup."""
@@ -164,6 +363,8 @@ def run_benchmark(
     smoke_test: bool = False,
     v_tokens: int = None,
     draft_vocab: Optional[str] = None,
+    q_a: Optional[int] = None,
+    tree_mode: str = "auto",
 ):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -264,7 +465,7 @@ def run_benchmark(
     compiled_tps = None
     if device == "cuda" and not smoke_test:
         try:
-            print("\n[2/3] Running Compiled Baseline (torch.compile reduce-overhead)...")
+            print("\n[2/4] Running Compiled Baseline (torch.compile reduce-overhead)...")
             compiled_model = torch.compile(base_model, mode="reduce-overhead")
             # Untimed warmup: the first call pays the whole graph compilation cost.
             w_inputs = tok(prompts[:1], return_tensors="pt", padding=True).to(device)
@@ -289,8 +490,54 @@ def run_benchmark(
         except Exception as e:
             print(f"  Note: torch.compile baseline skipped ({e})")
 
-    # 3. Speculative: BFG-Diff v3 Drafter
-    print("\n[3/3] Running BFG-Diff v3 Speculative Engine...")
+    # 3. Baseline 3: Base-Model-Only Graphed Causal Runner (Q=1)
+    graphed_q1_tps = None
+    if device == "cuda" and batch_size == 1:
+        try:
+            print("\n[3/4] Running Base-Model-Only Graphed Causal Baseline (Q=1)...")
+            max_p_len_base = max(len(tok.encode(p)) for p in prompts)
+            graphed_runner = GraphedCausalRunner(
+                base_model=base_model,
+                max_len=max_p_len_base + max_new_tokens + 64,
+                device=device,
+                dtype=base_dtype,
+            )
+            graphed_times, graphed_tokens = [], []
+            for i in range(len(prompts)):
+                b_prompt = prompts[i]
+                inputs = tok(b_prompt, return_tensors="pt").to(device)
+                p_ids = inputs["input_ids"]
+                P_len = p_ids.shape[1]
+
+                sync_device()
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    logits = graphed_runner.prefill(p_ids)
+                    if temperature == 0.0:
+                        cur_tok = torch.argmax(logits, dim=-1)
+                    else:
+                        probs = F.softmax(logits / max(1e-4, temperature), dim=-1)
+                        cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
+
+                    for step_idx in range(1, max_new_tokens):
+                        cur_pos = P_len + step_idx - 1
+                        logits_step = graphed_runner.step(cur_tok, cur_pos)
+                        if temperature == 0.0:
+                            cur_tok = torch.argmax(logits_step, dim=-1)
+                        else:
+                            probs = F.softmax(logits_step / max(1e-4, temperature), dim=-1)
+                            cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
+                sync_device()
+                elapsed = time.perf_counter() - t0
+                graphed_times.append(elapsed)
+                graphed_tokens.append(max_new_tokens)
+            graphed_q1_tps = sum(graphed_tokens) / max(1e-4, sum(graphed_times))
+            print(f"  Graphed Q=1 Baseline TPS: {graphed_q1_tps:.1f}")
+        except Exception as e:
+            print(f"  Note: Graphed Q=1 baseline skipped ({e})")
+
+    # 4. Speculative: BFG-Diff v4 Drafter
+    print("\n[4/4] Running BFG-Diff v4 Speculative Engine...")
     spec_times, spec_tokens_list = [], []
     spec_outputs = []
     total_accepted_drafts = 0
@@ -310,6 +557,7 @@ def run_benchmark(
         max_len=engine_max_len,
         batch_size=batch_size,
         v_tokens=v_tokens,
+        q_a=q_a,
         device=device,
         dtype=base_dtype,
         use_cuda_graph=(batch_size == 1),
@@ -337,6 +585,8 @@ def run_benchmark(
                 engine=shared_engine,
                 hedge_margin=hedge_margin,
                 v_tokens=v_tokens,
+                q_a=q_a,
+                tree_mode=tree_mode,
             )
         sync_device()
         elapsed = time.perf_counter() - t0
@@ -364,6 +614,27 @@ def run_benchmark(
             raw_batch = raw_outputs[batch_idx]
             if torch.equal(raw_batch.cpu(), spec_gen_only.cpu()):
                 exact_matches += len(b_prompts)
+            else:
+                # Logit-margin first divergence diagnostic
+                try:
+                    r_toks = raw_batch[0]
+                    s_toks = spec_gen_only[0]
+                    min_len = min(len(r_toks), len(s_toks))
+                    div_idx = None
+                    for k_idx in range(min_len):
+                        if r_toks[k_idx] != s_toks[k_idx]:
+                            div_idx = k_idx
+                            break
+                    if div_idx is not None:
+                        ctx_ids = torch.cat([input_ids[0].cpu(), r_toks[:div_idx]], dim=0).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            base_out = base_model(ctx_ids)
+                            div_logits = base_out.logits[0, -1].float()
+                            top2_vals = torch.topk(div_logits, 2).values
+                            margin = (top2_vals[0] - top2_vals[1]).item()
+                        print(f"  [Divergence Diagnostic] Prompt {i}: first mismatch at step {div_idx} | raw={int(r_toks[div_idx])} vs spec={int(s_toks[div_idx])} | base logit margin={margin:.4f}")
+                except Exception as ex:
+                    print(f"  [Divergence Diagnostic] Warning: {ex}")
 
     total_spec_time = sum(spec_times)
     total_spec_tokens = sum(spec_tokens_list)
@@ -395,7 +666,7 @@ def run_benchmark(
     # Capture the CUDA graphs first: capture runs dummy kernels that overwrite both caches.
     eng = StaticDraftEngine(
         base_model, drafter, max_len=256, batch_size=1, v_tokens=v_tokens,
-        device=device, dtype=base_dtype, use_cuda_graph=(device == "cuda"),
+        q_a=q_a, device=device, dtype=base_dtype, use_cuda_graph=(device == "cuda"),
         draft_vocab_ids=draft_vocab_ids,
     )
     if eng.device.type == "cuda":
@@ -434,7 +705,11 @@ def run_benchmark(
     print(f"{'Throughput (TPS)':<35}{raw_tps:>15,.1f}{spec_tps:>15,.1f}")
     if compiled_tps is not None:
         print(f"{'Compiled Baseline (TPS)':<35}{compiled_tps:>15,.1f}{'-':>15}")
-    print(f"{'Wall-clock Speedup':<35}{'1.00x':>15}{f'{speedup:.2f}x':>15}")
+    if graphed_q1_tps is not None:
+        print(f"{'Graphed Q=1 Baseline (TPS)':<35}{graphed_q1_tps:>15,.1f}{'-':>15}")
+        spec_vs_graphed = spec_tps / max(1e-4, graphed_q1_tps)
+        print(f"{'Speculative Speedup (vs Q=1)':<35}{'1.00x':>15}{f'{spec_vs_graphed:.2f}x':>15}")
+    print(f"{'Wall-clock Speedup (vs HF)':<35}{'1.00x':>15}{f'{speedup:.2f}x':>15}")
     print(f"{'Mean Acceptance Alpha':<35}{'1.00':>15}{f'{alpha:.2f}':>15}")
     print(f"{'Gamma Total (Acceptance %)':<35}{'-':>15}{f'{gamma_total:.1f}%':>15}")
     print(f"{'A_+1 Acceptance Rate':<35}{'-':>15}{f'{a1:.1f}%':>15}")
@@ -468,6 +743,8 @@ def main():
     p.add_argument("--smoke_test", action="store_true")
     p.add_argument("--v_tokens", type=int, default=None, help="Draft window W (default: auto, 3 on CPU / 7 on CUDA)")
     p.add_argument("--draft_vocab", type=str, default=None, help="Path to draft_vocab_ids tensor")
+    p.add_argument("--q_a", type=int, default=None, help="Verification tile size Q_A (e.g. 8 or 16, default: v_tokens + 1)")
+    p.add_argument("--tree_mode", type=str, default="auto", choices=["auto", "linear", "tree"], help="Tree verification mode")
     args = p.parse_args()
 
     run_benchmark(
@@ -483,6 +760,8 @@ def main():
         smoke_test=args.smoke_test,
         v_tokens=args.v_tokens,
         draft_vocab=args.draft_vocab,
+        q_a=args.q_a,
+        tree_mode=args.tree_mode,
     )
 
 

@@ -23,6 +23,7 @@ Systems Optimizations:
    - 100% exact lossless parity against greedy autoregressive baseline across Case A, Case B, and Case C.
 """
 
+import heapq
 import math
 import os
 from typing import Callable, List, Optional, Set, Tuple, Union
@@ -111,6 +112,7 @@ class StaticDraftEngine:
         buckets: Optional[Tuple[int, ...]] = None,
         mask_token_id: int = MASK_TOKEN_ID,
         draft_vocab_ids: Optional[torch.Tensor] = None,
+        q_a: Optional[int] = None,
     ):
         self.base_model = base_model
         self.drafter = drafter
@@ -127,8 +129,10 @@ class StaticDraftEngine:
         if v_tokens is None:
             v_tokens = 7 if self.device.type == "cuda" else 3
         self.v_tokens = v_tokens
-        self.q_a = v_tokens + 1
         self.w = v_tokens
+        if q_a is None:
+            q_a = v_tokens + 1
+        self.q_a = q_a
         self.use_cuda_graph = use_cuda_graph
         self.hedge_margin = float(hedge_margin)
 
@@ -602,13 +606,15 @@ class StaticDraftEngine:
 
     def forward_verify_step(
         self,
-        verify_tokens: torch.Tensor,       # (B, Q_A=8) [y*, d_0, ..., d_6] or [y*, d0_1, ..., d0_2]
+        verify_tokens: torch.Tensor,       # (B, Q_A) [y*, d_0, ...] or tree candidate tile
         cur_pos_list: List[int],           # list of B ints: sequence position t
         is_hedge: bool = False,
         pos_verify_override: Optional[torch.Tensor] = None,
+        tree_mask_override: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Stage 1 verify pass over Q_A = 8 tokens with WAL write-ahead logging into draft_cache.
+        """Stage 1 verify pass over Q_A tokens with WAL write-ahead logging into draft_cache.
         Uses Power-of-2 Bucketed CUDA Graphs on CUDA B=1; runs eager static fallback on CPU / B > 1.
+        Supports linear causal chain, legacy leaf-hedge, or tree_mask_override (Q_A, Q_A).
         """
         B, Q_A = verify_tokens.shape
         t = cur_pos_list[0]
@@ -634,7 +640,10 @@ class StaticDraftEngine:
             if t > 0:
                 mask_A_view[0, 0, :, :t] = 0.0
 
-            if not is_hedge:
+            if tree_mask_override is not None:
+                # Arbitrary static tree ancestor topology
+                mask_A_view[0, 0, :, t : t + Q_A].copy_(tree_mask_override)
+            elif not is_hedge:
                 # Standard linear causal chain
                 mask_A_view[0, 0, :, t : t + Q_A] = self.causal_qa_block
             else:
@@ -676,7 +685,9 @@ class StaticDraftEngine:
             if cp > 0:
                 mask[b, 0, :, :cp] = 0.0
 
-            if not is_hedge or b > 0:
+            if tree_mask_override is not None and b == 0:
+                mask[b, 0, :, cp : cp + Q_A].copy_(tree_mask_override)
+            elif not is_hedge or b > 0:
                 mask[b, 0, :, cp : cp + Q_A] = self.causal_qa_block
             else:
                 mask[b, 0, :self.w, cp : cp + self.w] = self.causal_wxw_block
@@ -948,6 +959,78 @@ class StaticDraftEngine:
                 self.draft_cache.v[d_l_idx][b, :, sp] = v_d[b]
 
 
+def build_topk_tree(
+    draft_logits: torch.Tensor,       # (W, V_d) or (W, V) logits
+    q_a: int = 16,
+    draft_vocab_list: Optional[List[int]] = None,
+    draft_vocab_ids: Optional[torch.Tensor] = None,
+    k_per_step: int = 3,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Build a static tree candidate tile of size Q_A from 1D/2D draft logits.
+
+    Returns:
+        tree_tokens: List of length Q_A (slot 0 is a placeholder 0 for concrete y*, filled at step)
+        tree_parents: List of length Q_A (parent slot index in 0..Q_A-1, with parent[0] = -1)
+        tree_depths: List of length Q_A (depth relative to t: slot 0 has depth 0, children have depth >= 1)
+    """
+    W = draft_logits.shape[0]
+    log_probs = F.log_softmax(draft_logits.float(), dim=-1)
+
+    # Pre-extract top-k candidates for each depth step 0 .. W-1
+    # Each slot j corresponds to draft step j (depth j + 1 in tree relative to t)
+    topk_vals, topk_inds = torch.topk(log_probs, k=min(k_per_step, log_probs.shape[-1]), dim=-1)
+    topk_vals = topk_vals.tolist()
+    topk_inds = topk_inds.tolist()
+
+    # Remap local vocab indices to global token IDs
+    topk_global = []
+    for step in range(W):
+        step_tokens = []
+        for local_idx in topk_inds[step]:
+            if draft_vocab_list is not None:
+                step_tokens.append(draft_vocab_list[local_idx])
+            elif draft_vocab_ids is not None:
+                step_tokens.append(int(draft_vocab_ids[local_idx].item()))
+            else:
+                step_tokens.append(local_idx)
+        topk_global.append(step_tokens)
+
+    # Priority queue: (-cum_logprob, depth, parent_slot, token_id, step_idx, rank)
+    heap = []
+    # Seed queue with top-k candidates for depth 1 (from draft step 0)
+    for rank in range(len(topk_global[0])):
+        val = topk_vals[0][rank]
+        tok = topk_global[0][rank]
+        heapq.heappush(heap, (-val, 1, 0, tok, 0, rank))
+
+    tree_tokens = [0]       # slot 0 placeholder for y*
+    tree_parents = [-1]    # slot 0 has no parent
+    tree_depths = [0]      # slot 0 is at depth 0 (pos t)
+
+    while len(tree_tokens) < q_a and heap:
+        neg_p, depth, p_slot, tok, step_idx, rank = heapq.heappop(heap)
+        cur_slot = len(tree_tokens)
+        tree_tokens.append(tok)
+        tree_parents.append(p_slot)
+        tree_depths.append(depth)
+
+        # Expand child candidates at next draft step if within window W
+        next_step = step_idx + 1
+        if next_step < W:
+            for next_rank in range(len(topk_global[next_step])):
+                next_val = -neg_p + topk_vals[next_step][next_rank]
+                next_tok = topk_global[next_step][next_rank]
+                heapq.heappush(heap, (-next_val, depth + 1, cur_slot, next_tok, next_step, next_rank))
+
+    # Pad if tree didn't reach q_a (fallback)
+    while len(tree_tokens) < q_a:
+        tree_tokens.append(0)
+        tree_parents.append(0)
+        tree_depths.append(1)
+
+    return tree_tokens, tree_parents, tree_depths
+
+
 def generate_speculative_v3(
     base_model: nn.Module,
     drafter: WeightTiedTopKDrafter,
@@ -962,6 +1045,8 @@ def generate_speculative_v3(
     engine: Optional[StaticDraftEngine] = None,
     hedge_margin: float = 1.0,
     step_callback: Optional[Callable[[dict], None]] = None,
+    tree_mode: str = "auto",
+    q_a: Optional[int] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """BFG-Diff v4 Speculative Decoding:
     - 100% Lossless mathematical parity to greedy base_model autoregressive decoding.
@@ -978,13 +1063,14 @@ def generate_speculative_v3(
     if v_tokens is None:
         v_tokens = 7 if device.type == "cuda" else 3
 
-    if engine is None or getattr(engine, "max_len", 0) < (P + max_new_tokens + 32) or getattr(engine, "batch_size", 0) != B or getattr(engine, "v_tokens", None) != v_tokens:
+    if engine is None or getattr(engine, "max_len", 0) < (P + max_new_tokens + 32) or getattr(engine, "batch_size", 0) != B or getattr(engine, "v_tokens", None) != v_tokens or (q_a is not None and getattr(engine, "q_a", None) != q_a):
         engine = StaticDraftEngine(
             base_model=base_model,
             drafter=drafter,
             max_len=P + max_new_tokens + 64,
             batch_size=B,
             v_tokens=v_tokens,
+            q_a=q_a,
             device=device,
             dtype=dtype,
             use_cuda_graph=use_cuda_graph,
@@ -1054,6 +1140,7 @@ def generate_speculative_v3(
     # Pre-allocated reusable buffers for hot loop (zero per-step heap allocations)
     verify_input_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
     pos_override_buf = torch.zeros(B, engine.q_a, dtype=torch.long, device=engine.device)
+    tree_mask_buf = torch.full((engine.q_a, engine.q_a), -1e4, dtype=engine.dtype, device=engine.device)
 
     while not all(done) and any((cur_pos_list[b] - P + 1) < max_new_tokens for b in range(B)):
         y_star = next_token  # (B, 1) concrete bonus token at position t
@@ -1072,32 +1159,67 @@ def generate_speculative_v3(
             return_logits=True,
         )
 
-        # Leaf-Hedge Margin Check at Slot 0
+        use_tree = False
         is_hedge = False
         d0_1, d0_2 = None, None
-        if B == 1 and hedge_margin > 0.0:
-            top2 = torch.topk(draft_logits[0, 0], k=2)
-            top2_vals = top2.values.tolist()
-            top2_inds = top2.indices.tolist()
-            v1, v2 = top2_vals[0], top2_vals[1]
-            raw_d0_1, raw_d0_2 = top2_inds[0], top2_inds[1]
-            draft_v_list = getattr(engine, "_draft_vocab_list", None)
-            if draft_v_list is not None:
-                d0_1 = draft_v_list[raw_d0_1]
-                d0_2 = draft_v_list[raw_d0_2]
-            elif getattr(engine, "draft_vocab_ids", None) is not None:
-                d0_1 = int(engine.draft_vocab_ids[raw_d0_1].item())
-                d0_2 = int(engine.draft_vocab_ids[raw_d0_2].item())
-            else:
-                d0_1 = raw_d0_1
-                d0_2 = raw_d0_2
-            margin = v1 - v2
-            if margin < hedge_margin:
-                is_hedge = True
-                hedge_attempts += 1
+
+        if B == 1:
+            if tree_mode == "tree" or (tree_mode == "auto" and engine.q_a > engine.w + 1):
+                use_tree = True
+            elif hedge_margin > 0.0:
+                # Leaf-Hedge Margin Check at Slot 0
+                top2 = torch.topk(draft_logits[0, 0], k=2)
+                top2_vals = top2.values.tolist()
+                top2_inds = top2.indices.tolist()
+                v1, v2 = top2_vals[0], top2_vals[1]
+                raw_d0_1, raw_d0_2 = top2_inds[0], top2_inds[1]
+                draft_v_list = getattr(engine, "_draft_vocab_list", None)
+                if draft_v_list is not None:
+                    d0_1 = draft_v_list[raw_d0_1]
+                    d0_2 = draft_v_list[raw_d0_2]
+                elif getattr(engine, "draft_vocab_ids", None) is not None:
+                    d0_1 = int(engine.draft_vocab_ids[raw_d0_1].item())
+                    d0_2 = int(engine.draft_vocab_ids[raw_d0_2].item())
+                else:
+                    d0_1 = raw_d0_1
+                    d0_2 = raw_d0_2
+                margin = v1 - v2
+                if margin < hedge_margin:
+                    is_hedge = True
+                    hedge_attempts += 1
 
         # Stage 1: Verify batch Q_A at positions [t .. t + Q_A - 1]
-        if is_hedge:
+        if use_tree:
+            # Build top-k best-first tree topology of size Q_A
+            t_tokens, t_parents, t_depths = build_topk_tree(
+                draft_logits=draft_logits[0],
+                q_a=engine.q_a,
+                draft_vocab_list=getattr(engine, "_draft_vocab_list", None),
+                draft_vocab_ids=getattr(engine, "draft_vocab_ids", None),
+                k_per_step=3,
+            )
+            t_tokens[0] = int(y_star[0, 0].item())
+
+            verify_input_buf[0].copy_(torch.tensor(t_tokens, dtype=torch.long, device=engine.device))
+            pos_override_buf[0].copy_(torch.tensor([t + d for d in t_depths], dtype=torch.long, device=engine.device))
+
+            # Build ancestor mask in tree_mask_buf
+            tree_mask_buf.fill_(-1e4)
+            for i in range(engine.q_a):
+                curr = i
+                while curr != -1:
+                    tree_mask_buf[i, curr] = 0.0
+                    curr = t_parents[curr]
+
+            verify_logits, f_ctx_verify = engine.forward_verify_step(
+                verify_input_buf,
+                cur_pos_list=cur_pos_list,
+                is_hedge=False,
+                pos_verify_override=pos_override_buf,
+                tree_mask_override=tree_mask_buf,
+            )
+            verify_input = verify_input_buf
+        elif is_hedge:
             # Polymorphic Micro-Tree Tile: [y*, d0_1, ..., d0_2]
             verify_input_buf[0, 0] = y_star[0, 0]
             verify_input_buf[0, 1] = d0_1
@@ -1114,7 +1236,9 @@ def generate_speculative_v3(
         else:
             # Standard Linear Chain Tile: [y*, d0, d1, ...]
             verify_input_buf[:, 0:1].copy_(y_star)
-            verify_input_buf[:, 1:].copy_(draft_ids)
+            verify_input_buf[:, 1 : engine.w + 1].copy_(draft_ids)
+            if engine.q_a > engine.w + 1:
+                verify_input_buf[:, engine.w + 1 :].zero_()
             verify_logits, f_ctx_verify = engine.forward_verify_step(
                 verify_input_buf, cur_pos_list=cur_pos_list, is_hedge=False
             )
@@ -1127,7 +1251,90 @@ def generate_speculative_v3(
             probs = F.softmax(verify_logits / max(1e-4, temperature), dim=-1)
             target_tokens = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, engine.q_a)
 
-        if is_hedge:
+        if use_tree:
+            # Walk tree from root slot 0 along greedy verified path
+            accepted_slots = [0]
+            curr_slot = 0
+            while True:
+                # Find children of curr_slot
+                # Prediction of target at curr_slot is target_tokens[0, curr_slot]
+                t_pred = int(target_tokens[0, curr_slot].item())
+                matched_child = None
+                for c_slot in range(curr_slot + 1, engine.q_a):
+                    if t_parents[c_slot] == curr_slot and t_tokens[c_slot] == t_pred:
+                        matched_child = c_slot
+                        break
+                if matched_child is not None:
+                    accepted_slots.append(matched_child)
+                    curr_slot = matched_child
+                else:
+                    break
+
+            k = len(accepted_slots) - 1  # number of accepted draft tokens
+            for offset_idx in range(min(k, len(a_plus))):
+                a_plus[offset_idx] += 1
+
+            num_committed = k + 1
+            accept_counts[num_committed] += 1
+            total_draft_tokens += v_tokens
+            accepted_draft_tokens += k
+
+            # Final bonus token is predicted by last accepted slot
+            last_slot = accepted_slots[-1]
+            bonus_token = target_tokens[0, last_slot : last_slot + 1]
+
+            # Committed tokens: candidate tokens along accepted path + bonus token
+            # Slot 0 token is y* (already committed in previous step/prefill), so path tokens are slots 1..k
+            path_draft_tokens = [t_tokens[s] for s in accepted_slots[1:]]
+            if path_draft_tokens:
+                committed_tokens = torch.cat([
+                    torch.tensor(path_draft_tokens, device=engine.device, dtype=torch.long),
+                    bonus_token,
+                ], dim=0)
+            else:
+                committed_tokens = bonus_token
+
+            step_accepted = k
+            step_committed = [int(x) for x in committed_tokens]
+
+            # Ascending KV compaction: compact accepted slot n_m into sequence position t + m
+            # Topological ordering (parent[i] < i) guarantees n_m >= m, making ascending copy overwrite-safe!
+            for m in range(1, len(accepted_slots)):
+                src_slot = accepted_slots[m]
+                dst_pos = t + m
+                src_pos = t + src_slot
+                if src_pos != dst_pos:
+                    for l_idx in range(engine.total_layers):
+                        engine.target_cache.k[l_idx][0, :, dst_pos] = engine.target_cache.k[l_idx][0, :, src_pos]
+                        engine.target_cache.v[l_idx][0, :, dst_pos] = engine.target_cache.v[l_idx][0, :, src_pos]
+                    if engine.device.type == "cuda":
+                        for dl_idx in range(engine.k_layers):
+                            engine.draft_cache.k[dl_idx][0, :, engine.w + dst_pos] = engine.draft_cache.k[dl_idx][0, :, engine.w + src_pos]
+                            engine.draft_cache.v[dl_idx][0, :, engine.w + dst_pos] = engine.draft_cache.v[dl_idx][0, :, engine.w + src_pos]
+
+            # CPU Lazy Draft KV Commit for accepted path tokens
+            if engine.device.type != "cuda":
+                pos_acc = torch.arange(t, t + k + 1, device=engine.device)
+                f_ctx_path = torch.stack([f_ctx_verify[0, s] for s in accepted_slots], dim=0).unsqueeze(0)
+                engine.commit_accepted_tokens(
+                    f_ctx_path,
+                    pos_acc,
+                    engine.w + pos_acc,
+                )
+
+            committed_tokens, hit_stop = _truncate_at_stop(committed_tokens)
+            generated_per_row[0].append(committed_tokens)
+
+            next_token = bonus_token.unsqueeze(0)
+            f_ctx_last = f_ctx_verify[0:1, last_slot : last_slot + 1]
+            cur_pos_list[0] += num_committed
+
+            if hit_stop:
+                done[0] = True
+            if (cur_pos_list[0] - P + 1) >= max_new_tokens:
+                done[0] = True
+
+        elif is_hedge:
             # Leaf-Hedge Verification Branching
             t0 = target_tokens[0, 0].item()
             total_draft_tokens += v_tokens

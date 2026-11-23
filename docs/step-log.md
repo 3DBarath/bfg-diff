@@ -1039,4 +1039,25 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - AST analysis verified zero mutable default arguments and clean imports.
   - `git diff --check` verified no whitespace or EOF formatting errors.
 
+## 58. Phase 3 & 4: Generic Static Tree Verifier & Benchmark Rigor (2026-11-23)
+- **Phase 1/2 Bug Remediations**:
+  - Added missing `Optional` import in `benchmark.py`.
+  - Guarded `draft_vocab_ids` with `getattr(engine, "draft_vocab_ids", None)` in `sampler.py` to prevent `_StubEngine` crashes in unit tests.
+  - Improved SDPA GQA probe in `sampler.py` to use non-zero `linspace` tensors with non-trivial 4D additive float mask.
+  - Cached `_draft_vocab_list` in `StaticDraftEngine` to avoid GPU-CPU `.item()` synchronization during token mapping.
+  - Defensively unwrapped `draft_vocab_ids` from dict payloads in `chat.py` and `benchmark.py`.
+- **Phase 3: Generic Static-Shape Tree Verifier (`sampler.py`)**:
+  - Decoupled `q_a` from `w` in `StaticDraftEngine` (default `w + 1`, supports `q_a = 16` with `w = 7`).
+  - Added `build_topk_tree` function implementing best-first priority queue search from draft logits to construct topological tree candidate tiles of size $Q_A$.
+  - Extended `forward_verify_step` with `tree_mask_override` supporting arbitrary ancestor masks without CUDA Graph invalidation.
+  - Implemented greedy tree walking and ascending in-place KV compaction ($t + n_m \to t + m$) for both target and CUDA draft caches.
+  - Added `--q_a` and `--tree_mode` support to `generate_speculative_v3`.
+- **Phase 4: T4 Benchmark Rigor & Diagnostics (`benchmark.py`)**:
+  - Implemented `GraphedCausalRunner` base-model-only bucketed CUDA Graph runner ($Q=1$) to measure true systems speedup.
+  - Added first-divergence diagnostic logger for greedy baseline mismatches reporting exact base model top-2 logit margins.
+  - Exposed `--q_a` and `--tree_mode` CLI parameters in `benchmark.py`.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` verified clean compilation across all modules.
+  - `git diff --check` verified clean formatting with no trailing whitespace or extra newlines.
+
 

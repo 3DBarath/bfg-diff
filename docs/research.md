@@ -546,6 +546,17 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
 - Replaces repetitive KV tensor expansions (`repeat_kv`) with PyTorch native Grouped-Query Attention (`enable_gqa=True`) in `F.scaled_dot_product_attention`.
 - Guarded by runtime probe checking device, dtype, head configuration, and 4D additive float attention masks (`attn_mask`) against reference outputs (`max_abs_diff <= 1e-2`), automatically falling back to `repeat_kv` on non-compliant backends.
 
+#### D. Generic Static-Shape Tree Verifier ($Q_A \in \{8, 16\}$)
+- Decouples verification tile size $Q_A$ from the draft sequence window $W$ (`q_a: Optional[int] = None`, defaulting to $W + 1$). Allows high-throughput $Q_A = 16$ tree verification tiles on CUDA while keeping $W = 7$ drafter architecture intact (`slot_emb` size 8 untouched).
+- Dynamic topological tree generator (`build_topk_tree`) expands top-$k$ branch candidates from draft logits using best-first priority queue search, constructing an arbitrary tree candidate tile of size $Q_A$ with strict topological ordering (`parent[i] < i`).
+- Invariant CUDA Graph Replay: because positional RoPE embedding in `_step_verify_kernel` depends on `static_pos_verify` ($t + \text{depth}$) while KV cache scatter uses $t + \text{slot}$, the exact same captured bucketed CUDA Graph executes any tree topology of size $Q_A$ without recompilation.
+- Overwrite-Safe Ascending KV Compaction: accepted root-to-leaf paths $[0, n_1, \dots, n_k]$ satisfy $n_m \ge m$. Compacting KV cache entries in ascending order ($t + n_m \to t + m$) guarantees zero overwriting of uncompacted slots, updating both target KV cache and CUDA draft KV cache in place.
+
+#### E. T4 Benchmark Rigor & Margin Diagnostics
+- Implemented `GraphedCausalRunner`: base-model-only bucketed CUDA Graph runner ($Q=1$) using identical static KV cache, bucket dispatch, and memory layout to report true system speculative speedup without python/framework dispatch overheads.
+- First-divergence diagnostic logger: on greedy baseline mismatches, extracts context up to the divergence step, evaluates base model logits, and outputs the top-2 logit margin to identify floating-point boundary sensitivity.
+- Exposed `--q_a` and `--tree_mode` (`auto`, `linear`, `tree`) CLI options in `benchmark.py`.
+
 
 
 
