@@ -135,7 +135,8 @@ class V3ModelManager:
             draft_vocab_ids = None
             if self.draft_vocab and Path(self.draft_vocab).exists():
                 print(f"[V3ModelManager] Loading draft vocab IDs from {self.draft_vocab}...")
-                draft_vocab_ids = torch.load(self.draft_vocab, map_location=self.device)
+                loaded = torch.load(self.draft_vocab, map_location=self.device)
+                draft_vocab_ids = loaded["draft_vocab_ids"] if isinstance(loaded, dict) else loaded
                 print(f"[V3ModelManager] Loaded {len(draft_vocab_ids)} draft vocab IDs.")
 
             engine = StaticDraftEngine(

@@ -134,10 +134,12 @@ class StaticDraftEngine:
 
         # Draft Vocabulary Pruning
         self.draft_vocab_ids = None
+        self._draft_vocab_list = None
         self.draft_lm_head_w = None
         self.draft_lm_head_b = None
         if draft_vocab_ids is not None:
             self.draft_vocab_ids = draft_vocab_ids.to(device=self.device, dtype=torch.long).contiguous()
+            self._draft_vocab_list = self.draft_vocab_ids.cpu().tolist()
             self.draft_lm_head_w = self.base_model.lm_head.weight[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
             if getattr(self.base_model.lm_head, "bias", None) is not None:
                 self.draft_lm_head_b = self.base_model.lm_head.bias[self.draft_vocab_ids].detach().to(device=self.device, dtype=self.dtype).contiguous()
@@ -162,24 +164,30 @@ class StaticDraftEngine:
         self.supports_enable_gqa = False
         if self.num_heads != self.num_kv_heads:
             try:
-                # Probe with exact shapes, device, dtype, and 4D float mask
-                probe_q = torch.zeros(1, self.num_heads, 1, self.head_dim, dtype=self.dtype, device=self.device)
-                probe_k = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
-                probe_v = torch.zeros(1, self.num_kv_heads, 2, self.head_dim, dtype=self.dtype, device=self.device)
-                probe_mask = torch.zeros(1, 1, 1, 2, dtype=self.dtype, device=self.device)
-                probe_mask[0, 0, 0, 1] = -1e4
+                with torch.no_grad():
+                    # Deterministic non-zero tensors with non-trivial 4D mask
+                    q_len, kv_len = 8, 16
+                    probe_q = torch.linspace(-1, 1, self.num_heads * q_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_q = probe_q.view(1, self.num_heads, q_len, self.head_dim)
+                    probe_k = torch.linspace(-0.5, 0.5, self.num_kv_heads * kv_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_k = probe_k.view(1, self.num_kv_heads, kv_len, self.head_dim)
+                    probe_v = torch.linspace(0.1, 0.9, self.num_kv_heads * kv_len * self.head_dim, dtype=self.dtype, device=self.device)
+                    probe_v = probe_v.view(1, self.num_kv_heads, kv_len, self.head_dim)
 
-                # Reference output via repeat_kv
-                k_rep = repeat_kv(probe_k, self.num_heads // self.num_kv_heads)
-                v_rep = repeat_kv(probe_v, self.num_heads // self.num_kv_heads)
-                out_ref = F.scaled_dot_product_attention(probe_q, k_rep, v_rep, attn_mask=probe_mask)
+                    probe_mask = torch.zeros(1, 1, q_len, kv_len, dtype=self.dtype, device=self.device)
+                    probe_mask[:, :, :, kv_len // 2:] = -1e4
 
-                # Test enable_gqa=True
-                out_gqa = F.scaled_dot_product_attention(probe_q, probe_k, probe_v, attn_mask=probe_mask, enable_gqa=True)
-                diff = (out_ref - out_gqa).abs().max().item()
-                tol = 1e-2 if self.dtype in (torch.float16, torch.bfloat16) else 1e-4
-                if diff <= tol:
-                    self.supports_enable_gqa = True
+                    # Reference output via repeat_kv
+                    k_rep = repeat_kv(probe_k, self.num_heads // self.num_kv_heads)
+                    v_rep = repeat_kv(probe_v, self.num_heads // self.num_kv_heads)
+                    out_ref = F.scaled_dot_product_attention(probe_q, k_rep, v_rep, attn_mask=probe_mask)
+
+                    # Test enable_gqa=True
+                    out_gqa = F.scaled_dot_product_attention(probe_q, probe_k, probe_v, attn_mask=probe_mask, enable_gqa=True)
+                    diff = (out_ref - out_gqa).abs().max().item()
+                    tol = 1e-2 if self.dtype in (torch.float16, torch.bfloat16) else 1e-4
+                    if diff <= tol:
+                        self.supports_enable_gqa = True
             except Exception:
                 self.supports_enable_gqa = False
 
@@ -981,6 +989,7 @@ def generate_speculative_v3(
             dtype=dtype,
             use_cuda_graph=use_cuda_graph,
             hedge_margin=hedge_margin,
+            draft_vocab_ids=getattr(engine, "draft_vocab_ids", None),
         )
 
     v_tokens = engine.v_tokens
@@ -1072,7 +1081,11 @@ def generate_speculative_v3(
             top2_inds = top2.indices.tolist()
             v1, v2 = top2_vals[0], top2_vals[1]
             raw_d0_1, raw_d0_2 = top2_inds[0], top2_inds[1]
-            if engine.draft_vocab_ids is not None:
+            draft_v_list = getattr(engine, "_draft_vocab_list", None)
+            if draft_v_list is not None:
+                d0_1 = draft_v_list[raw_d0_1]
+                d0_2 = draft_v_list[raw_d0_2]
+            elif getattr(engine, "draft_vocab_ids", None) is not None:
                 d0_1 = int(engine.draft_vocab_ids[raw_d0_1].item())
                 d0_2 = int(engine.draft_vocab_ids[raw_d0_2].item())
             else:

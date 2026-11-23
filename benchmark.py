@@ -19,6 +19,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -189,7 +190,8 @@ def run_benchmark(
     draft_vocab_ids = None
     if draft_vocab and Path(draft_vocab).exists():
         print(f"Loading draft vocab IDs from {draft_vocab}...")
-        draft_vocab_ids = torch.load(draft_vocab, map_location=device)
+        loaded = torch.load(draft_vocab, map_location=device)
+        draft_vocab_ids = loaded["draft_vocab_ids"] if isinstance(loaded, dict) else loaded
         print(f"Loaded {len(draft_vocab_ids)} draft vocab IDs.")
 
     if checkpoint and Path(checkpoint).exists():
