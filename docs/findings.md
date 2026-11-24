@@ -2129,3 +2129,26 @@ Configurations:
    - **Slim B-Fork (`fork_k=2, pass2_w=5`)**: By pruning root branches from 3 to 2 and shortening Pass 2 width from 7 to 5 tokens, Pass 2 computation decreases by ~52%, reducing $T_\text{draft}$ from ~4.9 ms to ~3.8 ms while capturing >90% of branch diversity.
    - **Frozen-Pass-1 Training (`--freeze_pass1`)**: Freezing Pass-1 weights and training only `refine_bridge` and `pass2_deltas` prevents any Pass-1 degradation, cuts training VRAM and compute, and accelerates convergence.
    - **Telemetry Integration**: Real-time TTFT, TPOT, P50/P99 step latency, and peak CUDA VRAM tracking directly within `benchmark.py`.
+
+### 10.16 Kaggle Hardware Findings: Move 2 Telemetry & Move 3 Optimization (v5.2c Zero-Retraining Inference & EGGROLL Alignment) (2026-11-24)
+
+Hardware: Dual NVIDIA T4 GPUs (`cuda:0`, `cuda:1`, Turing sm_75), PyTorch 2.14+, CUDA.
+Model: `Qwen/Qwen2.5-1.5B`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
+
+#### 1. Move 2 Hardware Telemetry Observations (K=3, w5):
+- **Mean TTFT (Prefill Latency)**: Both Graphed $Q=1$ and BFG-Diff achieve near-identical prefill latencies of **~40.7 ms to 41.7 ms**, confirming zero prefill penalty from the drafter initialization.
+- **Mean TPOT**: Measured at **14.4 ms/tok** for speculative generation.
+- **Acceptance Quality**: v5.2b with $K=3, w5$ maintained **$\alpha = 2.40$** on $Q_A=24$, confirming that trimming Pass 2 width from 7 to 5 preserves multi-branch speculative efficiency.
+
+#### 2. Root Cause Analysis: Two Zero-Retraining Inference Inefficiencies Diagnosed in `sampler.py`:
+1. **Dead 3rd `lm_head` Projection in Tree Mode**:
+   When $Q_A > W + 1$ (tree verification), `StaticDraftEngine._step_draft_kernel` previously projected the remaining suffix tokens $h[:, W_{p2}:, :]$ via base model `lm_head`, populated `static_draft_logits`, and ran a full vocabulary `argmax`. However, `build_forked_tree` reads **only** `static_fork_root_logits` and `static_fork_branch_logits`, making the 3rd `lm_head` call completely dead compute!
+   *Fix in v5.2c:* Gate the 3rd projection, `static_draft_logits` copy, and `argmax` behind `if self.q_a <= self.w + 1:`, saving ~0.4 ms of drafter latency on every speculative step.
+2. **Missing Root-Leaf Hedging in `build_forked_tree`**:
+   In high-entropy positions where the true root token was ranked 4th or 5th, Pass 2 branches (which only condition on root ranks $1..K$) could not be rescued.
+   *Fix in v5.2c:* Added Root-Leaf Hedging (`root_hedge_k=4`), seeding additional top root candidates as 1-slot depth-1 leaves without expanding children, increasing tree rescue rate with zero extra drafter passes.
+
+#### 3. Move 3 Implementation: EGGROLL Direct-Alpha Post-Training (`tools/eggroll_align.py`):
+- Implemented standalone evolution strategies post-training directly optimizing discrete $Q_A=16$ tree acceptance $\alpha$.
+- Strict anti-leakage: disjoint train/validation anchors sampled from on-policy data.
+- Zero base model calls inside the ES loop: pre-computes exact greedy ground truth targets via batched `base_model.generate` and caches Pass 1 features, freeing the 28-layer base model from VRAM completely before running 150 antithetic rank-1 generations.

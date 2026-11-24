@@ -604,22 +604,24 @@ class StaticDraftEngine:
 
                 self.static_fork_branch_logits.copy_(branch_logits)
 
-                # Populate backward-compatible self.static_draft_logits
-                self.static_draft_logits[:, 0:1].copy_(z1_s0)
-                self.static_draft_logits[:, 1:W_p2].copy_(branch_logits[0:1])
-                if W_p2 < self.w:
-                    h_rem = self.drafter.norm(h[:, W_p2:, :])
-                    if self.draft_lm_head_w is not None:
-                        rem_logits = F.linear(h_rem, self.draft_lm_head_w, self.draft_lm_head_b)
-                    else:
-                        rem_logits = self.drafter.lm_head(h_rem)
-                    self.static_draft_logits[:, W_p2:].copy_(rem_logits)
+                # In tree mode (q_a > w + 1), build_forked_tree reads ONLY fork buffers.
+                # Skip dead 3rd lm_head projection, static_draft_logits copy, and argmax.
+                if self.q_a <= self.w + 1:
+                    self.static_draft_logits[:, 0:1].copy_(z1_s0)
+                    self.static_draft_logits[:, 1:W_p2].copy_(branch_logits[0:1])
+                    if W_p2 < self.w:
+                        h_rem = self.drafter.norm(h[:, W_p2:, :])
+                        if self.draft_lm_head_w is not None:
+                            rem_logits = F.linear(h_rem, self.draft_lm_head_w, self.draft_lm_head_b)
+                        else:
+                            rem_logits = self.drafter.lm_head(h_rem)
+                        self.static_draft_logits[:, W_p2:].copy_(rem_logits)
 
-                if self.draft_vocab_ids is not None:
-                    local_ids = torch.argmax(self.static_draft_logits, dim=-1)
-                    self.static_draft_ids.copy_(self.draft_vocab_ids[local_ids])
-                else:
-                    self.static_draft_ids.copy_(torch.argmax(self.static_draft_logits, dim=-1))
+                    if self.draft_vocab_ids is not None:
+                        local_ids = torch.argmax(self.static_draft_logits, dim=-1)
+                        self.static_draft_ids.copy_(self.draft_vocab_ids[local_ids])
+                    else:
+                        self.static_draft_ids.copy_(torch.argmax(self.static_draft_logits, dim=-1))
             else:
                 h_norm1 = self.drafter.norm(h[:, :self.w - 1])
                 if self.draft_lm_head_w is not None:
@@ -1515,11 +1517,13 @@ def build_forked_tree(
     draft_vocab_list: Optional[List[int]] = None,
     draft_vocab_ids: Optional[torch.Tensor] = None,
     k_per_step: int = 3,
+    root_hedge_k: int = 4,
 ) -> Tuple[List[int], List[int], List[int]]:
     """Build a static tree candidate tile of size Q_A from B-Fork multi-branch draft outputs.
 
     Slot 0: y* (placeholder 0, depth 0)
     Branches 1..K: conditioned on concrete root token root_global_ids[k].
+    Root-Leaf Hedging: top root candidates up to root_hedge_k seeded as depth-1 leaves if not in root_local_ids.
     Suffix slots expand greedily from branch_logits[k, suffix_idx] along each branch.
 
     Returns:
@@ -1539,14 +1543,35 @@ def build_forked_tree(
     tree_parents = [-1]    # slot 0 has no parent
     tree_depths = [0]      # slot 0 is at depth 0 (pos t)
 
-    # Seed heap with top-K root candidates at depth 1 via single GPU-to-CPU transfers
+    # 1. Seed branches 0..K-1 as full expandable Pass-2 branches (suffix_step = -1)
     root_vals_list = root_log_probs[root_local_ids].tolist()
     root_globals_list = root_global_ids.tolist()
+    seen_root_locals = set(root_local_ids.tolist())
+
     for k in range(K):
         val = float(root_vals_list[k])
         glob_id = int(root_globals_list[k])
-        # Seed item: cum_lp = val, depth = 1, parent_slot = 0, tok = glob_id, branch_idx = k, suffix_step = -1
         heapq.heappush(heap, (-val, 1, 0, glob_id, k, -1))
+
+    # 2. Root-Leaf Hedging: top root candidates up to root_hedge_k seeded as depth-1 1-slot leaves
+    k_root = max(K, min(root_hedge_k, root_log_probs.shape[-1]))
+    topk_root_vals, topk_root_inds = torch.topk(root_log_probs, k=k_root)
+    topk_root_vals_list = topk_root_vals.tolist()
+    topk_root_inds_list = topk_root_inds.tolist()
+
+    for r_idx in range(k_root):
+        loc_id = topk_root_inds_list[r_idx]
+        if loc_id not in seen_root_locals:
+            val = float(topk_root_vals_list[r_idx])
+            if draft_vocab_list is not None:
+                glob_id = draft_vocab_list[loc_id]
+            elif draft_vocab_ids is not None:
+                glob_id = int(draft_vocab_ids[loc_id].item())
+            else:
+                glob_id = loc_id
+            seen_root_locals.add(loc_id)
+            # Suffix step = W_minus_1 so it is a dead-end leaf and never expands children
+            heapq.heappush(heap, (-val, 1, 0, glob_id, -1, W_minus_1))
 
     # Pre-extract top candidates for each branch's suffix steps using ONE batched top-k
     # branch_log_probs: (K, W - 1, V_d)
@@ -1579,12 +1604,13 @@ def build_forked_tree(
         tree_parents.append(p_slot)
         tree_depths.append(depth)
 
-        # Expand child candidates along the branch b_idx if within suffix steps
-        next_s = s_step + 1
-        if next_s < W_minus_1:
-            for val, gid in branch_topk[b_idx][next_s]:
-                next_val = -neg_p + val
-                heapq.heappush(heap, (-next_val, depth + 1, cur_slot, gid, b_idx, next_s))
+        # Expand child candidates along the branch b_idx if within suffix steps (b_idx >= 0)
+        if b_idx >= 0:
+            next_s = s_step + 1
+            if next_s < W_minus_1:
+                for val, gid in branch_topk[b_idx][next_s]:
+                    next_val = -neg_p + val
+                    heapq.heappush(heap, (-next_val, depth + 1, cur_slot, gid, b_idx, next_s))
 
     # Pad if tree didn't reach q_a
     while len(tree_tokens) < q_a:

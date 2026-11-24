@@ -383,6 +383,8 @@ def run_benchmark(
     draft_vocab: Optional[str] = None,
     q_a: Optional[int] = None,
     tree_mode: str = "auto",
+    fork_k_override: Optional[int] = None,
+    max_draft_vocab: Optional[int] = None,
 ):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -425,7 +427,7 @@ def run_benchmark(
         pass2_layers=arch_kwargs.get("pass2_layers", 1),
         refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
         pass2_mode=arch_kwargs.get("pass2_mode", "soft"),
-        fork_k=arch_kwargs.get("fork_k", 3),
+        fork_k=fork_k_override if fork_k_override is not None else arch_kwargs.get("fork_k", 3),
         pass2_w=arch_kwargs.get("pass2_w", None),
     )
 
@@ -434,7 +436,26 @@ def run_benchmark(
         print(f"Loading draft vocab IDs from {draft_vocab}...")
         loaded = torch.load(draft_vocab, map_location=device)
         draft_vocab_ids = loaded["draft_vocab_ids"] if isinstance(loaded, dict) else loaded
-        print(f"Loaded {len(draft_vocab_ids)} draft vocab IDs.")
+        if max_draft_vocab is not None and max_draft_vocab < len(draft_vocab_ids):
+            # Keep essential special tokens included
+            vocab_special = [0, 1, 2, mask_id, tok.eos_token_id]
+            special_set = {s for s in vocab_special if s is not None}
+            sliced_tokens = []
+            seen = set()
+            for s in special_set:
+                sliced_tokens.append(int(s))
+                seen.add(int(s))
+            for tid in draft_vocab_ids.tolist():
+                tid = int(tid)
+                if tid not in seen:
+                    sliced_tokens.append(tid)
+                    seen.add(tid)
+                if len(sliced_tokens) >= max_draft_vocab:
+                    break
+            draft_vocab_ids = torch.tensor(sliced_tokens, dtype=torch.long, device=device)
+            print(f"Sliced draft vocab IDs to top {len(draft_vocab_ids)} (preserving special tokens).")
+        else:
+            print(f"Loaded {len(draft_vocab_ids)} draft vocab IDs.")
 
     if ckpt_payload is not None:
         drafter.load_state_dict(ckpt_payload["drafter_state_dict"], strict=False)
@@ -853,6 +874,8 @@ def main():
     p.add_argument("--draft_vocab", type=str, default=None, help="Path to draft_vocab_ids tensor")
     p.add_argument("--q_a", type=int, default=None, help="Verification tile size Q_A (e.g. 8 or 16, default: v_tokens + 1)")
     p.add_argument("--tree_mode", type=str, default="auto", choices=["auto", "linear", "tree"], help="Tree verification mode")
+    p.add_argument("--fork_k_override", type=int, default=None, help="Override fork_k (e.g. 1, 2, or 3) for ablation")
+    p.add_argument("--max_draft_vocab", type=int, default=None, help="Cap loaded draft vocab (e.g. 16384)")
     args = p.parse_args()
 
     run_benchmark(
@@ -870,6 +893,8 @@ def main():
         draft_vocab=args.draft_vocab,
         q_a=args.q_a,
         tree_mode=args.tree_mode,
+        fork_k_override=args.fork_k_override,
+        max_draft_vocab=args.max_draft_vocab,
     )
 
 

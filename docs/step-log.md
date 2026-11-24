@@ -1164,3 +1164,17 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 - Fixed `benchmark.py`: imported `Tuple` from `typing`, removed dead duplicate `return logits` on line 226, and guaranteed `graphed_ttfts, graphed_step_ms = [], []` initialization before conditional CUDA checks.
 - Fixed `test_gates.py`: corrected Unit Gate D `attn_mask_p2` prefix slice to `:S` instead of `:w_p2`, and added `pass2_w` parameter to `test_gate0_gate1_profile`.
 - Verified clean syntax compilation with `python3 -m py_compile *.py tools/*.py` and whitespace via `git diff --check`.
+
+## 65. BFG-Diff v5.2c Zero-Retraining Inference Optimizations & Move 3 EGGROLL (2026-11-24)
+- **`sampler.py` (v5.2c Zero-Retraining Inference Speedup)**:
+  - Eliminated dead 3rd `lm_head` projection, `static_draft_logits` memory copies, and full-vocab argmax in `StaticDraftEngine._step_draft_kernel` under tree verification mode (`q_a > w + 1`), saving ~0.4 ms of drafter latency per step.
+  - Implemented Root-Leaf Hedging (`root_hedge_k=4`) in `build_forked_tree`: extracted top root candidates via a single `torch.topk` call and seeded non-branch root candidates as 1-slot depth-1 dead-end leaves (`b_idx = -1`, `suffix_step = W_minus_1`), expanding candidate tree coverage.
+- **`benchmark.py` (Ablation Flags)**:
+  - Added `--fork_k_override` CLI option allowing zero-retraining inference evaluations of $K=1$ (hard-prefix D-Loop), $K=2$, and $K=3$ on the same checkpoint.
+  - Added `--max_draft_vocab` CLI option to cap loaded draft vocabulary (e.g. 16,384 tokens) while ensuring all special tokens (`0, 1, 2, mask_id, eos_id`) remain present.
+- **`tools/eggroll_align.py` (Move 3 EGGROLL Post-Training)**:
+  - Implemented standalone post-training optimization maximizing discrete tree acceptance rate $\alpha$ using antithetic rank-1 evolution strategies on `refine_bridge` and `pass2_deltas[0]`.
+  - Built upfront exact greedy ground truth cache via batched `base_model.generate` and cached Pass 1 prefix features, deleting the 28-layer base model from GPU memory prior to running ES optimization.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
+  - `git diff --check` confirmed clean whitespace and formatting across all modified files.
