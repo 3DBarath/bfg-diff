@@ -1158,3 +1158,9 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
   - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
   - Unit tests in `test_units.py` and verification in `test_gates.py` passed.
   - `git diff --check` confirmed clean formatting.
+
+## 64. BFG-Diff v5.2b Post-Merge Bugfixes (2026-11-24)
+- Fixed missing `import time` in `sampler.py`.
+- Fixed `benchmark.py`: imported `Tuple` from `typing`, removed dead duplicate `return logits` on line 226, and guaranteed `graphed_ttfts, graphed_step_ms = [], []` initialization before conditional CUDA checks.
+- Fixed `test_gates.py`: corrected Unit Gate D `attn_mask_p2` prefix slice to `:S` instead of `:w_p2`, and added `pass2_w` parameter to `test_gate0_gate1_profile`.
+- Verified clean syntax compilation with `python3 -m py_compile *.py tools/*.py` and whitespace via `git diff --check`.

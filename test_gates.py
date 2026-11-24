@@ -461,7 +461,7 @@ def test_unit_gate_d(
                 tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, w_p2)
                 h_tap_used = (h_tap if h_tap is not None else h)[:, :w_p2, :]
                 pos_draft_p2 = pos_draft[:, :w_p2]
-                attn_mask_p2 = torch.cat([attn_mask[:, :, :w_p2, :w_p2], attn_mask[:, :, :w_p2, S : S + w_p2]], dim=-1) if w_p2 < w else attn_mask
+                attn_mask_p2 = torch.cat([attn_mask[:, :, :w_p2, :S], attn_mask[:, :, :w_p2, S : S + w_p2]], dim=-1) if w_p2 < w else attn_mask
 
                 h2 = drafter.refine_bridge(tok_emb_2, h_tap_used, f_last)
                 for layer_idx in range(p2_start, drafter.k_layers):
@@ -570,6 +570,7 @@ def test_gate0_gate1_profile(
     refine_bottleneck: int = 256,
     pass2_mode: str = "soft",
     fork_k: int = 3,
+    pass2_w: Optional[int] = None,
 ) -> dict:
     """Gate 0 and Gate 1: Hardware roofline & draft cost ratio profiling with populated P=128 KV cache."""
     print("\n" + "=" * 60)

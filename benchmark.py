@@ -19,7 +19,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import time
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -223,7 +223,6 @@ class GraphedCausalRunner:
         sync_device()
         ttft_ms = (time.perf_counter() - t_start) * 1000.0
         return logits, ttft_ms
-        return logits
 
     def step(self, token: torch.Tensor, cur_pos: int) -> torch.Tensor:
         S_b = self.get_bucket(cur_pos)
@@ -532,6 +531,7 @@ def run_benchmark(
 
     # 3. Baseline 3: Base-Model-Only Graphed Causal Runner (Q=1)
     graphed_q1_tps = None
+    graphed_ttfts, graphed_step_ms = [], []
     if device == "cuda" and batch_size == 1:
         try:
             print("\n[3/4] Running Base-Model-Only Graphed Causal Baseline (Q=1)...")
