@@ -532,7 +532,7 @@ def main():
             # sum_i f_hat[i] * E_i
             E = perturbations_per_param[name]  # (pop_size, m, n)
             grad_est = (f_hat.view(-1, 1, 1) * E).mean(dim=0) / args.sigma
-            master_weights[name] += args.lr * grad_est.cpu()
+            master_weights[name] += args.lr * grad_est.to(master_weights[name].device)
             param.data.copy_(master_weights[name].to(device, dtype=param.dtype))
 
         elapsed_gen = time.perf_counter() - t_gen_start

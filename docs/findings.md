@@ -2152,3 +2152,23 @@ Model: `Qwen/Qwen2.5-1.5B`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
 - Implemented standalone evolution strategies post-training directly optimizing discrete $Q_A=16$ tree acceptance $\alpha$.
 - Strict anti-leakage: disjoint train/validation anchors sampled from on-policy data.
 - Zero base model calls inside the ES loop: pre-computes exact greedy ground truth targets via batched `base_model.generate` and caches Pass 1 features, freeing the 28-layer base model from VRAM completely before running 150 antithetic rank-1 generations.
+
+
+### Verified Controlled T4 Results: v5.2c, D-Loop ($K=1$) & EGGROLL (2026-11-25)
+
+Controlled evaluation on NVIDIA T4 (`Qwen/Qwen2.5-1.5B`, 50 unseen `GEN_PROMPTS`, `C=128`, `B=1`, `Q_A=16` Tree, Graphed `Q=1` baseline `49.1–49.2 TPS`):
+
+| Variant | Vocab | TPS (`vs Q=1` / `vs HF`) | Alpha | A_+1 / A_+2 / A_+3 / A_+4 | T_verify / T_draft | TTFT (vs Q=1) | TPOT | P50/P99 Step | Peak VRAM | Exact Match (Max Margin) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| v4.2 Tail Control | 32k | 77.4 (1.58x / 3.05x) | 2.32 | 69.7 / 40.5 / 18.6 / 6.9% | 24.55 / 3.56 ms | 41.66 ms (40.67) | 12.92 ms | 28.8 / 32.1 ms | 3987.0 MB | 76.0% (<=0.0312) |
+| v4.2 Tail Control | 16k | 76.5 (1.56x / 2.89x) | 2.27 | 67.4 / 39.5 / 17.1 / 5.9% | 24.60 / 3.28 ms | 40.16 ms (39.02) | 13.07 ms | 28.5 / 31.5 ms | 3780.9 MB | 82.0% (<=0.0312) |
+| v5.2c Slim B-Fork (K=2, w5) | 32k | 76.3 (1.55x / 2.87x) | 2.42 | 73.3 / 43.6 / 21.4 / 8.2% | 24.44 / 4.95 ms | 40.25 ms (38.82) | 13.10 ms | 30.5 / 33.7 ms | 4144.8 MB | 82.0% (<=0.0312) |
+| v5.2c Slim B-Fork (K=2, w5) | 16k | 75.4 (1.53x / 2.90x) | 2.35 | 70.0 / 41.4 / 19.3 / 6.8% | 24.77 / 4.54 ms | 41.01 ms (39.40) | 13.26 ms | 30.0 / 33.1 ms | 3951.9 MB | 80.0% (<=0.0312) |
+| D-Loop Style Ablation (K=1, w5) | 16k | 73.2 (1.49x / 2.86x) | 2.27 | 70.0 / 35.0 / 17.9 / 7.6% | 24.49 / 4.41 ms | 41.75 ms (40.35) | 13.65 ms | 29.9 / 32.6 ms | 3911.8 MB | 78.0% (<=0.0312) |
+| v5.2c + EGGROLL (150 gens) | 16k | 56.2 (1.14x / 2.17x) | 1.71 | 71.3 / 0.0 / 0.0 / 0.0% | 24.47 / 4.52 ms | 40.46 ms (39.18) | 17.79 ms | 29.9 / 31.5 ms | 3938.7 MB | 86.0% (<=0.0156) |
+
+#### Key Engineering Takeaways:
+1. **Dead 3rd `lm_head` removal + root-leaf hedging (`v5.2c`)** lifted `K=2 w5` from `2.33 -> 2.42` alpha (`A_+1: 63.8% -> 73.3%`, `T_draft: 5.43 -> 4.95 ms` at 32k, `4.54 ms` at 16k), setting a new `Q_A=16` acceptance record (`2.42`, Leaf-Hedge `44.3%`).
+2. **B-Fork (`K=2`) vs. D-Loop (`K=1`) controlled ablation** on identical weights: `K=2` gains `+6.4 pp` on `A_+2` (`41.4% vs 35.0%`), `+0.08` alpha (`2.35 vs 2.27`), and `+2.2 TPS` (`75.4 vs 73.2`) at nearly identical draft latency (`4.54 vs 4.41 ms`).
+3. **Inference provider telemetry:** TTFT overhead is only `+0.8 to +1.8 ms` (`~40.2–41.7 ms` vs `38.8–40.7 ms` Q=1), TPOT drops `-36%` (`20.36 -> 12.92–13.10 ms/tok`), Peak VRAM stays `3.78–4.15 GB`, and 100% of greedy mismatches across all runs occurred at base logit margins `<= 0.0312` (0–2 fp16 ULPs).
+4. **Negative result (EGGROLL discrete-alpha ES):** Optimizing discrete tree-match alpha (`pop=32, gens=150, sigma=0.005, lr=0.003`) drifted Pass-2 validation alpha from `3.0469 -> 1.7578` and collapsed unseen `A_+2..A_+4` to `0.0%` (frozen Pass 1 preserved `A_+1 = 71.3%`) due to flat step-function equality plateaus and unclipped LoRA perturbation drift.

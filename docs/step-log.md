@@ -1178,3 +1178,13 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 - **Verification**:
   - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
   - `git diff --check` confirmed clean whitespace and formatting across all modified files.
+
+
+## 66. Lock In v5.2c, D-Loop K=1, Provider Telemetry & EGGROLL Findings (2026-11-25)
+- **`tools/eggroll_align.py`**:
+  - Fixed CUDA device mismatch in master weight update (`master_weights[name] += args.lr * grad_est.to(master_weights[name].device)` instead of `.cpu()`).
+- **`docs/findings.md`**:
+  - Recorded the full controlled T4 benchmark table (`Qwen2.5-1.5B`, 50 unseen `GEN_PROMPTS`, `C=128`, `B=1`, `Q_A=16` Tree, Graphed `Q=1` baseline `49.1–49.2 TPS`) covering `v4.2 Tail Control` (32k/16k), `v5.2c Slim B-Fork (K=2, w5)` (32k/16k), `D-Loop Style Ablation (K=1, w5)` (16k), and `v5.2c + EGGROLL (150 gens)` (16k).
+  - Documented the 4 key engineering takeaways: `v5.2c` `Q_A=16` acceptance record (`2.42` alpha, Leaf-Hedge `44.3%`), `K=2` vs `K=1` controlled ablation (`+6.4 pp` on `A_+2`, `+2.2 TPS`), inference provider telemetry (`+0.8 to +1.8 ms` TTFT overhead, `-36%` TPOT, `3.78–4.15 GB` VRAM, `<= 0.0312` greedy mismatch margins), and the EGGROLL discrete-alpha ES negative result.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` and `git diff --check`.
