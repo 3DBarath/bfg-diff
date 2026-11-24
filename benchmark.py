@@ -182,8 +182,10 @@ class GraphedCausalRunner:
             print(f"[GraphedCausalRunner] CUDA Graph capture skipped/failed: {e}")
             self.cuda_graphs = {}
 
-    def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, float]:
         self.cache.reset()
+        sync_device()
+        t_start = time.perf_counter()
         B, P = input_ids.shape
         pos_ids = torch.arange(P, device=self.device).unsqueeze(0)
         mask = torch.triu(torch.full((1, 1, P, P), -1e4, dtype=self.dtype, device=self.device), diagonal=1)
@@ -218,6 +220,9 @@ class GraphedCausalRunner:
 
         h_last = self.base_model.model.norm(h[:, -1:])
         logits = self.base_model.lm_head(h_last)
+        sync_device()
+        ttft_ms = (time.perf_counter() - t_start) * 1000.0
+        return logits, ttft_ms
         return logits
 
     def step(self, token: torch.Tensor, cur_pos: int) -> torch.Tensor:
@@ -422,6 +427,7 @@ def run_benchmark(
         refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
         pass2_mode=arch_kwargs.get("pass2_mode", "soft"),
         fork_k=arch_kwargs.get("fork_k", 3),
+        pass2_w=arch_kwargs.get("pass2_w", None),
     )
 
     draft_vocab_ids = None
@@ -537,6 +543,7 @@ def run_benchmark(
                 dtype=base_dtype,
             )
             graphed_times, graphed_tokens = [], []
+            graphed_ttfts, graphed_step_ms = [], []
             for i in range(len(prompts)):
                 b_prompt = prompts[i]
                 inputs = tok(b_prompt, return_tensors="pt").to(device)
@@ -546,7 +553,8 @@ def run_benchmark(
                 sync_device()
                 t0 = time.perf_counter()
                 with torch.no_grad():
-                    logits = graphed_runner.prefill(p_ids)
+                    logits, ttft_val = graphed_runner.prefill(p_ids)
+                    graphed_ttfts.append(ttft_val)
                     if temperature == 0.0:
                         cur_tok = torch.argmax(logits, dim=-1)
                     else:
@@ -559,12 +567,15 @@ def run_benchmark(
                     else:
                         for step_idx in range(1, max_new_tokens):
                             cur_pos = P_len + step_idx - 1
+                            t_step_start = time.perf_counter()
                             logits_step = graphed_runner.step(cur_tok, cur_pos)
                             if temperature == 0.0:
                                 cur_tok = torch.argmax(logits_step, dim=-1)
                             else:
                                 probs = F.softmax(logits_step / max(1e-4, temperature), dim=-1)
                                 cur_tok = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(1, 1)
+                            sync_device()
+                            graphed_step_ms.append((time.perf_counter() - t_step_start) * 1000.0)
                             gen_tokens_count += 1
                             if tok.eos_token_id is not None and int(cur_tok.item()) == tok.eos_token_id:
                                 break
@@ -581,6 +592,8 @@ def run_benchmark(
     print("\n[4/4] Running BFG-Diff v4 Speculative Engine...")
     spec_times, spec_tokens_list = [], []
     spec_outputs = []
+    spec_ttfts = []
+    spec_step_ms = []
     total_accepted_drafts = 0
     total_draft_tokens = 0
     total_steps = 0
@@ -638,6 +651,10 @@ def run_benchmark(
         new_tok_count = (spec_out.shape[1] - input_ids.shape[1]) * len(b_prompts)
         spec_times.append(elapsed)
         spec_tokens_list.append(new_tok_count)
+        if "ttft_ms" in stats:
+            spec_ttfts.append(stats["ttft_ms"])
+        if "step_ms_list" in stats and stats["step_ms_list"]:
+            spec_step_ms.extend(stats["step_ms_list"])
         spec_gen_only = spec_out[:, input_ids.shape[1]:]
         spec_outputs.append(spec_gen_only.cpu())
 
@@ -765,7 +782,11 @@ def run_benchmark(
     print(f"{'T_verify (Q_A=%d)' % eng.q_a:<35}{'-':>15}{f'{t_verify_ms:.2f} ms':>15}")
     if getattr(drafter, 'num_draft_steps', 1) > 1:
         if getattr(drafter, "pass2_mode", "soft") == "bfork":
-            print(f"{'T_draft (%dL+%dLx%d B-Fork, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), getattr(drafter, 'fork_k', 3), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+            p2_w = getattr(drafter, "pass2_w", None)
+            if p2_w is not None and p2_w != eng.w:
+                print(f"{'T_draft (%dL+%dLx%d w%d B-Fork)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), getattr(drafter, 'fork_k', 3), p2_w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
+            else:
+                print(f"{'T_draft (%dL+%dLx%d B-Fork, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), getattr(drafter, 'fork_k', 3), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
         else:
             print(f"{'T_draft (%dL+%dL, W=%d)' % (eng.k_layers, getattr(drafter, 'pass2_layers', 1), eng.w):<35}{'-':>15}{f'{t_draft_ms:.2f} ms':>15}")
     else:
@@ -775,6 +796,38 @@ def run_benchmark(
         min_m = min(divergence_margins)
         max_m = max(divergence_margins)
         print(f"  [Divergence Margins Summary] Mismatches: {len(divergence_margins)}/{len(prompts)} | Min Margin: {min_m:.4f} | Max Margin: {max_m:.4f}")
+
+    # Provider Telemetry (TTFT, TPOT, Step Latency P50/P99, Peak VRAM)
+    def _pct(arr, q):
+        if not arr:
+            return 0.0
+        s = sorted(arr)
+        idx = int(round(q * (len(s) - 1)))
+        return s[max(0, min(idx, len(s) - 1))]
+
+    raw_tpot = 1000.0 / max(1e-4, raw_tps)
+    spec_tpot = 1000.0 / max(1e-4, spec_tps)
+    graphed_tpot = (1000.0 / max(1e-4, graphed_q1_tps)) if graphed_q1_tps is not None else None
+
+    mean_ttft_q1 = (sum(graphed_ttfts) / max(1, len(graphed_ttfts))) if graphed_ttfts else None
+    mean_ttft_spec = (sum(spec_ttfts) / max(1, len(spec_ttfts))) if spec_ttfts else None
+
+    p50_q1 = _pct(graphed_step_ms, 0.50) if graphed_step_ms else None
+    p99_q1 = _pct(graphed_step_ms, 0.99) if graphed_step_ms else None
+    p50_spec = _pct(spec_step_ms, 0.50) if spec_step_ms else None
+    p99_spec = _pct(spec_step_ms, 0.99) if spec_step_ms else None
+
+    peak_vram_mb = (torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    print("-" * 80)
+    print("INFERENCE PROVIDER TELEMETRY:")
+    print(f"{'Mean TTFT (ms)':<35}{f'{mean_ttft_q1:.2f} ms' if mean_ttft_q1 is not None else '-':>15}{f'{mean_ttft_spec:.2f} ms' if mean_ttft_spec is not None else '-':>15}")
+    print(f"{'Mean TPOT (ms/tok)':<35}{f'{graphed_tpot:.2f} ms' if graphed_tpot is not None else f'{raw_tpot:.2f} ms':>15}{f'{spec_tpot:.2f} ms':>15}")
+    q1_step_str = f"{p50_q1:.1f}/{p99_q1:.1f} ms" if p50_q1 is not None else "-"
+    spec_step_str = f"{p50_spec:.1f}/{p99_spec:.1f} ms" if p50_spec is not None else "-"
+    print(f"{'Step Latency P50 / P99 (ms)':<35}{q1_step_str:>15}{spec_step_str:>15}")
+    if peak_vram_mb is not None:
+        print(f"{'Peak CUDA VRAM (MB)':<35}{'-':>15}{f'{peak_vram_mb:.1f} MB':>15}")
     print(f"{'4-gram Entropy (H4)':<35}{ngram_entropy(all_raw_seqs):>15.3f}{ngram_entropy(all_spec_seqs):>15.3f}")
     print(f"{'4-gram Repetition (rep4)':<35}{repeat_rate(all_raw_seqs):>14.1%}{repeat_rate(all_spec_seqs):>14.1%}")
     print(f"{'Adjacent Duplication (adj_dup)':<35}{adj_dup(all_raw_seqs):>14.1%}{adj_dup(all_spec_seqs):>14.1%}")

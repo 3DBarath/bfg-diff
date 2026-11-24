@@ -282,6 +282,7 @@ class WeightTiedTopKDrafter(nn.Module):
         refine_bottleneck: int = 256,
         pass2_mode: str = "soft",
         fork_k: int = 3,
+        pass2_w: Optional[int] = None,
     ):
         super().__init__()
         self.k_layers = k_layers
@@ -293,6 +294,7 @@ class WeightTiedTopKDrafter(nn.Module):
         self.refine_bottleneck = refine_bottleneck
         self.pass2_mode = pass2_mode
         self.fork_k = fork_k
+        self.pass2_w = pass2_w
 
         # Frozen backbone references, kept out of _modules so that .to(), .train()
         # and .state_dict() never touch the 1.5B base model.
@@ -460,6 +462,7 @@ class WeightTiedTopKDrafter(nn.Module):
             "num_draft_steps": self.num_draft_steps,
             "pass2_mode": getattr(self, "pass2_mode", "soft"),
             "fork_k": getattr(self, "fork_k", 3),
+            "pass2_w": getattr(self, "pass2_w", None),
         }
 
     def fuse_stage1_features(self, all_hidden_states: Tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -688,9 +691,20 @@ class WeightTiedTopKDrafter(nn.Module):
                 z1_slot0 = self.lm_head(self.norm(h[:, 0:1, :]))  # (B, 1, V)
                 d0_ids = d0_override if d0_override is not None else z1_slot0[:, 0, :].argmax(dim=-1, keepdim=True)
                 d0_emb = self.embed_tokens(d0_ids)  # (B, 1, D)
-                tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, w)  # (B, W, D)
+
+                w_p2 = w if getattr(self, "pass2_w", None) is None else max(2, min(int(self.pass2_w), w))
+                tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, w_p2)  # (B, w_p2, D)
                 # Feed h_tap (pre-Pass-2 manifold tap) instead of post-Pass-1 h
-                h2 = self.refine_bridge(tok_emb_2, h_tap if h_tap is not None else h, f_ctx_last)
+                h_tap_p2 = (h_tap if h_tap is not None else h)[:, :w_p2, :]
+                pos_draft_p2 = pos_draft[:, :w_p2]
+
+                if attn_mask is not None and w_p2 < w:
+                    s_p = attn_mask.shape[-1] - w
+                    attn_mask_p2 = torch.cat([attn_mask[:, :, :w_p2, :s_p], attn_mask[:, :, :w_p2, s_p : s_p + w_p2]], dim=-1)
+                else:
+                    attn_mask_p2 = attn_mask
+
+                h2 = self.refine_bridge(tok_emb_2, h_tap_p2, f_ctx_last)
 
                 for layer_idx in range(p2_start, self.k_layers):
                     kp = k_prefix_list[layer_idx] if k_prefix_list is not None else None
@@ -698,14 +712,17 @@ class WeightTiedTopKDrafter(nn.Module):
                     h2, _, _ = self.forward_draft_layer(
                         layer_idx=layer_idx,
                         hidden_states=h2,
-                        pos_draft=pos_draft,
+                        pos_draft=pos_draft_p2,
                         k_prefix=kp,
                         v_prefix=vp,
-                        attn_mask=attn_mask,
+                        attn_mask=attn_mask_p2,
                         use_pass2=True,
                     )
 
-                z2_suffix = self.lm_head(self.norm(h2[:, 1:, :]))  # (B, W - 1, V)
+                z2_suffix = self.lm_head(self.norm(h2[:, 1:, :]))  # (B, w_p2 - 1, V)
+                if w_p2 < w:
+                    z1_rem = self.lm_head(self.norm(h[:, w_p2:, :]))
+                    return torch.cat([z1_slot0, z2_suffix, z1_rem], dim=1)  # (B, W, V)
                 return torch.cat([z1_slot0, z2_suffix], dim=1)  # (B, W, V)
             else:
                 # Pass 2: Differentiable soft embedding refinement (v5.1 default)
@@ -806,6 +823,7 @@ def prepare_v3(
     refine_bottleneck: int = 256,
     pass2_mode: str = "soft",
     fork_k: int = 3,
+    pass2_w: Optional[int] = None,
 ) -> Tuple[AutoModelForCausalLM, WeightTiedTopKDrafter, AutoTokenizer, int]:
     """Prepare frozen base model + standalone WeightTiedTopKDrafter."""
     if device is None:
@@ -832,6 +850,7 @@ def prepare_v3(
         refine_bottleneck=refine_bottleneck,
         pass2_mode=pass2_mode,
         fork_k=fork_k,
+        pass2_w=pass2_w,
     ).to(device)
 
     # Drafter trainable parameters in fp32 for stable training

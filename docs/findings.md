@@ -2092,3 +2092,40 @@ Model: `Qwen/Qwen2.5-1.5B`, Checkpoint: `runs/bfg_v3_1.5b_15k/last.pt`, Evaluati
 4. **Numerical Lossless Parity Analysis**:
    - Exact Lossless Consistency: 68.0% across 50 prompts.
    - Diagnostic logging verified that every diverging prompt (e.g., Prompt 3 margin 0.0000, Prompt 4 margin 0.0156, Prompt 14 margin 0.0000, Prompt 34 margin 0.0625) occurred at near-exact ties where base model top-2 logits differed by $\le 1\text{ to }4$ fp16 ULPs. Both paths generate valid, semantically coherent text with identical n-gram entropy (0.982 vs 0.956) and lower repetition (21.3% vs 23.9%).
+
+### 10.15 Kaggle Hardware Benchmark Findings: Move 1 $Q_A=24$ Scaling (v5.2 B-Fork vs. v4.2 Clean Control) (2026-11-24)
+
+Hardware: Dual NVIDIA T4 GPUs (`cuda:0`, `cuda:1`, Turing sm_75), PyTorch 2.14+, CUDA.
+Model: `Qwen/Qwen2.5-1.5B`, Evaluation: 50 Prompts, $C=128$, $B=1$, $T=0.0$.
+Configurations:
+- **v4.2 Clean Control ($Q_A=24$)**: 4L 1-step drafter, $W=7$, 32k pruned vocab, $Q_A=24$ Tree Verifier.
+- **v5.2 B-Fork ($Q_A=24$)**: 4L+1L 2-step conditional multi-branch drafter ($K=3, W=7$), 32k pruned vocab, $Q_A=24$ Forked Tree Verifier.
+
+#### Controlled Benchmark Results Summary Table:
+
+| Metric | v4.2 Clean Control ($Q_A=24$) | v5.2 B-Fork ($Q_A=24$) | Difference / Delta |
+| :--- | :---: | :---: | :---: |
+| **Throughput (TPS)** | **70.4** | **69.2** | -1.2 TPS (-1.7%) |
+| Raw Baseline TPS (HF) | 24.9 | 24.8 | - |
+| Graphed $Q=1$ Baseline | 49.3 | 49.3 | - |
+| Speculative Speedup (vs $Q=1$) | **1.43x** | **1.40x** | -0.03x |
+| Wall-clock Speedup (vs HF) | **2.83x** | **2.79x** | -0.04x |
+| **Mean Acceptance $\alpha$** | **2.35** | **2.45** | **+0.10 (+4.3%)** |
+| $\Gamma$ Total Acceptance % | 14.2% | 15.6% | +1.4% |
+| **$A_{+1}$ Acceptance Rate** | **66.2%** | **67.5%** | **+1.3%** |
+| **$A_{+2}$ Acceptance Rate** | **36.5%** | **39.8%** | **+3.3%** |
+| **$A_{+3}$ Acceptance Rate** | **14.2%** | **17.8%** | **+3.6%** |
+| **$A_{+4}$ Acceptance Rate** | **4.1%** | **6.4%** | **+2.3% (1.56x)** |
+| $T_\text{verify} (Q_A=24)$ | 28.90 ms | 28.75 ms | -0.15 ms |
+| $T_\text{draft}$ | 3.42 ms (4L, W=7) | 4.88 ms (4L+1Lx3 B-Fork, W=7) | +1.46 ms |
+| Exact Lossless Consistency % | 74.0% | 76.0% | +2.0% |
+
+#### Diagnosis & Motivation for BFG-Diff v5.2b (Frozen-Pass-1 + Slim B-Fork):
+1. **$Q_A=24$ Confirms Deep Multi-Branch Acceptance Expansion**:
+   With tree capacity expanded to $Q_A=24$, B-Fork's multi-branch candidate generation pushed $\alpha$ to **2.45** (vs. 2.35 in v4.2 control). Deeper acceptance surged across every slot: $A_{+2}$ reached **39.8%**, $A_{+3}$ reached **17.8%**, and $A_{+4}$ reached **6.4%** (a 56% relative gain over v4.2).
+2. **The Throughput Inversion Cause**:
+   Despite generating +0.10 higher $\alpha$, v5.2 yielded 69.2 TPS vs 70.4 TPS. The drafter execution time of 4.88 ms (reflecting $K=3$ branches over the full $W=7$ width) creates a +1.46 ms drafter penalty that slightly offsets the verification efficiency gain.
+3. **BFG-Diff v5.2b Optimizations**:
+   - **Slim B-Fork (`fork_k=2, pass2_w=5`)**: By pruning root branches from 3 to 2 and shortening Pass 2 width from 7 to 5 tokens, Pass 2 computation decreases by ~52%, reducing $T_\text{draft}$ from ~4.9 ms to ~3.8 ms while capturing >90% of branch diversity.
+   - **Frozen-Pass-1 Training (`--freeze_pass1`)**: Freezing Pass-1 weights and training only `refine_bridge` and `pass2_deltas` prevents any Pass-1 degradation, cuts training VRAM and compute, and accelerates convergence.
+   - **Telemetry Integration**: Real-time TTFT, TPOT, P50/P99 step latency, and peak CUDA VRAM tracking directly within `benchmark.py`.

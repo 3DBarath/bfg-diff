@@ -131,6 +131,7 @@ class V3ModelManager:
                 refine_bottleneck=arch_kwargs.get("refine_bottleneck", 256),
                 pass2_mode=arch_kwargs.get("pass2_mode", "soft"),
                 fork_k=arch_kwargs.get("fork_k", 3),
+                pass2_w=arch_kwargs.get("pass2_w", None),
             )
 
             if ck_payload is not None:

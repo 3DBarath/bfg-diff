@@ -140,6 +140,7 @@ def compute_anchor_distill_loss(
     seq_lens: Optional[torch.Tensor] = None,  # (B,) valid tokens per row
     lambda_pass1: float = 0.3,
     loss_chunk_anchors: int = 4,
+    freeze_pass1: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
     """Parallelized DFlash-Style Random-Anchor Block Training (Fix 1 & Fix 2):
     1. Base model no_grad forward pass: extracts Top-64 teacher logits and tapped hidden states.
@@ -177,13 +178,15 @@ def compute_anchor_distill_loss(
         top64_vals, top64_idx = torch.topk(teacher_logits, k=64, dim=-1)  # (B, S, 64)
         top64_probs = F.softmax(top64_vals.float(), dim=-1)
 
-    # Multi-layer target feature fusion (with grad enabled for fusion parameters)
-    f_ctx = drafter.fuse_stage1_features(out.hidden_states)  # (B, S, D)
+    # Multi-layer target feature fusion
+    with torch.set_grad_enabled(not freeze_pass1):
+        f_ctx = drafter.fuse_stage1_features(out.hidden_states)  # (B, S, D)
     del out, teacher_logits
 
     # 2. Project full prefix KV ONCE for the entire sequence (B, S, D)
     pos_all = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
-    kp_all, vp_all = drafter.project_prefix_kv(f_ctx, pos_all)
+    with torch.set_grad_enabled(not freeze_pass1):
+        kp_all, vp_all = drafter.project_prefix_kv(f_ctx, pos_all)
 
     # 3. Sample random clean anchors
     # Each anchor t needs prefix of length >= 1 (so t >= 1, meaning token t-1 exists)
@@ -218,9 +221,10 @@ def compute_anchor_distill_loss(
     y_star_emb = drafter.embed_tokens(y_star_packed)  # (B * N, 1, D)
 
     # Construct bridge output: (B * N, W, D)
-    h_packed = drafter.bridge(y_star_emb, mask_emb, f_last_packed, w=w)
-    # Reshape to (B, M, D) with M = N * W
-    h = h_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+    with torch.set_grad_enabled(not freeze_pass1):
+        h_packed = drafter.bridge(y_star_emb, mask_emb, f_last_packed, w=w)
+        # Reshape to (B, M, D) with M = N * W
+        h = h_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
 
     # RoPE positions for all packed tokens: (B, M)
     pos_draft_list = [
@@ -243,20 +247,21 @@ def compute_anchor_distill_loss(
     # 6. Execute draft layers in parallel forward pass (Pass 1)
     h_tap = None
     p2_start = drafter.k_layers - drafter.pass2_layers
-    for layer_idx in range(drafter.k_layers):
-        if getattr(drafter, "num_draft_steps", 1) > 1 and layer_idx == p2_start:
-            h_tap = h
-        h, _, _ = drafter.forward_draft_layer(
-            layer_idx=layer_idx,
-            hidden_states=h,
-            pos_draft=pos_draft,
-            k_prefix=kp_all[layer_idx],
-            v_prefix=vp_all[layer_idx],
-            attn_mask=attn_mask,
-        )
+    with torch.set_grad_enabled(not freeze_pass1):
+        for layer_idx in range(drafter.k_layers):
+            if getattr(drafter, "num_draft_steps", 1) > 1 and layer_idx == p2_start:
+                h_tap = h
+            h, _, _ = drafter.forward_draft_layer(
+                layer_idx=layer_idx,
+                hidden_states=h,
+                pos_draft=pos_draft,
+                k_prefix=kp_all[layer_idx],
+                v_prefix=vp_all[layer_idx],
+                attn_mask=attn_mask,
+            )
 
-    h_norm1 = drafter.norm(h)
-    student_logits1 = drafter.lm_head(h_norm1).view(B, N, w, -1)  # (B, N, W, vocab)
+        h_norm1 = drafter.norm(h)
+        student_logits1 = drafter.lm_head(h_norm1).view(B, N, w, -1)  # (B, N, W, vocab)
 
     # 7. Targets and teacher distributions for all anchors
     targets = torch.stack([batch_seqs[:, t + 1 : t + 1 + w] for t in anchors], dim=1)  # (B, N, W)
@@ -289,50 +294,73 @@ def compute_anchor_distill_loss(
         if pass2_mode == "bfork":
             # B-Fork Pass 2: Teacher-forced ground-truth target token at slot 1
             # targets[:, :, 0] is ground truth for slot 1 (t+1), permuted to match (N, B) packing order
+            w_p2 = w if getattr(drafter, "pass2_w", None) is None else max(2, min(int(drafter.pass2_w), w))
+            M_p2 = N * w_p2
+
             d0_targets = targets[:, :, 0].permute(1, 0).reshape(B * N, 1)
             d0_emb = drafter.embed_tokens(d0_targets)
             tok_emb_2 = build_bfork_token_embeds(
                 y_star_emb=y_star_emb,
                 d0_emb=d0_emb,
                 mask_emb=mask_emb,
-                w=w,
+                w=w_p2,
             )
             h_tap_used = h_tap if h_tap is not None else h
-            h_tap_unpacked = h_tap_used.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
-            h2_packed = drafter.refine_bridge(tok_emb_2, h_tap_unpacked, f_last_packed)
-            h2 = h2_packed.view(N, B, w, drafter.dim).permute(1, 0, 2, 3).reshape(B, M, drafter.dim)
+            h_tap_p2 = h_tap_used.view(B, N, w, drafter.dim)[:, :, :w_p2, :].permute(1, 0, 2, 3).reshape(B * N, w_p2, drafter.dim)
+            h2_packed = drafter.refine_bridge(tok_emb_2, h_tap_p2, f_last_packed)
+            h2 = h2_packed.view(N, B, w_p2, drafter.dim).permute(1, 0, 2, 3).reshape(B, M_p2, drafter.dim)
+
+            # Build pos_draft and attn_mask matching w_p2
+            pos_draft_p2_list = [
+                torch.arange(t, t + w_p2, device=device).unsqueeze(0).expand(B, w_p2)
+                for t in anchors
+            ]
+            pos_draft_p2 = torch.cat(pos_draft_p2_list, dim=1)  # (B, M_p2)
+
+            attn_mask_p2 = torch.full((1, 1, M_p2, S + M_p2), -1e4, dtype=f_ctx.dtype, device=device)
+            for m, t in enumerate(anchors):
+                r_start = m * w_p2
+                r_end = (m + 1) * w_p2
+                if t > 0:
+                    attn_mask_p2[0, 0, r_start : r_end, :t] = 0.0
+                k_start = S + m * w_p2
+                k_end = S + (m + 1) * w_p2
+                attn_mask_p2[0, 0, r_start : r_end, k_start : k_end] = 0.0
 
             # Re-run draft layers with refined h2
             for layer_idx in range(p2_start, drafter.k_layers):
                 h2, _, _ = drafter.forward_draft_layer(
                     layer_idx=layer_idx,
                     hidden_states=h2,
-                    pos_draft=pos_draft,
+                    pos_draft=pos_draft_p2,
                     k_prefix=kp_all[layer_idx],
                     v_prefix=vp_all[layer_idx],
-                    attn_mask=attn_mask,
+                    attn_mask=attn_mask_p2,
                     use_pass2=True,
                 )
 
             h_norm2 = drafter.norm(h2)
-            student_logits2 = drafter.lm_head(h_norm2).view(B, N, w, -1)
+            student_logits2 = drafter.lm_head(h_norm2).view(B, N, w_p2, -1)
 
-            # Suffix loss over slots 1..w-1
-            w_suffix = max(1, w - 1)
+            # Suffix loss over slots 1..w_p2-1
+            w_suffix = max(1, w_p2 - 1)
             d_pace_suffix = torch.tensor([d_pace_decay ** j for j in range(w_suffix)], device=device, dtype=torch.float32)
             d_pace_suffix = d_pace_suffix / d_pace_suffix.sum()
 
             loss_p2 = _chunked_distill_loss(
                 student_logits2[:, :, 1:],
-                t_top64_idx[:, :, 1:],
-                t_top64_probs[:, :, 1:],
-                targets[:, :, 1:],
+                t_top64_idx[:, :, 1:w_p2],
+                t_top64_probs[:, :, 1:w_p2],
+                targets[:, :, 1:w_p2],
                 d_pace_suffix,
                 lambda_kl,
                 chunk_size=loss_chunk_anchors,
             )
-            loss = lambda_pass1 * loss_p1 + loss_p2
-            eval_logits = torch.cat([student_logits1[:, :, :1], student_logits2[:, :, 1:]], dim=2)
+            loss = loss_p2 if freeze_pass1 else (lambda_pass1 * loss_p1 + loss_p2)
+            if w_p2 < w:
+                eval_logits = torch.cat([student_logits1[:, :, :1], student_logits2[:, :, 1:], student_logits1[:, :, w_p2:]], dim=2)
+            else:
+                eval_logits = torch.cat([student_logits1[:, :, :1], student_logits2[:, :, 1:]], dim=2)
         else:
             # Soft refinement pass 2
             h1_unpacked = h.view(B, N, w, drafter.dim).permute(1, 0, 2, 3).reshape(B * N, w, drafter.dim)
@@ -419,6 +447,8 @@ def parse_args():
     p.add_argument("--refine_bottleneck", type=int, default=256, help="refinement bridge bottleneck dimension (default 256)")
     p.add_argument("--pass2_mode", default="soft", choices=["soft", "bfork"], help="pass 2 refinement mode: soft or bfork (default soft)")
     p.add_argument("--fork_k", type=int, default=3, help="number of root candidates to branch on in bfork mode (default 3)")
+    p.add_argument("--pass2_w", type=int, default=None, help="optional slim Pass-2 block width for B-Fork (e.g. 5)")
+    p.add_argument("--freeze_pass1", action="store_true", help="freeze Pass-1 params and train only Pass-2 refinement modules")
     p.add_argument("--slice_mode", default="tail", choices=["head", "tail"], help="sequence slice mode: head or tail (default tail)")
     p.add_argument("--min_seq_len", type=int, default=128, help="minimum sequence length filter (default 128)")
     p.add_argument("--lambda_pass1", type=float, default=0.3, help="weight for pass 1 loss in 2-step training (default 0.3)")
@@ -460,6 +490,7 @@ def main():
         refine_bottleneck=args.refine_bottleneck,
         pass2_mode=args.pass2_mode,
         fork_k=args.fork_k,
+        pass2_w=args.pass2_w,
     )
 
     # Print parameter breakdown
@@ -487,8 +518,18 @@ def main():
             print(f"Cloned layer_deltas[{p2_start}:{drafter.k_layers}] into pass2_deltas for warm-start")
         print(f"Warm-started drafter from {args.resume}")
 
-    # Optimizer on drafter params only
-    trainable_params = drafter.get_trainable_parameters()
+    if args.freeze_pass1:
+        assert args.num_draft_steps > 1 and drafter.refine_bridge is not None, "--freeze_pass1 requires --num_draft_steps > 1 and refine_bridge"
+        for mod in (drafter.fusion, drafter.bridge, drafter.layer_deltas):
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = False
+        trainable_params = [p for p in drafter.get_trainable_parameters() if p.requires_grad]
+        print(f"[Freeze Pass 1] Training only Pass-2 params: {sum(p.numel() for p in trainable_params):,d}")
+    else:
+        # Optimizer on drafter params only
+        trainable_params = drafter.get_trainable_parameters()
+
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
 
     # Cosine scheduler with warmup
@@ -537,6 +578,7 @@ def main():
         initial_loss, _ = compute_anchor_distill_loss(
             base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1],
             d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1, loss_chunk_anchors=args.loss_chunk_anchors,
+            freeze_pass1=args.freeze_pass1,
         )
     before_loss = initial_loss.item()
     if args.smoke_test:
@@ -560,6 +602,7 @@ def main():
                     n_anchors=args.n_anchors, seq_lens=batch_lens,
                     d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1,
                     loss_chunk_anchors=args.loss_chunk_anchors,
+                    freeze_pass1=args.freeze_pass1,
                 )
             # Divide now, rescale after unscale_ if the inner loop came up short.
             scaled_loss = loss / args.grad_accum
@@ -624,6 +667,7 @@ def main():
                     "refine_bottleneck": args.refine_bottleneck,
                     "pass2_mode": args.pass2_mode,
                     "fork_k": args.fork_k,
+                    "pass2_w": args.pass2_w,
                 },
             }
             save_path = Path(args.out) / f"ckpt-{step}.pt"
@@ -636,6 +680,7 @@ def main():
             after_loss_t, _ = compute_anchor_distill_loss(
                 base_model, drafter, probe_batch[0], mask_id, w=args.w, n_anchors=2, seq_lens=probe_batch[1],
                 d_pace_decay=args.d_pace_decay, lambda_pass1=args.lambda_pass1, loss_chunk_anchors=args.loss_chunk_anchors,
+                freeze_pass1=args.freeze_pass1,
             )
         after_loss = after_loss_t.item()
         ok = math.isfinite(after_loss) and after_loss < before_loss

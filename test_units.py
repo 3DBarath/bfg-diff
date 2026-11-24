@@ -611,7 +611,55 @@ def test_v52_bfork_tree_parity():
     match_pruned = torch.equal(ref_out[:, :spec_out_pruned.shape[1]], spec_out_pruned)
     print(f"B-Fork Pruned Vocab Match: {match_pruned} (steps={stats_pruned['steps']}, alpha={stats_pruned['alpha']:.2f})")
     assert match_pruned, "B-Fork 2-step drafter output differed from base_model.generate() (pruned vocab)"
-    print("PASS: BFG-Diff v5.2 B-Fork multi-branch conditional pass 2 maintains exact lossless greedy parity\n")
+
+    # 3. Slim B-Fork v5.2b verification (fork_k=2, pass2_w=5, q_a=16, tree_mode="tree", pruned vocab)
+    base_model_slim, drafter_slim, tok_slim, mask_id_slim = prepare_v3(
+        "Qwen/Qwen2.5-0.5B",
+        device=device,
+        dtype=dtype,
+        k_layers=4,
+        drafter_r=32,
+        drafter_alpha=64.0,
+        num_draft_steps=2,
+        soft_topk=4,
+        pass2_layers=1,
+        refine_bottleneck=256,
+        pass2_mode="bfork",
+        fork_k=2,
+        pass2_w=5,
+    )
+    drafter_slim.merge_ghost_weights(dtype=dtype)
+
+    engine_slim = StaticDraftEngine(
+        base_model=base_model_slim,
+        drafter=drafter_slim,
+        max_len=512,
+        batch_size=1,
+        v_tokens=7,
+        q_a=16,
+        device=device,
+        dtype=dtype,
+        use_cuda_graph=(device == "cuda"),
+        draft_vocab_ids=draft_vocab_ids,
+    )
+
+    with torch.no_grad():
+        spec_out_slim, stats_slim = generate_speculative_v3(
+            base_model=base_model_slim,
+            drafter=drafter_slim,
+            input_ids=input_ids,
+            mask_token_id=mask_id_slim,
+            max_new_tokens=max_new,
+            temperature=0.0,
+            engine=engine_slim,
+            tree_mode="tree",
+            eos_token_id=tok.eos_token_id,
+        )
+
+    match_slim = torch.equal(ref_out[:, :spec_out_slim.shape[1]], spec_out_slim)
+    print(f"Slim B-Fork (k=2, w_p2=5) Match: {match_slim} (steps={stats_slim['steps']}, alpha={stats_slim['alpha']:.2f})")
+    assert match_slim, "Slim B-Fork (k=2, w_p2=5) output differed from base_model.generate()"
+    print("PASS: BFG-Diff v5.2b Slim B-Fork multi-branch conditional pass 2 maintains exact lossless greedy parity\n")
 
 
 if __name__ == "__main__":

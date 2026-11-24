@@ -180,6 +180,8 @@ class StaticDraftEngine:
             and self.pass2_mode == "bfork"
             and getattr(drafter, "refine_bridge", None) is not None
         )
+        raw_p2_w = getattr(drafter, "pass2_w", None)
+        self.pass2_w = self.w if (raw_p2_w is None or not self.is_bfork) else max(2, min(int(raw_p2_w), self.w))
 
         # Probe hardware/PyTorch support for enable_gqa=True with 4D float additive mask
         self.supports_enable_gqa = False
@@ -275,13 +277,15 @@ class StaticDraftEngine:
         self.static_fork_root_local_ids = None
         self.static_fork_root_global_ids = None
         self.static_fork_branch_logits = None
+        self.static_mask_B_p2 = None
         if self.is_bfork:
             K = min(self.fork_k, draft_v_size)
             self.fork_k = K
             self.static_fork_root_logits = torch.zeros(1, draft_v_size, dtype=dtype, device=device)
             self.static_fork_root_local_ids = torch.zeros(K, dtype=torch.long, device=device)
             self.static_fork_root_global_ids = torch.zeros(K, dtype=torch.long, device=device)
-            self.static_fork_branch_logits = torch.zeros(K, max(1, self.w - 1), draft_v_size, dtype=dtype, device=device)
+            self.static_fork_branch_logits = torch.zeros(K, max(1, self.pass2_w - 1), draft_v_size, dtype=dtype, device=device)
+            self.static_mask_B_p2 = torch.full((batch_size, 1, self.pass2_w, self.pass2_w + max_len), -1e4, dtype=dtype, device=device)
 
         # Bucketed CUDA Graph storage: dict mapping S_bucket -> (verify_graph, draft_graph)
         self.cuda_graphs = {}
@@ -331,6 +335,9 @@ class StaticDraftEngine:
                     self.static_pos_draft.copy_(torch.arange(0, self.w, device=self.device).unsqueeze(0))
                     self.static_mask_B[:, :, :, :self.w + S_b].fill_(-1e4)
                     self.static_mask_B[0, 0, :, :self.w] = 0.0
+                    if self.is_bfork and self.static_mask_B_p2 is not None:
+                        self.static_mask_B_p2[:, :, :, :self.pass2_w + S_b].fill_(-1e4)
+                        self.static_mask_B_p2[0, 0, :, :self.pass2_w] = 0.0
 
                     # Warmup iterations
                     for _ in range(3):
@@ -501,6 +508,8 @@ class StaticDraftEngine:
         if getattr(self.drafter, "num_draft_steps", 1) > 1 and getattr(self.drafter, "refine_bridge", None) is not None:
             if self.is_bfork:
                 K = self.fork_k
+                W_p2 = self.pass2_w
+                mask_B_p2_view = self.static_mask_B_p2[:, :, :, :W_p2 + S_b] if self.static_mask_B_p2 is not None else mask_B_view[:, :, :W_p2, :W_p2 + S_b]
                 # 1. Project Pass-1 slot 0 only
                 h1_s0 = self.drafter.norm(h[:, 0:1])
                 if self.draft_lm_head_w is not None:
@@ -520,35 +529,35 @@ class StaticDraftEngine:
                 embed_w = self.draft_embed_w if self.draft_embed_w is not None else self.drafter.embed_tokens.weight
                 d0_embs = F.embedding(top_local, embed_w).unsqueeze(1)  # (K, 1, D)
                 tok_emb_2 = build_bfork_token_embeds(
-                    y_star_emb.expand(K, 1, -1), d0_embs, mask_emb, self.w
-                )  # (K, W, D)
+                    y_star_emb.expand(K, 1, -1), d0_embs, mask_emb, W_p2
+                )  # (K, W_p2, D)
 
-                h_tap_base = h_tap if h_tap is not None else h
+                h_tap_base = (h_tap if h_tap is not None else h)[:, :W_p2, :]
                 h2 = self.drafter.refine_bridge(
-                    tok_emb_2, h_tap_base.expand(K, self.w, -1), self.static_f_ctx_last.expand(K, 1, -1)
+                    tok_emb_2, h_tap_base.expand(K, W_p2, -1), self.static_f_ctx_last.expand(K, 1, -1)
                 )
 
                 # Run Pass 2 at batch size K
-                pos_draft_2 = self.static_pos_draft.expand(K, self.w)
+                pos_draft_2 = self.static_pos_draft[:, :W_p2].expand(K, W_p2)
                 p_start = self.k_layers - self.pass2_layers
                 for p_idx in range(self.pass2_layers):
                     layer_idx = p_start + p_idx
                     if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                         ghost_l = self.drafter.pass2_ghost_layers[p_idx]
                         norm_h2 = ghost_l.input_layernorm(h2)
-                        q = ghost_l.self_attn.q_proj(norm_h2).view(K, self.w, self.num_heads, self.head_dim).transpose(1, 2)
-                        k_d = ghost_l.self_attn.k_proj(norm_h2).view(K, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                        v_d = ghost_l.self_attn.v_proj(norm_h2).view(K, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        q = ghost_l.self_attn.q_proj(norm_h2).view(K, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
+                        k_d = ghost_l.self_attn.k_proj(norm_h2).view(K, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        v_d = ghost_l.self_attn.v_proj(norm_h2).view(K, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                     else:
                         base_l = self.drafter.draft_layers[layer_idx]
                         deltas = self.drafter.pass2_deltas[p_idx]
                         norm_h2 = base_l.input_layernorm(h2)
                         q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
-                        q = q.view(K, self.w, self.num_heads, self.head_dim).transpose(1, 2)
+                        q = q.view(K, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
                         k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
-                        k_d = k_d.view(K, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        k_d = k_d.view(K, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                         v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
-                        v_d = v_d.view(K, self.w, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                        v_d = v_d.view(K, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
                     cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_draft_2)
                     q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
@@ -561,14 +570,14 @@ class StaticDraftEngine:
 
                     if self.num_heads != self.num_kv_heads:
                         if self.supports_enable_gqa:
-                            attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view, enable_gqa=True)
+                            attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_p2_view, enable_gqa=True)
                         else:
                             k_attn = repeat_kv(k_total, self.num_heads // self.num_kv_heads)
                             v_attn = repeat_kv(v_total, self.num_heads // self.num_kv_heads)
-                            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_B_view)
+                            attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=mask_B_p2_view)
                     else:
-                        attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_view)
-                    attn_out = attn_out.transpose(1, 2).reshape(K, self.w, self.dim)
+                        attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=mask_B_p2_view)
+                    attn_out = attn_out.transpose(1, 2).reshape(K, W_p2, self.dim)
 
                     if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                         h2 = h2 + ghost_l.self_attn.o_proj(attn_out)
@@ -585,7 +594,7 @@ class StaticDraftEngine:
                         mlp_act = base_l.mlp.act_fn(gate) * up
                         h2 = h2 + apply_linear_with_delta(base_l.mlp.down_proj, mlp_act, deltas.down_proj)
 
-                # Project suffix slots 1..W-1 ONLY
+                # Project suffix slots 1..W_p2-1 ONLY
                 h2_suf = self.drafter.norm(h2[:, 1:, :])
                 if self.draft_lm_head_w is not None:
                     branch_logits = F.linear(h2_suf, self.draft_lm_head_w, self.draft_lm_head_b)
@@ -594,14 +603,22 @@ class StaticDraftEngine:
 
                 self.static_fork_branch_logits.copy_(branch_logits)
 
-                # Output compatible with standard single-branch interfaces (using branch 0)
-                logits_out = torch.cat([z1_s0, branch_logits[0:1]], dim=1)
-                self.static_draft_logits.copy_(logits_out)
+                # Populate backward-compatible self.static_draft_logits
+                self.static_draft_logits[:, 0:1].copy_(z1_s0)
+                self.static_draft_logits[:, 1:W_p2].copy_(branch_logits[0:1])
+                if W_p2 < self.w:
+                    h_rem = self.drafter.norm(h[:, W_p2:, :])
+                    if self.draft_lm_head_w is not None:
+                        rem_logits = F.linear(h_rem, self.draft_lm_head_w, self.draft_lm_head_b)
+                    else:
+                        rem_logits = self.drafter.lm_head(h_rem)
+                    self.static_draft_logits[:, W_p2:].copy_(rem_logits)
+
                 if self.draft_vocab_ids is not None:
-                    local_ids = torch.argmax(logits_out, dim=-1)
+                    local_ids = torch.argmax(self.static_draft_logits, dim=-1)
                     self.static_draft_ids.copy_(self.draft_vocab_ids[local_ids])
                 else:
-                    self.static_draft_ids.copy_(torch.argmax(logits_out, dim=-1))
+                    self.static_draft_ids.copy_(torch.argmax(self.static_draft_logits, dim=-1))
             else:
                 h_norm1 = self.drafter.norm(h[:, :self.w - 1])
                 if self.draft_lm_head_w is not None:
@@ -1027,6 +1044,13 @@ class StaticDraftEngine:
             if t > 0:
                 mask_B_view[0, 0, :, W : W + t] = 0.0
 
+            if self.is_bfork and self.static_mask_B_p2 is not None:
+                mask_p2_view = self.static_mask_B_p2[:, :, :, :self.pass2_w + S_b]
+                mask_p2_view.fill_(-1e4)
+                mask_p2_view[:, :, :, :self.pass2_w] = 0.0
+                if t > 0:
+                    mask_p2_view[:, :, :, self.pass2_w : self.pass2_w + t] = 0.0
+
             _, g_draft = self.cuda_graphs[S_b]
             self.cuda_graph_draft = g_draft
             g_draft.replay()
@@ -1125,6 +1149,7 @@ class StaticDraftEngine:
             if getattr(self, "is_bfork", False):
                 # B-Fork Pass 2
                 h_tap_used = h_tap if h_tap is not None else h
+                W_p2 = self.pass2_w
                 if B == 1:
                     h1_s0 = self.drafter.norm(h[:, 0:1])
                     if self.draft_lm_head_w is not None:
@@ -1150,30 +1175,31 @@ class StaticDraftEngine:
                         y_star_emb=y_star_emb.expand(self.fork_k, -1, -1),
                         d0_emb=d0_emb,
                         mask_emb=mask_emb.expand(self.fork_k, -1, -1),
-                        w=W,
+                        w=W_p2,
                     )
-                    h2 = self.drafter.refine_bridge(tok_emb_2, h_tap_used.expand(self.fork_k, -1, -1), f_ctx_last.expand(self.fork_k, -1, -1))
+                    h_tap_p2 = h_tap_used[:, :W_p2, :]
+                    h2 = self.drafter.refine_bridge(tok_emb_2, h_tap_p2.expand(self.fork_k, -1, -1), f_ctx_last.expand(self.fork_k, -1, -1))
 
-                    pos_fork = pos_draft.expand(self.fork_k, -1)
-                    attn_mask_fork = attn_mask.expand(self.fork_k, -1, -1, -1)
+                    pos_fork = pos_draft[:, :W_p2].expand(self.fork_k, -1)
+                    attn_mask_fork = torch.cat([attn_mask[:, :, :W_p2, :W_p2], attn_mask[:, :, :W_p2, W : W + S_active]], dim=-1).expand(self.fork_k, -1, -1, -1) if W_p2 < W else attn_mask.expand(self.fork_k, -1, -1, -1)
                     for p_idx in range(self.pass2_layers):
                         layer_idx = p_start + p_idx
                         if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                             ghost_l = self.drafter.pass2_ghost_layers[p_idx]
                             norm_h2 = ghost_l.input_layernorm(h2)
-                            q = ghost_l.self_attn.q_proj(norm_h2).view(self.fork_k, W, self.num_heads, self.head_dim).transpose(1, 2)
-                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            q = ghost_l.self_attn.q_proj(norm_h2).view(self.fork_k, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(self.fork_k, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(self.fork_k, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                         else:
                             base_l = self.drafter.draft_layers[layer_idx]
                             deltas = self.drafter.pass2_deltas[p_idx]
                             norm_h2 = base_l.input_layernorm(h2)
                             q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
-                            q = q.view(self.fork_k, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            q = q.view(self.fork_k, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
                             k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
-                            k_d = k_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            k_d = k_d.view(self.fork_k, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                             v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
-                            v_d = v_d.view(self.fork_k, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = v_d.view(self.fork_k, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
                         cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_fork)
                         q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
@@ -1193,7 +1219,7 @@ class StaticDraftEngine:
                                 attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask_fork)
                         else:
                             attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask_fork)
-                        attn_out = attn_out.transpose(1, 2).reshape(self.fork_k, W, self.dim)
+                        attn_out = attn_out.transpose(1, 2).reshape(self.fork_k, W_p2, self.dim)
 
                         if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                             h2 = h2 + ghost_l.self_attn.o_proj(attn_out)
@@ -1217,7 +1243,16 @@ class StaticDraftEngine:
                         branch_logits = self.drafter.lm_head(h2_norm)
                     self.static_fork_branch_logits.copy_(branch_logits)
 
-                    full_logits = torch.cat([z1_s0, branch_logits[0:1]], dim=1)
+                    if W_p2 < W:
+                        h_rem = self.drafter.norm(h[:, W_p2:, :])
+                        if self.draft_lm_head_w is not None:
+                            rem_logits = F.linear(h_rem, self.draft_lm_head_w, self.draft_lm_head_b)
+                        else:
+                            rem_logits = self.drafter.lm_head(h_rem)
+                        full_logits = torch.cat([z1_s0, branch_logits[0:1], rem_logits], dim=1)
+                    else:
+                        full_logits = torch.cat([z1_s0, branch_logits[0:1]], dim=1)
+
                     if self.draft_lm_head_w is not None:
                         local_ids = torch.argmax(full_logits, dim=-1)
                         draft_ids = self.draft_vocab_ids[local_ids]
@@ -1241,47 +1276,51 @@ class StaticDraftEngine:
                         d0_ids = torch.argmax(z1_s0[:, 0], dim=-1, keepdim=True)
 
                     d0_emb = self.drafter.embed_tokens(d0_ids)
-                    tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, W)
-                    h2 = self.drafter.refine_bridge(tok_emb_2, h_tap_used, f_ctx_last)
+                    tok_emb_2 = build_bfork_token_embeds(y_star_emb, d0_emb, mask_emb, W_p2)
+                    h_tap_p2 = h_tap_used[:, :W_p2, :]
+                    h2 = self.drafter.refine_bridge(tok_emb_2, h_tap_p2, f_ctx_last)
+
+                    pos_draft_p2 = pos_draft[:, :W_p2]
+                    attn_mask_p2 = torch.cat([attn_mask[:, :, :W_p2, :W_p2], attn_mask[:, :, :W_p2, W : W + S_active]], dim=-1) if W_p2 < W else attn_mask
 
                     for p_idx in range(self.pass2_layers):
                         layer_idx = p_start + p_idx
                         if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                             ghost_l = self.drafter.pass2_ghost_layers[p_idx]
                             norm_h2 = ghost_l.input_layernorm(h2)
-                            q = ghost_l.self_attn.q_proj(norm_h2).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
-                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            q = ghost_l.self_attn.q_proj(norm_h2).view(B, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
+                            k_d = ghost_l.self_attn.k_proj(norm_h2).view(B, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = ghost_l.self_attn.v_proj(norm_h2).view(B, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                         else:
                             base_l = self.drafter.draft_layers[layer_idx]
                             deltas = self.drafter.pass2_deltas[p_idx]
                             norm_h2 = base_l.input_layernorm(h2)
                             q = apply_linear_with_delta(base_l.self_attn.q_proj, norm_h2, deltas.q_proj)
-                            q = q.view(B, W, self.num_heads, self.head_dim).transpose(1, 2)
+                            q = q.view(B, W_p2, self.num_heads, self.head_dim).transpose(1, 2)
                             k_d = apply_linear_with_delta(base_l.self_attn.k_proj, norm_h2, deltas.k_proj)
-                            k_d = k_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            k_d = k_d.view(B, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
                             v_d = apply_linear_with_delta(base_l.self_attn.v_proj, norm_h2, deltas.v_proj)
-                            v_d = v_d.view(B, W, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                            v_d = v_d.view(B, W_p2, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-                        cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_draft)
+                        cos_d, sin_d = self.drafter.rotary_emb(norm_h2, pos_draft_p2)
                         q, k_d = apply_rotary_pos_emb(q, k_d, cos_d, sin_d, unsqueeze_dim=1)
 
-                        self.draft_cache.k[layer_idx][:, :, :W, :] = k_d
-                        self.draft_cache.v[layer_idx][:, :, :W, :] = v_d
-                        k_total = self.draft_cache.k[layer_idx][:, :, :W + S_active, :]
-                        v_total = self.draft_cache.v[layer_idx][:, :, :W + S_active, :]
+                        k_pref = self.draft_cache.k[layer_idx][:, :, W : W + S_active, :]
+                        v_pref = self.draft_cache.v[layer_idx][:, :, W : W + S_active, :]
+                        k_total = torch.cat([k_d, k_pref], dim=2)
+                        v_total = torch.cat([v_d, v_pref], dim=2)
 
                         if self.num_heads != self.num_kv_heads:
                             if self.supports_enable_gqa:
-                                attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask, enable_gqa=True)
+                                attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask_p2, enable_gqa=True)
                             else:
                                 n_rep = self.num_heads // self.num_kv_heads
                                 k_attn = repeat_kv(k_total, n_rep)
                                 v_attn = repeat_kv(v_total, n_rep)
-                                attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask)
+                                attn_out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_mask_p2)
                         else:
-                            attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask)
-                        attn_out = attn_out.transpose(1, 2).reshape(B, W, self.dim)
+                            attn_out = F.scaled_dot_product_attention(q, k_total, v_total, attn_mask=attn_mask_p2)
+                        attn_out = attn_out.transpose(1, 2).reshape(B, W_p2, self.dim)
 
                         if self.drafter.has_ghost_layers and getattr(self.drafter, "pass2_ghost_layers", None) is not None:
                             h2 = h2 + ghost_l.self_attn.o_proj(attn_out)
@@ -1303,7 +1342,17 @@ class StaticDraftEngine:
                         z2_suffix = F.linear(h2_norm, self.draft_lm_head_w, self.draft_lm_head_b)
                     else:
                         z2_suffix = self.drafter.lm_head(h2_norm)
-                    full_logits = torch.cat([z1_s0, z2_suffix], dim=1)
+
+                    if W_p2 < W:
+                        h_rem = self.drafter.norm(h[:, W_p2:, :])
+                        if self.draft_lm_head_w is not None:
+                            rem_logits = F.linear(h_rem, self.draft_lm_head_w, self.draft_lm_head_b)
+                        else:
+                            rem_logits = self.drafter.lm_head(h_rem)
+                        full_logits = torch.cat([z1_s0, z2_suffix, rem_logits], dim=1)
+                    else:
+                        full_logits = torch.cat([z1_s0, z2_suffix], dim=1)
+
                     if self.draft_lm_head_w is not None:
                         local_ids = torch.argmax(full_logits, dim=-1)
                         draft_ids = self.draft_vocab_ids[local_ids]
@@ -1689,12 +1738,18 @@ def generate_speculative_v3(
         engine.capture_cuda_graphs(mask_token_id)
 
     # 2. Prefill prompt (resets target_cache and draft_cache cleanly)
+    if engine.device.type == "cuda":
+        torch.cuda.synchronize()
+    t_prefill_start = time.perf_counter()
     logits_0, f_ctx_last = engine.prefill(input_ids)
     if temperature == 0.0:
         next_token = torch.argmax(logits_0[:, -1:], dim=-1)  # (B, 1) token at position P
     else:
         probs = F.softmax(logits_0[:, -1:] / max(1e-4, temperature), dim=-1)
         next_token = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(B, 1)
+    if engine.device.type == "cuda":
+        torch.cuda.synchronize()
+    prefill_time_ms = (time.perf_counter() - t_prefill_start) * 1000.0
 
     generated_per_row = [[input_ids[b], next_token[b]] for b in range(B)]
     cur_pos_list = [P for _ in range(B)]
@@ -1711,6 +1766,7 @@ def generate_speculative_v3(
     a_plus = [0] * min(4, v_tokens)
     hedge_attempts = 0
     hedge_hits = 0
+    step_ms_list = []
 
     if step_callback is not None and not done[0]:
         step_callback({
@@ -1731,6 +1787,9 @@ def generate_speculative_v3(
     tree_mask_cpu = torch.full((engine.q_a, engine.q_a), -1e4, dtype=engine_dtype, device="cpu")
 
     while not all(done) and any((cur_pos_list[b] - P + 1) < max_new_tokens for b in range(B)):
+        if engine.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_step_start = time.perf_counter()
         y_star = next_token  # (B, 1) concrete bonus token at position t
         t = cur_pos_list[0]
         generated_before = cur_pos_list[0] - P + 1
@@ -2118,6 +2177,10 @@ def generate_speculative_v3(
             next_token = torch.cat(next_token_list, dim=0)
             f_ctx_last = torch.cat(f_ctx_last_list, dim=0)
 
+        if engine.device.type == "cuda":
+            torch.cuda.synchronize()
+        step_ms_list.append((time.perf_counter() - t_step_start) * 1000.0)
+
         steps += 1
         if step_callback is not None:
             cb_tokens = []
@@ -2163,5 +2226,7 @@ def generate_speculative_v3(
         "hedge_attempts": hedge_attempts,
         "hedge_hits": hedge_hits,
         "hedge_hit_rate": (hedge_hits / max(1, hedge_attempts)) if hedge_attempts > 0 else 0.0,
+        "ttft_ms": prefill_time_ms,
+        "step_ms_list": step_ms_list,
     }
     return output_ids, stats

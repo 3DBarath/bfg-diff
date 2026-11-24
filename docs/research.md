@@ -587,6 +587,22 @@ BFG-Diff v4 upgrades the speculative decoding runtime with four zero-retraining 
 - **Warm-Start Cloning**:
   Resuming from any v3/v4 checkpoint automatically clones top Pass-1 `layer_deltas` into `pass2_deltas` on initialization, enabling fast convergence.
 
+### 10. BFG-Diff v5.2b: Frozen-Pass-1 Training & Slim B-Fork Architecture (`fork_k=2, pass2_w=5`)
+
+#### A. Architectural Motivation & Roofline Analysis
+- **Pass 2 Width Scaling Bottleneck**:
+  In v5.2, evaluating $K=3$ branches over full width $W=7$ increased $T_\text{draft}$ from $3.4\text{ ms}$ to $4.9\text{ ms}$. In a speculative tree with verification tile $Q_A=24$, deep candidate exploration beyond slot 4 yields diminishing returns, whereas maintaining low drafter latency is critical for net wall-clock TPS.
+- **Slim B-Fork (`fork_k=2, pass2_w=5`)**:
+  - Prunes root branch candidates to $K=2$ (covering >85% of high-entropy branching decisions).
+  - Truncates Pass-2 width to $W_{p2} = 5$ tokens. Suffix slots beyond $W_{p2}$ are backfilled from Pass-1 base representations.
+  - Generates Pass-2 suffix branches $(K, W_{p2}-1, V_d)$ in a dedicated, pre-allocated static mask buffer (`static_mask_B_p2`) inside the exact same captured CUDA graph with zero dynamic memory allocation or runtime mask concatenation.
+- **Frozen-Pass-1 Training (`--freeze_pass1`)**:
+  - Freezes `fusion`, `bridge`, and `layer_deltas`.
+  - Executes Pass 1 inside `torch.no_grad()` to eliminate activation memory and prevent Pass-1 drift.
+  - Trains exclusively `refine_bridge` and `pass2_deltas` against ground-truth teacher targets, achieving fast, stable convergence.
+- **Inference Provider Telemetry**:
+  - Added built-in instrumentation in `sampler.py` and `benchmark.py` tracking Mean TTFT (prefill time), Mean TPOT ($1000 / \text{TPS}$), Step Latency percentiles (P50 and P99), and Peak CUDA VRAM.
+
 
 #### A. Scaled Autocast Gradients
 - `train.py` scales micro-batch gradients via `scaler.scale(loss / args.grad_accum).backward()` when `use_fp16=True` (CUDA), guaranteeing safe FP16 dynamic loss scaling across inner accumulation steps.

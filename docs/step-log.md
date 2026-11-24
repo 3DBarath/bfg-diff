@@ -1135,3 +1135,26 @@ Benchmarked `runs/bfg-lora-mlp/last.pt` (recon + gen, suppression on) ->
 - **Verification**:
   - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
   - `git diff --check` confirmed clean whitespace and formatting across all modified files.
+
+## 63. BFG-Diff v5.2b Implementation: Frozen Pass 1, Slim B-Fork & Telemetry (2026-11-24)
+- **Implemented B-Fork v5.2b Slim Architecture & Optimization**:
+  - `model.py`: Added `pass2_w` support to `WeightTiedTopKDrafter.__init__` and `prepare_v3`. Stored `self.pass2_w`, included in `parameter_breakdown()`. Sliced `tok_emb_2`, `h_tap_p2`, `pos_draft_p2`, and `attn_mask_p2` to `w_p2 = min(pass2_w, w)`, returning padded full-width logits `[z1_slot0, z2_suffix, z1_rem]`.
+  - `sampler.py`:
+    - Computed `self.pass2_w` in `StaticDraftEngine.__init__`. Pre-allocated dedicated `self.static_mask_B_p2` buffer (`1, 1, pass2_w, pass2_w + max_len`) for zero-concatenation Pass-2 mask inside the static CUDA graph.
+    - Updated `_step_draft_kernel` and eager `forward_draft_step` to evaluate Pass 2 using `W_p2 = self.pass2_w`, copying suffix branch logits into `static_fork_branch_logits` and backfilling `static_draft_logits`.
+    - Integrated inference provider telemetry into `generate_speculative_v3` (tracking `ttft_ms` and per-step latencies `step_ms_list`).
+  - `train.py`:
+    - Added `--pass2_w` and `--freeze_pass1` CLI arguments. Threaded `pass2_w` into `prepare_v3` and saved in `"arch"` metadata.
+    - When `--freeze_pass1` is set, froze `fusion`, `bridge`, and `layer_deltas`. Wrapped Pass-1 operations in `torch.no_grad()` inside `compute_anchor_distill_loss`, training solely `refine_bridge` and `pass2_deltas` with `loss = loss_p2`.
+    - Sliced Pass-2 targets and teacher distributions to `w_p2` in `compute_anchor_distill_loss`.
+  - `benchmark.py` & `chat.py`:
+    - Propagated `pass2_w` from checkpoint `"arch"` into `prepare_v3`.
+    - Added provider telemetry reporting in `benchmark.py`: Mean TTFT (ms), Mean TPOT (ms/tok), Step Latency P50/P99 (ms), and Peak CUDA VRAM (MB). Updated drafter label to show `w%d B-Fork` when `pass2_w` is set.
+  - `test_gates.py` & `test_units.py`:
+    - Updated `test_gates.py` with `--pass2_w` arg and mirrored `w_p2` in Gate D's training-inference parity verification.
+    - Added Test 9 verification in `test_units.py` for slim B-Fork (`fork_k=2, pass2_w=5, q_a=16`) with pruned vocab, confirming lossless greedy parity.
+  - `docs/findings.md` & `docs/research.md`: Documented Move 1 $Q_A=24$ hardware findings ($v5.2$: $\alpha=2.45$, 69.2 TPS vs $v4.2$: $\alpha=2.35$, 70.4 TPS), roofline diagnosis, and v5.2b slim architecture.
+- **Verification**:
+  - `python3 -m py_compile *.py tools/*.py` compiled cleanly with 0 errors.
+  - Unit tests in `test_units.py` and verification in `test_gates.py` passed.
+  - `git diff --check` confirmed clean formatting.
